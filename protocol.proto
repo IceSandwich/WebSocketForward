@@ -1,0 +1,15 @@
+syntax = "proto3";
+package WSForward;
+
+message Request {
+	string url = 1;
+	string method = 2;
+	string headers_json = 3;
+	optional string body = 4;
+}
+
+message Response {
+	int32 status = 1;
+	string headers_json = 2;
+	bytes body = 3;
+}
