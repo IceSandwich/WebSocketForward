@@ -2,10 +2,11 @@ import asyncio
 import aiohttp
 from aiohttp import web, ClientSession
 from data import SerializableRequest, SerializableResponse
+import config
 
 # 服务器S的地址
-SERVER_URL = "http://127.0.0.1:8080/ws"
-FORWARD_PREFIX = "http://127.0.0.1:7860"
+SERVER_URL = "http://127.0.0.1:8030/ws"
+FORWARD_PREFIX = "http://127.0.0.1:8080"
 
 # 创建一个 aiohttp 客户端会话，用于转发 HTTP 请求
 async def forward_http_request(http_method, url, headers, body):
@@ -18,7 +19,7 @@ async def websocket_client():
 	# 建立WebSocket连接
 	headers = {"Upgrade": "websocket", "Connection": "Upgrade"}
 	async with ClientSession() as session:
-		async with session.ws_connect(SERVER_URL, headers=headers, max_msg_size=12*1024*1024) as ws:
+		async with session.ws_connect(SERVER_URL, headers=headers, max_msg_size=config.WS_MAX_MSG_SIZE) as ws:
 			print("Connected to server")
 			
 			# # 启动本地HTTP服务
