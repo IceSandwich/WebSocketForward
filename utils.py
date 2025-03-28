@@ -9,10 +9,10 @@ logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(name)s - %(leve
 def SetupLogging(log: logging.Logger, id: str):
 	formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
 
-	chandler = logging.StreamHandler()
-	chandler.setLevel(logging.INFO)
-	chandler.setFormatter(formatter)
-	log.addHandler(chandler)
+	# chandler = logging.StreamHandler()
+	# chandler.setLevel(logging.INFO)
+	# chandler.setFormatter(formatter)
+	# log.addHandler(chandler)
 
 	log_dir = "logs"
 	os.makedirs(log_dir, exist_ok=True)

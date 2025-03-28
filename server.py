@@ -69,7 +69,7 @@ class WebSocketManager:
 					resp = SerializableResponse.from_protobuf(msg.data)
 					if resp.sse_ticket:
 						isFirstSSE = resp.url not in self.ssePool
-						log.debug(f"recv sse: {resp.url} isFirst: {isFirstSSE}")
+						log.debug(f"recv sse: {resp.url} isFirst: {isFirstSSE} isEnd: {resp.stream_end}")
 						if isFirstSSE:
 							self.ssePool[resp.url] = asyncio.Queue()
 						else:
@@ -94,7 +94,7 @@ class WebSocketManager:
 	
 
 # 存储WebSocket连接
-client: WebSocketManager = None
+client: typing.Union[None, WebSocketManager] = None
 
 async def websocket_handler(request):
 	global client
