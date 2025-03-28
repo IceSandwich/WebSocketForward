@@ -24,7 +24,7 @@ _sym_db = _symbol_database.Default()
 
 
 
-DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x0eprotocol.proto\x12\tWSForward\"X\n\x07Request\x12\x0b\n\x03url\x18\x01 \x01(\t\x12\x0e\n\x06method\x18\x02 \x01(\t\x12\x14\n\x0cheaders_json\x18\x03 \x01(\t\x12\x11\n\x04\x62ody\x18\x04 \x01(\tH\x00\x88\x01\x01\x42\x07\n\x05_body\">\n\x08Response\x12\x0e\n\x06status\x18\x01 \x01(\x05\x12\x14\n\x0cheaders_json\x18\x02 \x01(\t\x12\x0c\n\x04\x62ody\x18\x03 \x01(\x0c\x62\x06proto3')
+DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x0eprotocol.proto\x12\tWSForward\"X\n\x07Request\x12\x0b\n\x03url\x18\x01 \x01(\t\x12\x0e\n\x06method\x18\x02 \x01(\t\x12\x14\n\x0cheaders_json\x18\x03 \x01(\t\x12\x11\n\x04\x62ody\x18\x04 \x01(\x0cH\x00\x88\x01\x01\x42\x07\n\x05_body\"s\n\x08Response\x12\x0b\n\x03url\x18\x01 \x01(\t\x12\x0e\n\x06status\x18\x02 \x01(\x05\x12\x14\n\x0cheaders_json\x18\x03 \x01(\t\x12\x0c\n\x04\x62ody\x18\x04 \x01(\x0c\x12\x12\n\nsse_ticket\x18\x05 \x01(\x08\x12\x12\n\nstream_end\x18\x06 \x01(\x08\x62\x06proto3')
 
 _globals = globals()
 _builder.BuildMessageAndEnumDescriptors(DESCRIPTOR, _globals)
@@ -34,5 +34,5 @@ if not _descriptor._USE_C_DESCRIPTORS:
   _globals['_REQUEST']._serialized_start=29
   _globals['_REQUEST']._serialized_end=117
   _globals['_RESPONSE']._serialized_start=119
-  _globals['_RESPONSE']._serialized_end=181
+  _globals['_RESPONSE']._serialized_end=234
 # @@protoc_insertion_point(module_scope)
