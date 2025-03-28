@@ -1,4 +1,4 @@
-import asyncio, aiohttp, aiohttp.locks, typing, argparse, logging
+import asyncio, aiohttp, typing, argparse, logging
 from data import SerializableRequest, SerializableResponse
 import aiohttp.web as web
 import utils
