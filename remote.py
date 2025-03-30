@@ -17,7 +17,7 @@ class Configuration:
 	@classmethod
 	def SetupParser(cls, parser: argp.ArgumentParser):
 		parser.add_argument("--server", type=str, default="http://127.0.0.1/remote_ws")
-		parser.add_argument("--port", type=int, default=1091)
+		parser.add_argument("--port", type=int, default=7860)
 		return parser
 
 class WSCallbacks(wsutils.Callbacks):
