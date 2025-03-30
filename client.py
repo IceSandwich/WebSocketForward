@@ -1,6 +1,8 @@
-import asyncio, aiohttp, argparse, logging
+import asyncio, aiohttp, logging
 from data import SerializableRequest, SerializableResponse
+import argparse as argp
 import utils
+import wsutils
 
 log = logging.getLogger(__name__)
 utils.SetupLogging(log, "client")
@@ -11,8 +13,8 @@ class Configuration:
 		self.forward_prefix: str = args.forward_prefix
 
 	@classmethod
-	def SetupParser(cls, parser: argparse.ArgumentParser):
-		parser.add_argument("--server", type=str, default="http://127.0.0.1:8030/ws")
+	def SetupParser(cls, parser: argp.ArgumentParser):
+		parser.add_argument("--server", type=str, default="http://127.0.0.1:8030/client_ws")
 		parser.add_argument("--forward_prefix", type=str, default="http://127.0.0.1:7860")
 		return parser
 	
@@ -38,53 +40,49 @@ async def sse_process(req: SerializableRequest, resp: aiohttp.ClientResponse, se
 	await resp.release()
 	await session.close()
 
-async def websocket_process(config: Configuration, ws: aiohttp.ClientWebSocketResponse):
-	# 保持连接
-	async for msg in ws:
-		if msg.type == aiohttp.WSMsgType.BINARY:
-			req = SerializableRequest.from_protobuf(msg.data)
-
-			# 转发 HTTP 请求到目标服务器
-			session = aiohttp.ClientSession()
-			resp = await session.request(req.method, config.forward_prefix + req.url, headers=req.headers, data=req.body)
+class ClientCallbacks(wsutils.Callbacks):
+	def __init__(self, config: Configuration):
+		super().__init__("Server")
+		self.config = config
 		
-			if 'text/event-stream' in resp.headers['Content-Type']:
-				log.info(f"SSE Proxy {req.method} {req.url}")
-				asyncio.ensure_future(sse_process(req, resp, session, ws))
-			else:
-				log.info(f"Proxy {req.method} {req.url} {resp.status} hasBody: {req.body is not None}")
-				data = await resp.content.read()
-				# 将响应数据通过 WebSocket 返回给客户端
-				response = SerializableResponse(
-					req.seq_id,
-					req.url,
-					resp.status,
-					dict(resp.headers),
-					data,
-					False
-				)
+	async def OnProcess(self, msg: aiohttp.WSMessage):
+		if msg.type != aiohttp.WSMsgType.BINARY: return
+		
+		req = SerializableRequest.from_protobuf(msg.data)
 
-				await ws.send_bytes(response.to_protobuf())
-				await resp.release()
-				await session.close()
-			
-		elif msg.type == aiohttp.WSMsgType.CLOSED:
-			log.info("Server closed connection")
-			break
-		elif msg.type == aiohttp.WSMsgType.ERROR:
-			log.error(f"Server raised error {msg.data}")
-			break
+		# 转发 HTTP 请求到目标服务器
+		timeout = aiohttp.ClientTimeout(total=None, connect=None, sock_read=60, sock_connect=60)  # 设置更长的读取和连接超时时间
+		session = aiohttp.ClientSession(timeout=timeout)
+		resp = await session.request(req.method, self.config.forward_prefix + req.url, headers=req.headers, data=req.body)
+	
+		if 'text/event-stream' in resp.headers['Content-Type']:
+			log.info(f"SSE Proxy {req.method} {req.url}")
+			asyncio.ensure_future(sse_process(req, resp, session, self.ws))
+		else:
+			log.info(f"Proxy {req.method} {req.url} {resp.status} hasBody: {req.body is not None}")
+			data = await resp.content.read()
+			# 将响应数据通过 WebSocket 返回给客户端
+			response = SerializableResponse(
+				req.seq_id,
+				req.url,
+				resp.status,
+				dict(resp.headers),
+				data,
+				False
+			)
+
+			await self.ws.send_bytes(response.to_protobuf())
+			await resp.release()
+			await session.close()
 
 async def main(config: Configuration):
-	# 建立WebSocket连接
-	headers = {"Upgrade": "websocket", "Connection": "Upgrade"}
-	async with aiohttp.ClientSession() as session:
-		async with session.ws_connect(config.server, headers=headers, max_msg_size=utils.WS_MAX_MSG_SIZE) as ws:
-			print("Connected to server")
-			await websocket_process(config, ws)
+	async def mainloop(ws: aiohttp.ClientWebSocketResponse):
+		manager = wsutils.Manager(ClientCallbacks(config), ws)
+		await manager.MainLoop()
+	await wsutils.ConnectToServer(config.server, mainloop)
 
 if __name__ == "__main__":
-	argparse = argparse.ArgumentParser()
+	argparse = argp.ArgumentParser()
 	argparse = Configuration.SetupParser(argparse)
 	args = argparse.parse_args()
 	conf = Configuration(args)

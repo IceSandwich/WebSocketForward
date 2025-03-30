@@ -1,7 +1,6 @@
 import logging, os
 from datetime import datetime
 
-WS_MAX_MSG_SIZE = 12 * 1024 * 1024
 
 # 配置 logging
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')

@@ -1,7 +1,8 @@
-import asyncio, aiohttp, typing, argparse, logging
-from data import SerializableRequest, SerializableResponse
+import asyncio, aiohttp, logging
 import aiohttp.web as web
 import utils
+import wsutils
+import argparse as argp
 
 log = logging.getLogger(__name__)
 utils.SetupLogging(log, 'server')
@@ -9,150 +10,69 @@ utils.SetupLogging(log, 'server')
 class Configuration:
 	def __init__(self, args):
 		self.server: str = args.server
-		self.port: int = args.port
 
 	@classmethod
-	def SetupParser(cls, parser: argparse.ArgumentParser):
-		parser.add_argument("--server", type=str, default="127.0.0.1")
-		parser.add_argument("--port", type=int, default=8030)
+	def SetupParser(cls, parser: argp.ArgumentParser):
+		parser.add_argument("--server", type=str, default="127.0.0.1:8030")
 		return parser
 
-class WebSocketManager:
-	def __init__(self) -> None:
-		self.ws = aiohttp.web.WebSocketResponse(max_msg_size=utils.WS_MAX_MSG_SIZE)
-		self.isConnected = False
-		self.onConnected: typing.Callable[[]] = None
-		self.onDisconnected: typing.Callable[[]] = None
-		self.onError: typing.Callable[[BaseException]] = None
+	def GetListenedAddress(self):
+		return self.server
 
-		self.recvMaps: typing.Dict[str, SerializableResponse] = {}
-		self.recvCondition = asyncio.Condition()
+	def IsTCPAddress(self):
+		return not self.server.endswith('.sock')
 
-		self.ssePool: typing.Dict[str, asyncio.Queue[SerializableResponse]] = {}
+	def SeparateTCPAddress(self):
+		splitIdx = self.server.index(':')
+		server_name = self.server[:splitIdx]
+		server_port = int(self.server[splitIdx+1:])
+		return server_name, server_port
 
-	def IsClosed(self):
-		return self.ws.closed
-	
-	async def Session(self, request: SerializableRequest):
-		await self.ws.send_bytes(request.to_protobuf())
-		async with self.recvCondition:
-			await self.recvCondition.wait_for(lambda: request.seq_id in self.recvMaps)
-			resp = self.recvMaps[request.seq_id]
-			del self.recvMaps[request.seq_id]
-			return resp
-		
-	async def SessionSSE(self, seq_id: str):
-		while True:
-			data = await self.ssePool[seq_id].get()
-			if data.stream_end:
-				del self.ssePool[seq_id]
-				yield data
-				break
-			yield data
+clientOH = wsutils.OnceHandler("Client")
+remoteOH = wsutils.OnceHandler("Remote")
 
-	async def MainLoop(self, request: web.BaseRequest):
-		await self.ws.prepare(request)
-		self.isConnected = True
-		if self.onConnected:
-			self.onConnected()
-		else:
-			log.info("Websocket connected.")
+class ClientWS(wsutils.Callbacks):
+    def __init__(self):
+        super().__init__("Client")
+        
+    def OnProcess(self, ws: aiohttp.WSMessage):
+        if remoteOH.IsConnected():
+            remoteOH.GetHandler().send_bytes(ws.data)
+        else:
+            print(f"{self.name}] Remote is not connected.")
 
-		try:
-			async for msg in self.ws:
-				if msg.type == aiohttp.WSMsgType.ERROR:
-					if self.onError != None:
-						self.onError(self.ws.exception())
-					else:
-						log.error(f"WebSocket error: {self.ws.exception()}")
-				elif msg.type == aiohttp.WSMsgType.TEXT or msg.type == aiohttp.WSMsgType.BINARY:
-					resp = SerializableResponse.from_protobuf(msg.data)
-					if resp.sse_ticket:
-						isFirstSSE = resp.seq_id not in self.ssePool
-						log.debug(f"recv sse: {resp.url} isFirst: {isFirstSSE} isEnd: {resp.stream_end}")
-						if isFirstSSE:
-							self.ssePool[resp.seq_id] = asyncio.Queue()
-						else:
-							await self.ssePool[resp.seq_id].put(resp)
-						if isFirstSSE:
-							async with self.recvCondition:
-								self.recvMaps[resp.seq_id] = resp
-								self.recvCondition.notify_all()
-					else:
-						async with self.recvCondition:
-							log.debug(f"recv http: {resp.url}")
-							self.recvMaps[resp.seq_id] = resp
-							self.recvCondition.notify_all()
-		finally:
-			self.isConnected = False
-			if self.onDisconnected:
-				self.onDisconnected()
-			else:
-				log.info(f"Websocket disconnected.")
+class RemoteWS(wsutils.Callbacks):
+    def __init__(self):
+        super().__init__("Remote")
+        
+    def OnProcess(self, ws: aiohttp.WSMessage):
+        if clientOH.IsConnected():
+            clientOH.GetHandler().send_bytes(ws.data)
+        else:
+            print(f"{self.name}] Client is not connected.")
 
-		return self.ws
-	
-
-# 存储WebSocket连接
-client: typing.Union[None, WebSocketManager] = None
-
-async def websocket_handler(request):
-	global client
-	if client != None:
-		log.info(f"Already has connections")
-		return None
-
-	client = WebSocketManager()
-	def disconnected():
-		global client
-		client = None
-		log.info(f"Websocket disconnected.")
-	client.onDisconnected = disconnected
-	return await client.MainLoop(request)
-
-
-async def http_handler(request: web.Request):
-	if client is None or client.IsClosed():
-		return web.Response(status=503, text="No client connected")
-		
-	# 提取请求的相关信息
-	body = await request.read() if request.has_body else None
-	req = SerializableRequest(str(request.url.path_qs), request.method, dict(request.headers), body)
-	log.info(f"{req.method} {req.url} hasBody: {body is not None}")
-	resp = await client.Session(req)
-
-	if resp.sse_ticket:
-		async def sse_response(resp: SerializableResponse):
-			yield resp.body
-			async for package in client.SessionSSE(resp.seq_id):
-				yield package.body
-		return web.Response(
-			status=resp.status_code,
-			headers=resp.headers,
-			body=sse_response(resp)
-		)
-	else:
-		return web.Response(
-			status=resp.status_code,
-			headers=resp.headers,
-			body=resp.body
-		)
+clientOH.SetCallbacks(ClientWS())
+remoteOH.SetCallbacks(RemoteWS())
 
 async def main(config: Configuration):
 	app = web.Application()
-	app.router.add_get('/ws', websocket_handler)  # WebSocket升级端点
-	app.router.add_route('*', '/{tail:.*}', http_handler)  # HTTP服务
+	app.router.add_get('/client_ws', clientOH.Handler)
+	app.router.add_get('/remote_ws', remoteOH.Handler)
 	
 	runner = web.AppRunner(app)
 	await runner.setup()
-	site = web.TCPSite(runner, config.server, config.port)
+	if config.IsTCPAddress():
+		server_name, server_port = config.SeparateTCPAddress()
+		site = web.TCPSite(runner, server_name, server_port)
+	else:
+		site = web.UnixSite(runner, config.server)
 	await site.start()
 	
-	print(f"Server started on {config.server}:{config.port}")
+	print(f"Server started on {config.GetListenedAddress()}")
 	await asyncio.Future()
 
 if __name__ == "__main__":
-	argparse = argparse.ArgumentParser()
+	argparse = argp.ArgumentParser()
 	argparse = Configuration.SetupParser(argparse)
 	args = argparse.parse_args()
 	conf = Configuration(args)
