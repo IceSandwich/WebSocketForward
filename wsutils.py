@@ -59,7 +59,7 @@ class Manager:
 class OnceHandler:
 	def __init__(self, name: str):
 		self.name = name
-		self.client = typing.Union[None, Manager] = None
+		self.client: typing.Union[None, Manager] = None
 		self.callbacks = Callbacks()
 
 	def SetCallbacks(self, callbacks: Callbacks):
