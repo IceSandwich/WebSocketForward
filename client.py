@@ -44,8 +44,15 @@ class ClientCallbacks(wsutils.Callbacks):
 	def __init__(self, config: Configuration):
 		super().__init__("Server")
 		self.config = config
+		self.queue: asyncio.Queue[SerializableResponse] = asyncio.Queue()
 		
 	async def OnProcess(self, msg: aiohttp.WSMessage):
+		if not self.queue.empty():
+			print(f"Resend {len(self.queue)} responses.")
+			while not self.queue.empty():
+				oldresp = await self.queue.get()
+				self.ws.send_bytes(oldresp)
+		
 		if msg.type != aiohttp.WSMsgType.BINARY: return
 		
 		req = SerializableRequest.from_protobuf(msg.data)
@@ -70,16 +77,24 @@ class ClientCallbacks(wsutils.Callbacks):
 				data,
 				False
 			)
+			await self.queue.put(response)
 
-			await self.ws.send_bytes(response.to_protobuf())
+			await self.ws.send_bytes(response.to_protobuf()) # may raise error, but we can retreie old resp in queue
+			await self.queue.get()
 			await resp.release()
 			await session.close()
 
 async def main(config: Configuration):
-	async def mainloop(ws: aiohttp.ClientWebSocketResponse):
-		manager = wsutils.Manager(ClientCallbacks(config), ws)
-		await manager.MainLoop()
-	await wsutils.ConnectToServer(config.server, mainloop)
+	while True:
+		cb = ClientCallbacks(config)
+		try:
+			async def mainloop(ws: aiohttp.ClientWebSocketResponse):
+				manager = wsutils.Manager(cb, ws)
+				await manager.MainLoop()
+			await wsutils.ConnectToServer(config.server, mainloop)
+		except KeyboardInterrupt:
+			return
+		print("Reconnecting...")
 
 if __name__ == "__main__":
 	argparse = argp.ArgumentParser()
