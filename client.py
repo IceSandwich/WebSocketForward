@@ -51,7 +51,7 @@ async def websocket_process(config: Configuration, ws: aiohttp.ClientWebSocketRe
 				log.info(f"SSE Proxy {req.method} {req.url}")
 				asyncio.ensure_future(sse_process(req, resp, session, ws))
 			else:
-				log.info(f"Proxy {req.method} {req.url} {resp.status}")
+				log.info(f"Proxy {req.method} {req.url} {resp.status} hasBody: {req.body is not None}")
 				data = await resp.content.read()
 				# 将响应数据通过 WebSocket 返回给客户端
 				response = SerializableResponse(
@@ -78,7 +78,7 @@ async def main(config: Configuration):
 	headers = {"Upgrade": "websocket", "Connection": "Upgrade"}
 	async with aiohttp.ClientSession() as session:
 		async with session.ws_connect(config.server, headers=headers, max_msg_size=utils.WS_MAX_MSG_SIZE) as ws:
-			print("Connecting to server")
+			print("Connected to server")
 			await websocket_process(config, ws)
 
 if __name__ == "__main__":

@@ -116,8 +116,9 @@ async def http_handler(request: web.Request):
 		return web.Response(status=503, text="No client connected")
 		
 	# 提取请求的相关信息
-	req = SerializableRequest(str(request.url.path_qs), request.method, dict(request.headers), None if not request.body_exists else request.content.read_nowait())
-	log.info(f"{req.method} {req.url}")
+	body = await request.read() if request.has_body else None
+	req = SerializableRequest(str(request.url.path_qs), request.method, dict(request.headers), body)
+	log.info(f"{req.method} {req.url} hasBody: {body is not None}")
 	resp = await client.Session(req)
 
 	if resp.sse_ticket:
