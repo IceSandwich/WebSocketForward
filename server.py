@@ -36,16 +36,16 @@ class WebSocketManager:
 	async def Session(self, request: SerializableRequest):
 		await self.ws.send_bytes(request.to_protobuf())
 		async with self.recvCondition:
-			await self.recvCondition.wait_for(lambda: request.url in self.recvMaps)
-			resp = self.recvMaps[request.url]
-			del self.recvMaps[request.url]
+			await self.recvCondition.wait_for(lambda: request.seq_id in self.recvMaps)
+			resp = self.recvMaps[request.seq_id]
+			del self.recvMaps[request.seq_id]
 			return resp
 		
-	async def SessionSSE(self, url: str):
+	async def SessionSSE(self, seq_id: str):
 		while True:
-			data = await self.ssePool[url].get()
+			data = await self.ssePool[seq_id].get()
 			if data.stream_end:
-				del self.ssePool[url]
+				del self.ssePool[seq_id]
 				yield data
 				break
 			yield data
@@ -68,20 +68,20 @@ class WebSocketManager:
 				elif msg.type == aiohttp.WSMsgType.TEXT or msg.type == aiohttp.WSMsgType.BINARY:
 					resp = SerializableResponse.from_protobuf(msg.data)
 					if resp.sse_ticket:
-						isFirstSSE = resp.url not in self.ssePool
+						isFirstSSE = resp.seq_id not in self.ssePool
 						log.debug(f"recv sse: {resp.url} isFirst: {isFirstSSE} isEnd: {resp.stream_end}")
 						if isFirstSSE:
-							self.ssePool[resp.url] = asyncio.Queue()
+							self.ssePool[resp.seq_id] = asyncio.Queue()
 						else:
-							await self.ssePool[resp.url].put(resp)
+							await self.ssePool[resp.seq_id].put(resp)
 						if isFirstSSE:
 							async with self.recvCondition:
-								self.recvMaps[resp.url] = resp
+								self.recvMaps[resp.seq_id] = resp
 								self.recvCondition.notify_all()
 					else:
 						async with self.recvCondition:
 							log.debug(f"recv http: {resp.url}")
-							self.recvMaps[resp.url] = resp
+							self.recvMaps[resp.seq_id] = resp
 							self.recvCondition.notify_all()
 		finally:
 			self.isConnected = False
@@ -122,9 +122,9 @@ async def http_handler(request: web.Request):
 	resp = await client.Session(req)
 
 	if resp.sse_ticket:
-		async def sse_response(resp):
+		async def sse_response(resp: SerializableResponse):
 			yield resp.body
-			async for package in client.SessionSSE(resp.url):
+			async for package in client.SessionSSE(resp.seq_id):
 				yield package.body
 		return web.Response(
 			status=resp.status_code,

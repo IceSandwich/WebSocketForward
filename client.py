@@ -18,6 +18,7 @@ class Configuration:
 	
 async def sse_process(req: SerializableRequest, resp: aiohttp.ClientResponse, session: aiohttp.ClientSession, ws: aiohttp.ClientWebSocketResponse):
 	payload = SerializableResponse(
+		req.seq_id,
 		req.url,
 		resp.status,
 		dict(resp.headers),
@@ -55,6 +56,7 @@ async def websocket_process(config: Configuration, ws: aiohttp.ClientWebSocketRe
 				data = await resp.content.read()
 				# 将响应数据通过 WebSocket 返回给客户端
 				response = SerializableResponse(
+					req.seq_id,
 					req.url,
 					resp.status,
 					dict(resp.headers),
