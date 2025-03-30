@@ -35,9 +35,9 @@ class ClientWS(wsutils.Callbacks):
     def __init__(self):
         super().__init__("Client")
         
-    def OnProcess(self, ws: aiohttp.WSMessage):
+    async def OnProcess(self, msg: aiohttp.WSMessage):
         if remoteOH.IsConnected():
-            remoteOH.GetHandler().send_bytes(ws.data)
+            await remoteOH.GetHandler().send_bytes(msg.data)
         else:
             print(f"{self.name}] Remote is not connected.")
 
@@ -45,9 +45,9 @@ class RemoteWS(wsutils.Callbacks):
     def __init__(self):
         super().__init__("Remote")
         
-    def OnProcess(self, ws: aiohttp.WSMessage):
+    async def OnProcess(self, msg: aiohttp.WSMessage):
         if clientOH.IsConnected():
-            clientOH.GetHandler().send_bytes(ws.data)
+            await clientOH.GetHandler().send_bytes(msg.data)
         else:
             print(f"{self.name}] Client is not connected.")
 

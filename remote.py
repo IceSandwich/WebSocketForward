@@ -4,6 +4,7 @@ import utils, typing
 import aiohttp.web as web
 import argparse as argp
 import wsutils
+import os
 
 log = logging.getLogger(__name__)
 utils.SetupLogging(log, "remote")
@@ -30,6 +31,9 @@ class WSCallbacks(wsutils.Callbacks):
 
 	def IsClosed(self):
 		return self.ws.closed
+
+	def OnDisconnected(self):
+		os._exit(-1)
 	
 	async def Session(self, request: SerializableRequest):
 		await self.ws.send_bytes(request.to_protobuf())
@@ -138,9 +142,12 @@ async def http_main(config: Configuration):
 	print(f"Server started on 127.0.0.1:{config.port}")
 	await asyncio.Future()
 
+async def main(config: Configuration):
+    await asyncio.gather(ws_main(conf), http_main(conf))
+
 if __name__ == "__main__":
 	argparse = argp.ArgumentParser()
 	argparse = Configuration.SetupParser(argparse)
 	args = argparse.parse_args()
 	conf = Configuration(args)
-	asyncio.run(asyncio.gather([ws_main(conf), http_main(conf)]))
+	asyncio.run(main(conf))

@@ -26,8 +26,8 @@ class Callbacks:
 		pass
 
 class Manager:
-	def __init__(self, callbacks = Callbacks(), ws = web.WebSocketResponse(max_msg_size=WS_MAX_MSG_SIZE)):
-		self.ws = ws
+	def __init__(self, callbacks = Callbacks(), ws: web.WebSocketResponse = None):
+		self.ws = web.WebSocketResponse(max_msg_size=WS_MAX_MSG_SIZE) if ws is None else ws
 		self.isConnected = False
 		self.callbacks = callbacks
 		
@@ -37,10 +37,10 @@ class Manager:
 	async def MainLoop(self):
 		self.callbacks.SetWebsocket(self.ws)
 		async for msg in self.ws:
-				if msg.type == aiohttp.WSMsgType.ERROR:
-					self.callbacks.OnError(self.ws.exception())
-				elif msg.type == aiohttp.WSMsgType.TEXT or msg.type == aiohttp.WSMsgType.BINARY:
-					await self.callbacks.OnProcess(msg)
+			if msg.type == aiohttp.WSMsgType.ERROR:
+				self.callbacks.OnError(self.ws.exception())
+			elif msg.type == aiohttp.WSMsgType.TEXT or msg.type == aiohttp.WSMsgType.BINARY:
+				await self.callbacks.OnProcess(msg)
 
 	async def MainLoopOnRequest(self, request: web.BaseRequest):
 		self.callbacks.SetWebsocket(self.ws)
