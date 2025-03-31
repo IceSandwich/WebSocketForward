@@ -33,12 +33,12 @@ class Client(tunnel.WebSocketTunnelServer):
 	def __init__(self, name="WebSocket Client", **kwargs):
 		super().__init__(name=name, **kwargs)
 
-	def OnConnected(self):
+	async def OnConnected(self):
 		global client
 		if client.IsConnected():
-			print("A client want to connect but already connected to a client.")
-			return False
-		return super().OnConnected()
+			print("A client want to connect but already connected to a client. Replace them.")
+			await client.Close()
+		return await super().OnConnected()
 
 	async def OnProcess(self, raw: Transport):
 		# drop the message
@@ -52,12 +52,12 @@ class Remote(tunnel.WebSocketTunnelServer):
 	def __init__(self, name="WebSocket Remote", **kwargs):
 		super().__init__(name=name, **kwargs)
 
-	def OnConnected(self):
+	async def OnConnected(self):
 		global remote
 		if remote.IsConnected():
 			print("A remote want to connect but already connected to a remote.")
 			return False
-		return super().OnConnected()
+		return await super().OnConnected()
 
 	async def OnProcess(self, raw: Transport):
 		# drop the message

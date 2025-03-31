@@ -22,7 +22,7 @@ class Tunnel(abc.ABC):
 	def IsConnected(self) -> bool:
 		return self.isConnected
 
-	def OnConnected(self) -> bool:
+	async def OnConnected(self) -> bool:
 		"""
 		返回False取消连接
 		"""
@@ -71,7 +71,7 @@ class WebSocketTunnelServer(WebSocketTunnelBase):
 
 	async def MainLoopOnRequest(self, request: web.BaseRequest):
 		await self.ws.prepare(request)
-		if self.OnConnected() == False:
+		if await self.OnConnected() == False:
 			return self.ws
 		try:
 			await self.MainLoop()
@@ -83,6 +83,9 @@ class WebSocketTunnelServer(WebSocketTunnelBase):
 	
 	async def QueueToSend(self, raw: data.Transport):
 		await self.ws.send_bytes(raw.ToProtobuf())
+
+	async def Close(self):
+		await self.ws.close()
 
 class Chunk:
 	def __init__(self, total_cnt: int):
@@ -205,10 +208,10 @@ class WebSocketTunnelClient(WebSocketTunnelBase):
 	async def MainLoop(self):
 		curTries = 1
 		while curTries < self.maxRetries:
-			# try:
+			try:
 				async with self.session.ws_connect(self.url, headers=WebSocketTunnelBase.Headers, max_msg_size=WebSocketTunnelBase.MaxMessageSize) as ws:
 					self.handler = ws
-					if self.OnConnected() == False:
+					if await self.OnConnected() == False:
 						break
 					curTries = 1
 					if not self.send_queue.empty():
@@ -220,10 +223,10 @@ class WebSocketTunnelClient(WebSocketTunnelBase):
 						elif msg.type == aiohttp.WSMsgType.TEXT or msg.type == aiohttp.WSMsgType.BINARY:
 							parsed = data.Transport.FromProtobuf(msg.data)
 							await self.OnProcess(parsed)
-			# except Exception as e:
-			# 	curTries += 1
-			# 	print(f"{self.name}] Reconnecting({curTries}/{self.maxRetries}) due to exception: {e.with_traceback()}")
-			# 	await self.OnDisconnected()
+			except Exception as e:
+				curTries += 1
+				print(f"{self.name}] Reconnecting({curTries}/{self.maxRetries}) due to exception: {e.with_traceback()}")
+				await self.OnDisconnected()
 		await self.session.close()
 		return self.handler
 	

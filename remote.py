@@ -50,10 +50,10 @@ class Client(IClient):
 		self.ssePool: typing.Dict[str, asyncio.PriorityQueue[data.Transport]] = {} # a pool with sse_subpackage
 		self.sseCondition = asyncio.Condition()
 
-	def OnConnected(self) -> bool:
+	async def OnConnected(self) -> bool:
 		global client
 		client = self
-		return super().OnConnected()
+		return await super().OnConnected()
 	
 	async def OnDisconnected(self):
 		global client
