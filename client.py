@@ -12,7 +12,6 @@ utils.SetupLogging(log, "client")
 class Configuration:
 	def __init__(self, args):
 		self.server: str = args.server
-		self.prefix: str = args.prefix
 		if args.cipher != "":
 			self.cipher = encrypt.NewCipher(args.cipher, args.key)
 		else:
@@ -23,7 +22,6 @@ class Configuration:
 		parser.add_argument("--server", type=str, default="http://127.0.0.1:8030/client_ws")
 		parser.add_argument("--cipher", type=str, default="xor")
 		parser.add_argument("--key", type=str, default="websocket forward")
-		parser.add_argument("--prefix", type=str, default="http://127.0.0.1:7860")
 		return parser
 class ReqChunk:
 	def __init__(self, total_cnt: int):
@@ -116,7 +114,7 @@ class Client(tunnel.WebSocketTunnelClient):
 		rawData = raw.data if self.config.cipher is None else self.config.cipher.Decrypt(raw.data)
 		req = data.Request.FromProtobuf(rawData)
 
-		resp = await self.forward_session.request(req.method, self.config.prefix + req.url, headers=req.headers, data=req.body)
+		resp = await self.forward_session.request(req.method, req.url, headers=req.headers, data=req.body)
 	
 		if 'text/event-stream' in resp.headers['Content-Type']:
 			log.info(f"SSE {req.method} {req.url} >>> Open")

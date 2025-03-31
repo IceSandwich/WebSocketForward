@@ -13,6 +13,7 @@ class Configuration:
 	def __init__(self, args):
 		self.server: str = args.server
 		self.port: int = args.port
+		self.prefix: str = args.prefix
 		if args.cipher != "":
 			self.cipher = encrypt.NewCipher(args.cipher, args.key)
 		else:
@@ -21,6 +22,7 @@ class Configuration:
 	@classmethod
 	def SetupParser(cls, parser: argp.ArgumentParser):
 		parser.add_argument("--server", type=str, default="http://127.0.0.1:8030/remote_ws")
+		parser.add_argument("--prefix", type=str, default="http://127.0.0.1:7860")
 		parser.add_argument("--port", type=int, default=8130)
 		parser.add_argument("--cipher", type=str, default="xor")
 		parser.add_argument("--key", type=str, default="websocket forward")
@@ -146,7 +148,7 @@ class HttpServer:
 			
 		# 提取请求的相关信息
 		body = await request.read() if request.can_read_body else None
-		req = data.Request(str(request.url.path_qs), request.method, dict(request.headers), body=body)
+		req = data.Request(self.config.prefix + str(request.url.path_qs), request.method, dict(request.headers), body=body)
 		log.info(f"{req.method} {req.url}")
 		resp, seq_id = await client.Session(req)
 
