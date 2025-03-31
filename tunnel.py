@@ -127,13 +127,13 @@ class WebSocketTunnelClient(WebSocketTunnelBase):
 		
 	async def resend(self):
 		nowtime = time_utils.GetTimestamp()
-		while self.isConnected and not self.send_queue.empty():
+		while self.IsConnected() and not self.send_queue.empty():
 			item = await self.send_queue.get()
 			if time_utils.WithInDuration(item.timestamp, nowtime, self.resendDuration):
 				try:
 					await self.handler.send_bytes(item.ToProtobuf())
 				except aiohttp.ClientConnectionResetError:
-					await self.send_queue.put(item)
+					await self.send_queue.put(item) # put it back
 					return # wait for next resend
 			else:
 				print(f"{self.name}] Skip resending a package because the package is toooo old.")
