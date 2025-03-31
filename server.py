@@ -1,11 +1,9 @@
-import asyncio, aiohttp, logging
+import asyncio
 import aiohttp.web as web
-import utils
-import wsutils
+from data import Transport
 import argparse as argp
-
-log = logging.getLogger(__name__)
-utils.SetupLogging(log, 'server')
+import tunnel
+import typing
 
 class Configuration:
 	def __init__(self, args):
@@ -28,36 +26,51 @@ class Configuration:
 		server_port = int(self.server[splitIdx+1:])
 		return server_name, server_port
 
-clientOH = wsutils.OnceHandler("Client")
-remoteOH = wsutils.OnceHandler("Remote")
+client: typing.Union[None, tunnel.WebSocketTunnelServer] = None
+remote: typing.Union[None, tunnel.WebSocketTunnelServer] = None
 
-class ClientWS(wsutils.Callbacks):
-    def __init__(self):
-        super().__init__("Client")
-        
-    async def OnProcess(self, msg: aiohttp.WSMessage):
-        if remoteOH.IsConnected():
-            await remoteOH.GetHandler().send_bytes(msg.data)
-        else:
-            print(f"{self.name}] Remote is not connected.")
+class Client(tunnel.WebSocketTunnelServer):
+	def __init__(self, name="WebSocket Client", **kwargs):
+		super().__init__(name=name, **kwargs)
 
-class RemoteWS(wsutils.Callbacks):
-    def __init__(self):
-        super().__init__("Remote")
-        
-    async def OnProcess(self, msg: aiohttp.WSMessage):
-        if clientOH.IsConnected():
-            await clientOH.GetHandler().send_bytes(msg.data)
-        else:
-            print(f"{self.name}] Client is not connected.")
+	def OnConnected(self):
+		global client
+		if client.IsConnected():
+			print("A client want to connect but already connected to a client.")
+			return False
+		return super().OnConnected()
 
-clientOH.SetCallbacks(ClientWS())
-remoteOH.SetCallbacks(RemoteWS())
+	async def OnProcess(self, raw: Transport):
+		# drop the message
+		if remote is None or not remote.IsConnected(): return
+
+		await remote.QueueToSend(raw)
+
+client = Client()
+
+class Remote(tunnel.WebSocketTunnelServer):
+	def __init__(self, name="WebSocket Remote", **kwargs):
+		super().__init__(name=name, **kwargs)
+
+	def OnConnected(self):
+		global remote
+		if remote.IsConnected():
+			print("A remote want to connect but already connected to a remote.")
+			return False
+		return super().OnConnected()
+
+	async def OnProcess(self, raw: Transport):
+		# drop the message
+		if client is None or not client.IsConnected(): return
+
+		await client.QueueToSend(raw)
+
+remote = Remote()
 
 async def main(config: Configuration):
 	app = web.Application()
-	app.router.add_get('/client_ws', clientOH.Handler)
-	app.router.add_get('/remote_ws', remoteOH.Handler)
+	app.router.add_get('/client_ws', client.MainLoopOnRequest)
+	app.router.add_get('/remote_ws', remote.MainLoopOnRequest)
 	
 	runner = web.AppRunner(app)
 	await runner.setup()
