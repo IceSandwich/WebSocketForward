@@ -4,6 +4,10 @@ from data import Transport
 import argparse as argp
 import tunnel
 import typing
+import utils, logging
+
+log = logging.getLogger(__name__)
+utils.SetupLogging(log, "server")
 
 class Configuration:
 	def __init__(self, args):
@@ -36,8 +40,8 @@ class Client(tunnel.WebSocketTunnelServer):
 	async def OnConnected(self):
 		global client
 		if client.IsConnected():
-			print("A client want to connect but already connected to a client. Replace them.")
-			await client.Close()
+			print("A client want to connect but already connected to a client..")
+			return False
 		return await super().OnConnected()
 
 	async def OnProcess(self, raw: Transport):

@@ -54,7 +54,7 @@ class ReqChunk:
 
 class Client(tunnel.WebSocketTunnelClient):
 	def __init__(self, config: Configuration):
-		super().__init__(config.server)
+		super().__init__(config.server, maxRetries=1)
 		self.config = config
 		self.forward_session = aiohttp.ClientSession()
 		self.subpackages: typing.Dict[str, ReqChunk] = {}

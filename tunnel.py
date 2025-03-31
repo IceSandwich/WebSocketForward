@@ -122,7 +122,7 @@ class WebSocketTunnelClient(WebSocketTunnelBase):
 		self.handler: typing.Union[None, aiohttp.ClientWebSocketResponse] = None
 
 		# self.timeout = aiohttp.ClientTimeout(total=None, connect=None, sock_read=60, sock_connect=60)
-		self.session = aiohttp.ClientSession()
+		# self.session = aiohttp.ClientSession()
 
 		self.chunks: typing.Dict[str, Chunk] = {}
 		
@@ -207,30 +207,30 @@ class WebSocketTunnelClient(WebSocketTunnelBase):
 			
 	async def MainLoop(self):
 		curTries = 1
-		while curTries < self.maxRetries:
+		while curTries <= self.maxRetries:
 			try:
-				async with self.session.ws_connect(self.url, headers=WebSocketTunnelBase.Headers, max_msg_size=WebSocketTunnelBase.MaxMessageSize) as ws:
-					self.handler = ws
-					if await self.OnConnected() == False:
-						break
-					curTries = 1
-					if not self.send_queue.empty():
-						print(f"{self.name}] Resend {len(self.send_queue)} requests.")
-						asyncio.create_task(self.resend())
-					async for msg in self.handler:
-						if msg.type == aiohttp.WSMsgType.ERROR:
-							self.OnError(self.handler.exception())
-						elif msg.type == aiohttp.WSMsgType.TEXT or msg.type == aiohttp.WSMsgType.BINARY:
-							parsed = data.Transport.FromProtobuf(msg.data)
-							await self.OnProcess(parsed)
+				async with aiohttp.ClientSession() as session:
+					async with session.ws_connect(self.url, headers=WebSocketTunnelBase.Headers, max_msg_size=WebSocketTunnelBase.MaxMessageSize) as ws:
+						self.handler = ws
+						if await self.OnConnected() == False:
+							break
+						curTries = 1
+						if not self.send_queue.empty():
+							print(f"{self.name}] Resend {len(self.send_queue)} requests.")
+							asyncio.create_task(self.resend())
+						async for msg in self.handler:
+							if msg.type == aiohttp.WSMsgType.ERROR:
+								self.OnError(self.handler.exception())
+							elif msg.type == aiohttp.WSMsgType.TEXT or msg.type == aiohttp.WSMsgType.BINARY:
+								parsed = data.Transport.FromProtobuf(msg.data)
+								await self.OnProcess(parsed)
 			except Exception as e:
 				curTries += 1
 				print(f"{self.name}] Reconnecting({curTries}/{self.maxRetries}) due to exception: {e.with_traceback()}")
 				await self.OnDisconnected()
-		await self.session.close()
 		return self.handler
 	
 	async def Close(self):
 		print("Closing...")
-		await self.session.close()
+		# await self.session.close()
 		await self.OnDisconnected()
