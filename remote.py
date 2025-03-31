@@ -76,6 +76,14 @@ class Client(IClient):
 			return resp, package.seq_id
 		
 	async def SessionSSE(self, seq_id: str):
+		while True:
+			item = await self.ssePool[seq_id].get()
+			if item.total_cnt == -1:
+				del self.ssePool[seq_id]
+				yield item.data
+				break
+			yield item.data
+		return
 		expect_idx = 1 # 跳过了response，第一个sse_subpackage是1
 		last_len = self.ssePool[seq_id].qsize()
 		while True:

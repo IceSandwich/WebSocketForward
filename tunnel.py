@@ -120,7 +120,7 @@ class WebSocketTunnelClient(WebSocketTunnelBase):
 		
 		self.handler: typing.Union[None, aiohttp.ClientWebSocketResponse] = None
 
-		# self.timeout = aiohttp.ClientTimeout(total=None, connect=None, sock_read=60, sock_connect=60)
+		self.timeout = aiohttp.ClientTimeout(total=None, connect=None, sock_read=60, sock_connect=60)
 		# self.session = aiohttp.ClientSession()
 
 		self.chunks: typing.Dict[str, Chunk] = {}

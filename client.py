@@ -28,7 +28,11 @@ class Client(tunnel.WebSocketTunnelClient):
 	def __init__(self, config: Configuration):
 		super().__init__(config.server)
 		self.config = config
-		self.forward_session = aiohttp.ClientSession()
+		self.forward_session: aiohttp.ClientSession = None
+
+	async def OnConnected(self) -> bool:
+		self.forward_session = aiohttp.ClientSession(timeout=self.timeout)
+		return await super().OnConnected()
 
 	async def OnDisconnected(self):
 		await self.forward_session.close()
