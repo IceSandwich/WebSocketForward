@@ -23,41 +23,12 @@ class Configuration:
 		parser.add_argument("--cipher", type=str, default="xor")
 		parser.add_argument("--key", type=str, default="websocket forward")
 		return parser
-class ReqChunk:
-	def __init__(self, total_cnt: int):
-		self.total_cnt = total_cnt
-		self.data: typing.List[bytes] = [None] * total_cnt
-		self.cur_idx = 0
-		self.req = None
-
-	def IsFinish(self):
-		return self.cur_idx >= self.total_cnt
-
-	def Put(self, raw: typing.Union[data.Transport]):
-		if raw.data_type not in [data.TransportDataType.SUBPACKAGE, data.TransportDataType.REQUEST]:
-			raise Exception("unknown type")
-		if self.IsFinish():
-			raise Exception("already full.")
-		
-		self.data[raw.cur_idx] = raw.body
-		if raw.data_type == data.TransportDataType.REQUEST:
-			self.req = raw
-		
-		self.cur_idx = self.cur_idx + 1
-	
-	def Combine(self):
-		raw = b''.join(self.data)
-		self.req.body = raw
-		self.req.cur_idx = 0
-		self.req.total_cnt = 1
-		return self.req
 
 class Client(tunnel.WebSocketTunnelClient):
 	def __init__(self, config: Configuration):
-		super().__init__(config.server, maxRetries=1)
+		super().__init__(config.server)
 		self.config = config
 		self.forward_session = aiohttp.ClientSession()
-		self.subpackages: typing.Dict[str, ReqChunk] = {}
 
 	async def OnDisconnected(self):
 		await self.forward_session.close()

@@ -58,7 +58,7 @@ class Client(IClient):
 	async def OnDisconnected(self):
 		global client
 		client = None
-		return super().OnDisconnected()
+		return await super().OnDisconnected()
 	
 	async def Session(self, request: data.Request):
 		"""

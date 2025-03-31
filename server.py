@@ -39,10 +39,16 @@ class Client(tunnel.WebSocketTunnelServer):
 
 	async def OnConnected(self):
 		global client
-		if client.IsConnected():
+		if client is not None and client.IsConnected():
 			print("A client want to connect but already connected to a client..")
 			return False
+		client = self
 		return await super().OnConnected()
+
+	async def OnDisconnected(self):
+		global client
+		client = None
+		return await super().OnDisconnected()
 
 	async def OnProcess(self, raw: Transport):
 		# drop the message
@@ -50,18 +56,22 @@ class Client(tunnel.WebSocketTunnelServer):
 
 		await remote.QueueToSend(raw)
 
-client = Client()
-
 class Remote(tunnel.WebSocketTunnelServer):
 	def __init__(self, name="WebSocket Remote", **kwargs):
 		super().__init__(name=name, **kwargs)
 
 	async def OnConnected(self):
 		global remote
-		if remote.IsConnected():
+		if remote is not None and remote.IsConnected():
 			print("A remote want to connect but already connected to a remote.")
 			return False
+		remote = self
 		return await super().OnConnected()
+
+	async def OnDisconnected(self):
+		global remote
+		remote = None
+		return await super().OnDisconnected()
 
 	async def OnProcess(self, raw: Transport):
 		# drop the message
@@ -69,12 +79,10 @@ class Remote(tunnel.WebSocketTunnelServer):
 
 		await client.QueueToSend(raw)
 
-remote = Remote()
-
 async def main(config: Configuration):
 	app = web.Application()
-	app.router.add_get('/client_ws', client.MainLoopOnRequest)
-	app.router.add_get('/remote_ws', remote.MainLoopOnRequest)
+	app.router.add_get('/client_ws', tunnel.WebSocketTunnelServerHandler(Client))
+	app.router.add_get('/remote_ws', tunnel.WebSocketTunnelServerHandler(Remote))
 	
 	runner = web.AppRunner(app)
 	await runner.setup()

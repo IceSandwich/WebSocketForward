@@ -69,23 +69,22 @@ class WebSocketTunnelServer(WebSocketTunnelBase):
 				transport = data.Transport.FromProtobuf(msg.data)
 				await self.OnProcess(transport)
 
-	async def MainLoopOnRequest(self, request: web.BaseRequest):
-		await self.ws.prepare(request)
-		if await self.OnConnected() == False:
-			return self.ws
-		try:
-			await self.MainLoop()
-		except Exception as ex:
-			self.OnError(ex)
-			await self.OnDisconnected()
-		await self.ws.close()
-		return self.ws
-	
 	async def QueueToSend(self, raw: data.Transport):
 		await self.ws.send_bytes(raw.ToProtobuf())
 
-	async def Close(self):
-		await self.ws.close()
+def WebSocketTunnelServerHandler(cls: typing.Type[WebSocketTunnelServer]):
+    async def mainloop(request: web.BaseRequest):
+        instance = cls()
+        if await instance.OnConnected() == False:
+            return None
+        await instance.ws.prepare(request)
+        try:
+            await instance.MainLoop()
+        except Exception as ex:
+            instance.OnError(ex)
+        await instance.OnDisconnected()
+        return instance.ws
+    return mainloop
 
 class Chunk:
 	def __init__(self, total_cnt: int):
@@ -206,31 +205,26 @@ class WebSocketTunnelClient(WebSocketTunnelBase):
 			await self.send_queue.put(raw)
 			
 	async def MainLoop(self):
-		curTries = 1
-		while curTries <= self.maxRetries:
-			try:
-				async with aiohttp.ClientSession() as session:
-					async with session.ws_connect(self.url, headers=WebSocketTunnelBase.Headers, max_msg_size=WebSocketTunnelBase.MaxMessageSize) as ws:
-						self.handler = ws
-						if await self.OnConnected() == False:
-							break
-						curTries = 1
-						if not self.send_queue.empty():
-							print(f"{self.name}] Resend {len(self.send_queue)} requests.")
-							asyncio.create_task(self.resend())
-						async for msg in self.handler:
-							if msg.type == aiohttp.WSMsgType.ERROR:
-								self.OnError(self.handler.exception())
-							elif msg.type == aiohttp.WSMsgType.TEXT or msg.type == aiohttp.WSMsgType.BINARY:
-								parsed = data.Transport.FromProtobuf(msg.data)
-								await self.OnProcess(parsed)
-			except Exception as e:
-				curTries += 1
-				print(f"{self.name}] Reconnecting({curTries}/{self.maxRetries}) due to exception: {e.with_traceback()}")
-				await self.OnDisconnected()
-		return self.handler
-	
-	async def Close(self):
-		print("Closing...")
-		# await self.session.close()
-		await self.OnDisconnected()
+		curTries = 0
+		while curTries < self.maxRetries:
+			async with aiohttp.ClientSession() as session:
+				async with session.ws_connect(self.url, headers=WebSocketTunnelBase.Headers, max_msg_size=WebSocketTunnelBase.MaxMessageSize) as ws:
+					self.handler = ws
+					if await self.OnConnected() == False:
+						break
+					curTries = 0
+					if not self.send_queue.empty():
+						print(f"{self.name}] Resend {len(self.send_queue)} requests.")
+						asyncio.create_task(self.resend())
+					async for msg in self.handler:
+						if msg.type == aiohttp.WSMsgType.ERROR:
+							self.OnError(self.handler.exception())
+						elif msg.type == aiohttp.WSMsgType.TEXT or msg.type == aiohttp.WSMsgType.BINARY:
+							parsed = data.Transport.FromProtobuf(msg.data)
+							await self.OnProcess(parsed)
+			curTries += 1
+			print(f"{self.name}] Reconnecting({curTries}/{self.maxRetries})...")
+			await self.OnDisconnected()
+		bakHandler = self.handler
+		self.handler = None
+		return bakHandler
