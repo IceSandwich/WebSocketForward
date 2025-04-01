@@ -174,7 +174,7 @@ class WebSocketTunnelClient(WebSocketTunnelBase):
 				raw.data = cipher.Encrypt(raw.data)
 			await self.QueueToSend(raw)
 		else:
-			log.debug(f"Request {raw.seq_id} {template.url} is too large({len(buffer)}), will be split into {len(splitDatas)} packages to send.")
+			self.log.debug(f"Request {raw.seq_id} {template.url} is too large({len(buffer)}), will be split into {len(splitDatas)} packages to send.")
 			# 多个Subpackage，先发送Subpackage，然后最后一个发送Response/Request
 			raw.total_cnt = len(splitDatas) # 总共需要发送的次数
 			raw.data_type = data.TransportDataType.SUBPACKAGE
@@ -204,7 +204,7 @@ class WebSocketTunnelClient(WebSocketTunnelBase):
 				await self.send_queue.put(raw)
 			except Exception as e:
 				# skip package for unknown reason
-				log.error(f"{self.name}] Unknown exception on QueueToSend(): {e}")
+				self.log.error(f"{self.name}] Unknown exception on QueueToSend(): {e}")
 		else:
 			# not connected, cacheing data
 			await self.send_queue.put(raw)
