@@ -1,13 +1,8 @@
-import asyncio
+import asyncio, typing
 import aiohttp.web as web
-import data
 import argparse as argp
-import tunnel
 import typing
-import utils, logging
-import asyncio
-import collections
-T = typing.TypeVar('T')
+import data, tunnel, utils, logging, time_utils
 
 log = logging.getLogger(__name__)
 utils.SetupLogging(log, "server")
@@ -18,7 +13,7 @@ class Configuration:
 
 	@classmethod
 	def SetupParser(cls, parser: argp.ArgumentParser):
-		parser.add_argument("--server", type=str, default="127.0.0.1:8030")
+		parser.add_argument("--server", type=str, default="127.0.0.1:8030", help="The address to listen on.")
 		return parser
 
 	def GetListenedAddress(self):
@@ -33,86 +28,76 @@ class Configuration:
 		server_port = int(self.server[splitIdx+1:])
 		return server_name, server_port
 
-class BoundedQueue(typing.Generic[T]):
-	def __init__(self, capacity: int):
-		# 初始化容量和队列
-		self.capacity = capacity
-		self.queue = collections.deque()
-	
-	def Add(self, item: T):
-		# 如果队列已满，删除最旧的元素
-		if len(self.queue) >= self.capacity:
-			self.queue.popleft()
-		# 添加新元素到队列末尾
-		self.queue.append(item)
-	
-	def GetElements(self) -> typing.List[T]:
-		# 获取队列中的所有元素
-		return list(self.queue)
-
-	def Clear(self):
-		self.queue.clear()
-	
-	def GetSize(self):
-		# 获取当前队列的大小
-		return len(self.queue)
-
-	def IsEmpty(self):
-		return len(self.queue) == 0
-
 client: typing.Union[None, tunnel.WebSocketTunnelServer] = None
 remote: typing.Union[None, tunnel.WebSocketTunnelServer] = None
-toClient: BoundedQueue[data.Transport] = BoundedQueue(100)
-toRemote: BoundedQueue[data.Transport] = BoundedQueue(100)
+toClient: utils.BoundedQueue[data.Transport] = utils.BoundedQueue(100)
+toRemote: utils.BoundedQueue[data.Transport] = utils.BoundedQueue(100)
 
-class Client(tunnel.WebSocketTunnelServer):
+MaxTimeout = time_utils.Minutes(1) # 丢弃超过1分钟的包
+
+class Common(tunnel.WebSocketTunnelServer):
+	def __init__(self, name="WebSocket Common", **kwargs):
+		super().__init__(name=name, log=log, **kwargs)
+
+	async def resend(self, queue: utils.BoundedQueue[data.Transport]):
+		if queue.IsEmpty(): return
+
+		items = await queue.PopAllElements()
+		log.info(f"{self.name}] Resend {len(items)} package.")
+		nowtime = time_utils.GetTimestamp()
+		for item in items:
+			if time_utils.WithInDuration(item.timestamp, nowtime, MaxTimeout):
+				await self.QueueToSend(item)
+			else:
+				log.warning(f"{self.name}] Drop package {item.seq_id} {data.TransportDataType.ToString(item.data_type)} due to outdated.")
+
+class Client(Common):
 	def __init__(self, name="WebSocket Client", **kwargs):
 		super().__init__(name=name, **kwargs)
 
-	async def OnConnected(self):
+	async def OnPreConnected(self) -> bool:
 		global client
 		if client is not None and client.IsConnected():
-			print("A client want to connect but already connected to a client..")
+			log.error("A client want to connect but already connected to a client..")
 			return False
+		return await super().OnPreConnected()
+
+	async def OnConnected(self):
+		global client
 		client = self
-		if not toClient.IsEmpty():
-			print(f"Resend {toClient.GetSize()} package to client.")
-			items = toClient.GetElements()
-			toClient.Clear()
-			for item in items:
-				self.QueueToSend(item)
-		return await super().OnConnected()
+		await self.resend(toClient)
+		await super().OnConnected()
 
 	async def OnDisconnected(self):
 		global client
 		client = None
-		return await super().OnDisconnected()
+		await super().OnDisconnected()
 
 	async def OnProcess(self, raw: data.Transport):
+		global remote
 		# drop the message
 		if remote is None or not remote.IsConnected():
-			toRemote.Add(raw)
+			await toRemote.Add(raw)
 			return
 
 		await remote.QueueToSend(raw)
 
-class Remote(tunnel.WebSocketTunnelServer):
+class Remote(Common):
 	def __init__(self, name="WebSocket Remote", **kwargs):
 		super().__init__(name=name, **kwargs)
 
-	async def OnConnected(self):
+	async def OnPreConnected(self) -> bool:
 		global remote
 		if remote is not None and remote.IsConnected():
-			print("A remote want to connect but already connected to a remote.")
+			log.error("A remote want to connect but already connected to a remote.")
 			return False
+		return await super().OnPreConnected()
+
+	async def OnConnected(self):
+		global remote
 		remote = self
-		if not toRemote.IsEmpty():
-			print(f"Resend {toRemote.GetSize()} package to remote.")
-			items = toRemote.GetElements()
-			toRemote.Clear()
-			for item in items:
-				self.QueueToSend(item)
-		return await super().OnConnected()
+		await self.resend(toRemote)
+		await super().OnConnected()
 
 	async def OnDisconnected(self):
 		global remote
@@ -120,6 +105,7 @@ class Remote(tunnel.WebSocketTunnelServer):
 		return await super().OnDisconnected()
 
 	async def OnProcess(self, raw: data.Transport):
+		global client
 		# drop the message
 		if client is None or not client.IsConnected(): return
 
@@ -139,7 +125,7 @@ async def main(config: Configuration):
 		site = web.UnixSite(runner, config.server)
 	await site.start()
 	
-	print(f"Server started on {config.GetListenedAddress()}")
+	log.info(f"Server started on {config.GetListenedAddress()}")
 	await asyncio.Future()
 
 if __name__ == "__main__":

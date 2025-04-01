@@ -1,41 +1,42 @@
-﻿import aiohttp
-import aiohttp.web_ws
-import typing
-import abc
-import asyncio
-import time_utils
-import data
+﻿import typing, abc, logging, utils
+import asyncio, aiohttp
+import time_utils, data, encrypt
 import aiohttp.web as web
-import encrypt
+
+tunlog = logging.getLogger(__name__)
+utils.SetupLogging(tunlog, "tunnel", saveInFile=False)
 
 class Tunnel(abc.ABC):
 	"""
 	支持重连机制的隧道
 	"""
-	def __init__(self, name: str = "Tunnel", maxRetries: int = 3, resendDuration: int = time_utils.Minutes(5)):
+	def __init__(self, name: str = "Tunnel", maxRetries: int = 3, resendDuration: int = time_utils.Minutes(5), log: logging.Logger = tunlog):
 		self.name = name
 		self.maxRetries = maxRetries
 		self.resendDuration = resendDuration
 		self.isConnected = False
 		self.send_queue: asyncio.Queue[data.Transport] = asyncio.Queue()
+		self.log = log
 
 	def IsConnected(self) -> bool:
 		return self.isConnected
-
-	async def OnConnected(self) -> bool:
+	
+	async def OnPreConnected(self) -> bool:
 		"""
-		返回False取消连接
+		连接前可以在此函数判断是否需要取消连接，返回False取消连接。
 		"""
-		print(f"{self.name}] Connected.")
-		self.isConnected = True
 		return True
+
+	async def OnConnected(self):
+		self.log.info(f"{self.name}] Connected.")
+		self.isConnected = True
 		
 	async def OnDisconnected(self):
-		print(f"{self.name}] Disconnected.")
+		self.log.info(f"{self.name}] Disconnected.")
 		self.isConnected = False
 		
 	def OnError(self, ex: typing.Union[None, BaseException]):
-		print(f"{self.name}] Error: {ex}")
+		self.log.info(f"{self.name}] Error: {ex}")
 
 	async def OnProcess(self, raw: data.Transport):
 		pass
@@ -73,18 +74,19 @@ class WebSocketTunnelServer(WebSocketTunnelBase):
 		await self.ws.send_bytes(raw.ToProtobuf())
 
 def WebSocketTunnelServerHandler(cls: typing.Type[WebSocketTunnelServer]):
-    async def mainloop(request: web.BaseRequest):
-        instance = cls()
-        if await instance.OnConnected() == False:
-            return None
-        await instance.ws.prepare(request)
-        try:
-            await instance.MainLoop()
-        except Exception as ex:
-            instance.OnError(ex)
-        await instance.OnDisconnected()
-        return instance.ws
-    return mainloop
+	async def mainloop(request: web.BaseRequest):
+		instance = cls()
+		if await instance.OnPreConnected() == False:
+			return None
+		await instance.ws.prepare(request)
+		await instance.OnConnected()
+		try:
+			await instance.MainLoop()
+		except Exception as ex:
+			instance.OnError(ex)
+		await instance.OnDisconnected()
+		return instance.ws
+	return mainloop
 
 class Chunk:
 	def __init__(self, total_cnt: int):
@@ -126,17 +128,19 @@ class WebSocketTunnelClient(WebSocketTunnelBase):
 		self.chunks: typing.Dict[str, Chunk] = {}
 		
 	async def resend(self):
+		self.log.info(f"{self.name}] Resend {len(self.send_queue)} requests.")
 		nowtime = time_utils.GetTimestamp()
 		while self.IsConnected() and not self.send_queue.empty():
 			item = await self.send_queue.get()
 			if time_utils.WithInDuration(item.timestamp, nowtime, self.resendDuration):
 				try:
 					await self.handler.send_bytes(item.ToProtobuf())
-				except aiohttp.ClientConnectionResetError:
+				except aiohttp.ClientConnectionResetError as e:
+					self.log.error(f"{self.name}] Failed to resend {item.seq_id} but luckily it's ClientConnectionResetError so we plan to resent it next time: {e}")
 					await self.send_queue.put(item) # put it back
 					return # wait for next resend
 			else:
-				print(f"{self.name}] Skip resending a package because the package is toooo old.")
+				self.log.warning(f"{self.name}] Skip resending{item.seq_id} because the package is too old.")
 
 	async def ReadSegments(self, raw: data.Transport):
 		"""
@@ -170,6 +174,7 @@ class WebSocketTunnelClient(WebSocketTunnelBase):
 				raw.data = cipher.Encrypt(raw.data)
 			await self.QueueToSend(raw)
 		else:
+			log.debug(f"Request {raw.seq_id} {template.url} is too large({len(buffer)}), will be split into {len(splitDatas)} packages to send.")
 			# 多个Subpackage，先发送Subpackage，然后最后一个发送Response/Request
 			raw.total_cnt = len(splitDatas) # 总共需要发送的次数
 			raw.data_type = data.TransportDataType.SUBPACKAGE
@@ -199,7 +204,7 @@ class WebSocketTunnelClient(WebSocketTunnelBase):
 				await self.send_queue.put(raw)
 			except Exception as e:
 				# skip package for unknown reason
-				print(f"{self.name}] Unknown exception on QueueToSend(): {e}")
+				log.error(f"{self.name}] Unknown exception on QueueToSend(): {e}")
 		else:
 			# not connected, cacheing data
 			await self.send_queue.put(raw)
@@ -210,12 +215,10 @@ class WebSocketTunnelClient(WebSocketTunnelBase):
 			async with aiohttp.ClientSession() as session:
 				async with session.ws_connect(self.url, headers=WebSocketTunnelBase.Headers, max_msg_size=WebSocketTunnelBase.MaxMessageSize) as ws:
 					self.handler = ws
-					if await self.OnConnected() == False:
-						break
-					curTries = 0
-					if not self.send_queue.empty():
-						print(f"{self.name}] Resend {len(self.send_queue)} requests.")
-						asyncio.create_task(self.resend())
+					if await self.OnPreConnected() == False: break
+					await self.OnConnected()
+					curTries = 0 # reset tries
+					if not self.send_queue.empty(): asyncio.create_task(self.resend())
 					async for msg in self.handler:
 						if msg.type == aiohttp.WSMsgType.ERROR:
 							self.OnError(self.handler.exception())
@@ -223,7 +226,7 @@ class WebSocketTunnelClient(WebSocketTunnelBase):
 							parsed = data.Transport.FromProtobuf(msg.data)
 							await self.OnProcess(parsed)
 			curTries += 1
-			print(f"{self.name}] Reconnecting({curTries}/{self.maxRetries})...")
+			self.log.info(f"{self.name}] Reconnecting({curTries}/{self.maxRetries})...")
 			await self.OnDisconnected()
 		bakHandler = self.handler
 		self.handler = None

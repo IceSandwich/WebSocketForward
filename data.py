@@ -10,6 +10,21 @@ class TransportDataType:
 	SUBPACKAGE = 3
 	SSE_SUBPACKAGE = 4
 
+	@classmethod
+	def ToString(cls, t: int):
+		if t == cls.CONTROL:
+			return 'CONTROL'
+		elif t == cls.REQUEST:
+			return 'REQUEST'
+		elif t == cls.RESPONSE:
+			return 'RESPONSE'
+		elif t == cls.SUBPACKAGE:
+			return 'SUBPACKAGE'
+		elif t == cls.SSE_SUBPACKAGE:
+			return 'SSE_SUBPACKAGE'
+		else:
+			raise Exception(f'unknown data type: {t}')
+
 class Transport:
 	def __init__(self, data_type: TransportDataType, data: bytes, remote_id: int, client_id: int, seq_id: str = None):
 		"""
