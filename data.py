@@ -9,6 +9,8 @@ class TransportDataType:
 	RESPONSE = 2
 	SUBPACKAGE = 3
 	SSE_SUBPACKAGE = 4
+	TCP_CONNECT = 5
+	TCP_MESSAGE = 6
 
 	@classmethod
 	def ToString(cls, t: int):
@@ -22,6 +24,10 @@ class TransportDataType:
 			return 'SUBPACKAGE'
 		elif t == cls.SSE_SUBPACKAGE:
 			return 'SSE_SUBPACKAGE'
+		elif t == cls.TCP_CONNECT:
+			return 'TCP_COCNNECT'
+		elif t == cls.TCP_MESSAGE:
+			return 'TCP_MESSAGE'
 		else:
 			raise Exception(f'unknown data type: {t}')
 
@@ -50,9 +56,13 @@ class Transport:
 			return protocol_pb2.TransportDataType.SUBPACKAGE
 		elif self.data_type == TransportDataType.SSE_SUBPACKAGE:
 			return protocol_pb2.TransportDataType.SSE_SUBPACKAGE
+		elif self.data_type == TransportDataType.TCP_CONNECT:
+			return protocol_pb2.TransportDataType.TCP_CONNECT
+		elif self.data_type == TransportDataType.TCP_MESSAGE:
+			return protocol_pb2.TransportDataType.TCP_MESSAGE
 		else:
 			raise Exception(f'Invalid data type: {self.data_type}')
-		
+
 	@classmethod
 	def fromTransportDataType(cls, t):
 		if t == protocol_pb2.TransportDataType.CONTROL:
@@ -65,6 +75,10 @@ class Transport:
 			return TransportDataType.SUBPACKAGE
 		elif t == protocol_pb2.TransportDataType.SSE_SUBPACKAGE:
 			return TransportDataType.SSE_SUBPACKAGE
+		elif t == protocol_pb2.TransportDataType.TCP_CONNECT:
+			return TransportDataType.TCP_CONNECT
+		elif t == protocol_pb2.TransportDataType.TCP_MESSAGE:
+			return TransportDataType.TCP_MESSAGE
 		else:
 			raise Exception(f'Invalid data type: {t}')
 
@@ -147,3 +161,21 @@ class Response:
 		ret = Response(pb.url, pb.status, json.loads(pb.headers_json), pb.body)
 		ret.sse_ticket = pb.sse_ticket
 		return ret
+
+class TCPConnect:
+    def __init__(self, host: str, port: int):
+        self.host = host
+        self.port = port
+        
+    def ToProtobuf(self) -> bytes:
+        pb = protocol_pb2.TCPConnect()
+        pb.host = self.host
+        pb.port = self.port
+        return pb.SerializeToString()
+    
+    @classmethod
+    def FromProtobuf(cls, data: bytes):
+        pb = protocol_pb2.TCPConnect()
+        pb.ParseFromString(data)
+        ret = TCPConnect(pb.host, pb.port)
+        return ret

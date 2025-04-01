@@ -10,10 +10,12 @@ utils.SetupLogging(log, "server")
 class Configuration:
 	def __init__(self, args):
 		self.server: str = args.server
+		self.hasCache: bool = args.cache
 
 	@classmethod
 	def SetupParser(cls, parser: argp.ArgumentParser):
 		parser.add_argument("--server", type=str, default="127.0.0.1:8030", help="The address to listen on.")
+		parser.add_argument("--cache", action='store_true', help="Resend package when reconnecting.")
 		return parser
 
 	def GetListenedAddress(self):
@@ -51,6 +53,11 @@ class Common(tunnel.WebSocketTunnelServer):
 			else:
 				log.warning(f"{self.name}] Drop package {item.seq_id} {data.TransportDataType.ToString(item.data_type)} due to outdated.")
 
+argparse = argp.ArgumentParser()
+argparse = Configuration.SetupParser(argparse)
+args = argparse.parse_args()
+conf = Configuration(args)
+
 class Client(Common):
 	def __init__(self, name="WebSocket Client", **kwargs):
 		super().__init__(name=name, **kwargs)
@@ -77,7 +84,7 @@ class Client(Common):
 		global remote
 		# drop the message
 		if remote is None or not remote.IsConnected():
-			await toRemote.Add(raw)
+			if conf.hasCache: await toRemote.Add(raw)
 			return
 
 		await remote.QueueToSend(raw)
@@ -107,7 +114,9 @@ class Remote(Common):
 	async def OnProcess(self, raw: data.Transport):
 		global client
 		# drop the message
-		if client is None or not client.IsConnected(): return
+		if client is None or not client.IsConnected():
+			if conf.hasCache: await toClient.Add(raw)
+			return
 
 		await client.QueueToSend(raw)
 
@@ -129,9 +138,4 @@ async def main(config: Configuration):
 	await asyncio.Future()
 
 if __name__ == "__main__":
-	argparse = argp.ArgumentParser()
-	argparse = Configuration.SetupParser(argparse)
-	args = argparse.parse_args()
-	conf = Configuration(args)
-
 	asyncio.run(main(conf))

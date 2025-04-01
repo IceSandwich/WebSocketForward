@@ -119,6 +119,7 @@ class Client(IClient):
 		"""
 		isFirstSSE = raw.seq_id not in self.ssePool
 		if isFirstSSE:
+			if resp is None: return # tempory skip
 			log.debug(f"SSE >>>Begin {raw.seq_id} - {resp.url} {len(resp.body)} bytes")
 			self.tracksse[raw.seq_id] = [resp.url, True]
 			self.ssePool[raw.seq_id] = asyncio.PriorityQueue()
