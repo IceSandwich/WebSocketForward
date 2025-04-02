@@ -6,9 +6,9 @@ enum TransportDataType {
 	REQUEST = 1;
 	RESPONSE = 2;
 	SUBPACKAGE = 3;
-	SSE_SUBPACKAGE = 4;
+	STREAM_SUBPACKAGE = 4;
 	TCP_CONNECT = 5;
-	TCP_MESSAGE = 6;
+	// TCP_MESSAGE = 6;
 }
 
 message Transport {
@@ -34,7 +34,6 @@ message Response {
 	int32 status = 2;
 	string headers_json = 3;
 	bytes body = 4;
-	bool sse_ticket = 5;
 }
 
 message TCPConnect {

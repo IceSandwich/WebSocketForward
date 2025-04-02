@@ -28,7 +28,7 @@ class Configuration:
 
 class Client(tunnel.WebSocketTunnelClient):
 	def __init__(self, config: Configuration):
-		super().__init__(config.server)
+		super().__init__(config.server, log=log)
 		self.config = config
 		self.forward_session: aiohttp.ClientSession = None
 
@@ -39,90 +39,107 @@ class Client(tunnel.WebSocketTunnelClient):
 	async def OnDisconnected(self):
 		await self.forward_session.close()
 		await super().OnDisconnected()
-	
+
 	async def processSSE(self, raw: data.Transport, req: data.Request, resp: aiohttp.ClientResponse):
-		"""
-		由processSSE释放resp。raw是模板，函数里会填充数据再发送。
-		"""
-		raw.cur_idx = 0
-		raw.total_cnt = 0
-		# send data.Response for the first time and send data.Subpackage for the remain sequences, set total_cnt = -1 to end
 		isFirst = True
-		# 对于 SSE 流，持续读取并转发数据
+		cur = 0
 		async for chunk in resp.content.iter_any():
 			if not chunk: continue
 			# 将每一行事件发送给客户端
-			if isFirst:
-				payload = data.Response(
-					req.url,
-					resp.status,
-					dict(resp.headers),
-					chunk,
-					sse_ticket=True
+			if isFirst: # 第一个是response包
+				isFirst = False
+				respRaw = raw.CloneWithSameSeqID()
+				respRaw.ResetData(
+					data.Response(
+						url=req.url,
+						status_code=resp.status,
+						headers = dict(resp.headers),
+						body=chunk
+					).ToProtobuf(),
+					data_type=data.TransportDataType.RESPONSE
 				)
-				raw.RenewTimestamp()
-				raw.data_type = data.TransportDataType.RESPONSE
-				raw.data = payload.ToProtobuf()
-				log.debug(f"SSE >>>Begin {raw.seq_id} - {resp.url} {len(raw.data)} bytes")
-				rawData = raw.data if self.config.cipher is None else self.config.cipher.Encrypt(raw.data)
+				respRaw.SetPackages(0, cur)
+				respRawData = respRaw.data if self.config.cipher is None else self.config.cipher.Encrypt(respRaw.data)
+				log.debug(f"SSE >>>Begin {raw.seq_id} - {resp.url} {len(respRawData)} bytes")
 
 				# log SSE Package at the first time
-				log.debug(f"SSE Package <<< {repr(raw.data[:50])} ...>>> to <<< {repr(rawData[:50])} ...>>>")
-				raw.data = rawData
+				log.debug(f"SSE Package <<< {repr(respRaw.data[:50])} ...>>> to <<< {repr(respRawData[:50])} ...>>>")
+				respRaw.data = respRawData
 
-				await self.QueueToSend(raw)
-				isFirst = False
+				await self.QueueToSend(respRaw)
 			else:
-				raw.data_type = data.TransportDataType.SSE_SUBPACKAGE
-				log.debug(f"SSE Stream {raw.seq_id} - {len(chunk)} bytes")
-				raw.data = chunk if self.config.cipher is None else self.config.cipher.Encrypt(chunk)
-				raw.RenewTimestamp()
-				await self.QueueToSend(raw)
-			# 第一个response的idx为0，第一个sse_subpackage的idx为1
-			raw.cur_idx = raw.cur_idx + 1
-		
-		raw.total_cnt = -1 # -1 表示结束
-		raw.data_type = data.TransportDataType.SSE_SUBPACKAGE
-		raw.data = b''
-		log.debug(f"SSE <<<End {raw.seq_id} - {resp.url} {len(raw.data)} bytes")
-		await self.QueueToSend(raw)
+				respRaw = raw.CloneWithSameSeqID()
+				respRaw.ResetData(
+					chunk if self.config.cipher is None else self.config.cipher.Encrypt(chunk),
+					data.TransportDataType.STREAM_SUBPACKAGE
+				)
+				respRaw.SetPackages(0, cur)
+				log.debug(f"SSE Stream {raw.seq_id} - {len(respRaw.data)} bytes")
+				await self.QueueToSend(respRaw)
+			cur = cur + 1
+
+		respRaw = raw.CloneWithSameSeqID()
+		respRaw.ResetData(b'', data.TransportDataType.STREAM_SUBPACKAGE)
+		respRaw.SetPackages(data.Transport.END_PACKAGE, cur)
+		log.debug(f"SSE <<<End {respRaw.seq_id} - {resp.url} {len(respRaw.data)} bytes")
+		await self.QueueToSend(respRaw)
 		await resp.release()
 
-	async def OnProcess(self, raw: data.Transport):
-		if raw.data_type not in [data.TransportDataType.REQUEST, data.TransportDataType.SUBPACKAGE]: return
+	async def OnRecvStreamPackage(self, raw: data.Transport):
+		await self.putStream(raw)
 
-		if raw.data_type == data.TransportDataType.SUBPACKAGE:
-			isGotPackage, package = await self.ReadSegments(raw)
-			if isGotPackage == False: return
-			raw = package
-
-		rawData = raw.data if self.config.cipher is None else self.config.cipher.Decrypt(raw.data)
-		try:
-			req = data.Request.FromProtobuf(rawData)
-		except Exception as e:
-			log.error(f"Failed to parse {raw.seq_id} request, maybe the cipher problem: {e}")
-			log.error(f"{raw.seq_id}] Source raw data: {raw.data[:100]}")
-			log.error(f"{raw.seq_id}] Target raw data: {rawData[:100]}")
-			raise e # rethrow the exception
+	async def OnRecvPackage(self, raw: data.Transport):
+		if self.checkTransportDataType(raw, [data.TransportDataType.REQUEST]) == False: return
 		
+		rawData = raw.data if self.config.cipher is None else self.config.cipher.Decrypt(raw.data)
+		req = data.Request.FromProtobuf(rawData)
 		log.debug(f"Request {raw.seq_id} - {req.method} {req.url}")
 
-		resp = await self.forward_session.request(req.method, req.url, headers=req.headers, data=req.body)
-	
+		try:
+			resp = await self.forward_session.request(req.method, req.url, headers=req.headers, data=req.body)
+		except aiohttp.ClientConnectorError as e:
+			log.error(f'Failed to forward request {req.url}: {e}')
+			respRaw = raw.CloneWithSameSeqID()
+			respRaw.ResetData(
+				data.Response(
+					req.url,
+					502,
+					{
+						'Content-Type': 'text/plain; charset=utf-8',
+					},
+					f'=== Proxy server cannot request: {e}'.encode('utf8'),
+				).ToProtobuf(),
+				data.TransportDataType.RESPONSE
+			)
+			respRaw.data = respRaw.data if self.config.cipher is None else self.config.cipher.Encrypt(respRaw.data)
+			await self.QueueSendSmartSegments(respRaw)
+			return
+
 		if 'text/event-stream' in resp.headers['Content-Type']:
 			log.debug(f"SSE Response {raw.seq_id} - {req.method} {resp.url} {resp.status}")
 			asyncio.ensure_future(self.processSSE(raw, req, resp))
 		else:
 			log.debug(f"Response {raw.seq_id} - {req.method} {resp.url} {resp.status}")
 			respData = await resp.content.read()
-			template = data.Response(
-				req.url,
-				resp.status,
-				dict(resp.headers),
-				None
+			respRaw = raw.CloneWithSameSeqID()
+			respRaw.ResetData(
+				data.Response(
+					req.url,
+					resp.status,
+					dict(resp.headers),
+					respData
+				).ToProtobuf(),
+				data.TransportDataType.RESPONSE
 			)
-			await self.QueueSendSegments(raw, template, respData, cipher=self.config.cipher)
+			respRaw.data = respRaw.data if self.config.cipher is None else self.config.cipher.Encrypt(respRaw.data)
+			await self.QueueSendSmartSegments(respRaw)
 			await resp.release()
+
+	# async def Session(self, raw: data.Transport):
+	# 	raise SyntaxError("This client doesn't support session method.")
+	
+	# async def Stream(self, seq_id: str):
+	# 	raise SyntaxError("DONOT call stream method directly. It have been used internally.")
 
 async def main(config: Configuration):
 	client = Client(config)

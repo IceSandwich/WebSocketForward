@@ -8,30 +8,49 @@ class TransportDataType:
 	REQUEST = 1
 	RESPONSE = 2
 	SUBPACKAGE = 3
-	SSE_SUBPACKAGE = 4
+	STREAM_SUBPACKAGE = 4 # 传输SSE、TCP包
 	TCP_CONNECT = 5
-	TCP_MESSAGE = 6
+	# TCP_MESSAGE = 6
+
+	Mappings: typing.List[typing.Tuple[int, str, typing.Any]] = [
+		[CONTROL, 'CONTROL', protocol_pb2.TransportDataType.CONTROL],
+		[REQUEST, 'REQUEST', protocol_pb2.TransportDataType.REQUEST],
+		[RESPONSE, 'RESPONSE', protocol_pb2.TransportDataType.RESPONSE],
+		[SUBPACKAGE, 'SUBPACKAGE', protocol_pb2.TransportDataType.SUBPACKAGE],
+		[STREAM_SUBPACKAGE, 'STREAM_SUBPACKAGE', protocol_pb2.TransportDataType.STREAM_SUBPACKAGE],
+		[TCP_CONNECT, 'TCP_CONNECT', protocol_pb2.TransportDataType.TCP_CONNECT],
+		# [TCP_MESSAGE, 'TCP_MESSAGE', protocol_pb2.TransportDataType.TCP_MESSAGE]
+	]
+
+	TypeToPB = { x[0] : x[2] for x in Mappings }
+	TypeToName = { x[0]: x[1] for x in Mappings }
+	PBToType = { x[2] : x[0] for x in Mappings }
 
 	@classmethod
 	def ToString(cls, t: int):
-		if t == cls.CONTROL:
-			return 'CONTROL'
-		elif t == cls.REQUEST:
-			return 'REQUEST'
-		elif t == cls.RESPONSE:
-			return 'RESPONSE'
-		elif t == cls.SUBPACKAGE:
-			return 'SUBPACKAGE'
-		elif t == cls.SSE_SUBPACKAGE:
-			return 'SSE_SUBPACKAGE'
-		elif t == cls.TCP_CONNECT:
-			return 'TCP_COCNNECT'
-		elif t == cls.TCP_MESSAGE:
-			return 'TCP_MESSAGE'
+		if t in cls.PBToType:
+			return cls.TypeToName[cls.PBToType[t]]
+		else:
+			raise Exception(f'unknown data type: {t}')
+		
+	@classmethod
+	def ToPB(cls, t: int):
+		if t in cls.TypeToPB:
+			return cls.TypeToPB[t]
+		else:
+			raise Exception(f'unknown data type: {t}')
+
+	@classmethod
+	def FromPB(cls, t: typing.Any):
+		if t in cls.PBToType:
+			return cls.PBToType[t]
 		else:
 			raise Exception(f'unknown data type: {t}')
 
 class Transport:
+	END_PACKAGE = -1
+	SINGLE_PACKAGE = 1
+
 	def __init__(self, data_type: TransportDataType, data: bytes, remote_id: int, client_id: int, seq_id: str = None):
 		"""
 		默认开启新的seq_id
@@ -40,47 +59,40 @@ class Transport:
 		self.remote_id = remote_id
 		self.client_id = client_id
 		self.seq_id = str(uuid4()) if seq_id is None else seq_id
-		self.data_type = data_type
-		self.data = data
 		self.cur_idx = 0
 		self.total_cnt = 1
+		self.data_type = data_type
+		self.data = data
+	
+	def IsStreamPackage(self):
+		return self.data_type == TransportDataType.STREAM_SUBPACKAGE
+	
+	def IsSinglePackage(self):
+		assert(self.cur_idx == 0)
+		return self.total_cnt == self.SINGLE_PACKAGE
+	
+	def IsEndPackage(self):
+		return self.total_cnt == self.END_PACKAGE
+	
+	def MarkAsSinglePackage(self):
+		self.cur_idx = 0
+		self.total_cnt = self.SINGLE_PACKAGE
 
-	def toTransportDataType(self):
-		if self.data_type == TransportDataType.CONTROL:
-			return protocol_pb2.TransportDataType.CONTROL
-		elif self.data_type == TransportDataType.REQUEST:
-			return protocol_pb2.TransportDataType.REQUEST
-		elif self.data_type == TransportDataType.RESPONSE:
-			return protocol_pb2.TransportDataType.RESPONSE
-		elif self.data_type == TransportDataType.SUBPACKAGE:
-			return protocol_pb2.TransportDataType.SUBPACKAGE
-		elif self.data_type == TransportDataType.SSE_SUBPACKAGE:
-			return protocol_pb2.TransportDataType.SSE_SUBPACKAGE
-		elif self.data_type == TransportDataType.TCP_CONNECT:
-			return protocol_pb2.TransportDataType.TCP_CONNECT
-		elif self.data_type == TransportDataType.TCP_MESSAGE:
-			return protocol_pb2.TransportDataType.TCP_MESSAGE
-		else:
-			raise Exception(f'Invalid data type: {self.data_type}')
+	def SetPackages(self, total: int, cur: int = 1):
+		self.total_cnt = total
+		self.cur_idx = cur
 
-	@classmethod
-	def fromTransportDataType(cls, t):
-		if t == protocol_pb2.TransportDataType.CONTROL:
-			return TransportDataType.CONTROL
-		elif t == protocol_pb2.TransportDataType.REQUEST:
-			return TransportDataType.REQUEST
-		elif t == protocol_pb2.TransportDataType.RESPONSE:
-			return TransportDataType.RESPONSE
-		elif t == protocol_pb2.TransportDataType.SUBPACKAGE:
-			return TransportDataType.SUBPACKAGE
-		elif t == protocol_pb2.TransportDataType.SSE_SUBPACKAGE:
-			return TransportDataType.SSE_SUBPACKAGE
-		elif t == protocol_pb2.TransportDataType.TCP_CONNECT:
-			return TransportDataType.TCP_CONNECT
-		elif t == protocol_pb2.TransportDataType.TCP_MESSAGE:
-			return TransportDataType.TCP_MESSAGE
-		else:
-			raise Exception(f'Invalid data type: {t}')
+	def ResetData(self, data: bytes, data_type: TransportDataType = None):
+		self.data = data
+		if data_type is not None:
+			self.data_type = data_type
+
+	def CloneWithSameSeqID(self):
+		"""
+		保留seq_id和data_type，更新时间戳
+		"""
+		ret = Transport(self.data_type, None, self.remote_id, self.client_id, seq_id=self.seq_id)
+		return ret
 
 	def ToProtobuf(self) -> bytes:
 		pb = protocol_pb2.Transport()
@@ -90,7 +102,7 @@ class Transport:
 		pb.seq_id = self.seq_id
 		pb.cur_idx = self.cur_idx
 		pb.total_cnt = self.total_cnt
-		pb.data_type = self.toTransportDataType()
+		pb.data_type = TransportDataType.ToPB(self.data_type)
 		pb.data = self.data
 		return pb.SerializeToString()
 	
@@ -98,9 +110,8 @@ class Transport:
 	def FromProtobuf(cls, buffer: bytes):
 		pb = protocol_pb2.Transport()
 		pb.ParseFromString(buffer)
-		ret = Transport(cls.fromTransportDataType(pb.data_type), pb.data, pb.remote_id, pb.client_id)
+		ret = Transport(TransportDataType.FromPB(pb.data_type), pb.data, pb.remote_id, pb.client_id, seq_id=pb.seq_id)
 		ret.timestamp = pb.timestamp
-		ret.seq_id = pb.seq_id
 		ret.cur_idx = pb.cur_idx
 		ret.total_cnt = pb.total_cnt
 		return ret
@@ -138,12 +149,11 @@ class Request:
 		return ret
 
 class Response:
-	def __init__(self, url: str, status_code: int, headers: typing.Dict[str, str], body: bytes, sse_ticket = False):
+	def __init__(self, url: str, status_code: int, headers: typing.Dict[str, str], body: bytes):
 		self.url = url
 		self.status_code = status_code
 		self.headers = headers
 		self.body = body
-		self.sse_ticket = sse_ticket
 
 	def ToProtobuf(self) -> bytes:
 		pb  = protocol_pb2.Response()
@@ -151,7 +161,6 @@ class Response:
 		pb.status = self.status_code
 		pb.headers_json = json.dumps(self.headers)
 		pb.body = self.body
-		pb.sse_ticket = self.sse_ticket
 		return pb.SerializeToString()
 	
 	@classmethod
@@ -159,8 +168,10 @@ class Response:
 		pb = protocol_pb2.Response()
 		pb.ParseFromString(data)
 		ret = Response(pb.url, pb.status, json.loads(pb.headers_json), pb.body)
-		ret.sse_ticket = pb.sse_ticket
 		return ret
+	
+	def IsSSEResponse(self):
+		return 'Content-Type' in self.headers and 'text/event-stream' in self.headers['Content-Type']
 
 class TCPConnect:
     def __init__(self, host: str, port: int):

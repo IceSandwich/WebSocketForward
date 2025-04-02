@@ -11,11 +11,15 @@ class Configuration:
 	def __init__(self, args):
 		self.server: str = args.server
 		self.hasCache: bool = args.cache
+		self.timeout = time_utils.Seconds(args.timeout)
+		self.cacheSize = args.cache_size
 
 	@classmethod
 	def SetupParser(cls, parser: argp.ArgumentParser):
 		parser.add_argument("--server", type=str, default="127.0.0.1:8030", help="The address to listen on.")
 		parser.add_argument("--cache", action='store_true', help="Resend package when reconnecting.")
+		parser.add_argument("--cache_size", type=int, default=128, help="The maximum number of packages to cache.")
+		parser.add_argument("--timeout", type=int, default=10, help="The maximum seconds to resend packages.")
 		return parser
 
 	def GetListenedAddress(self):
@@ -30,100 +34,65 @@ class Configuration:
 		server_port = int(self.server[splitIdx+1:])
 		return server_name, server_port
 
-client: typing.Union[None, tunnel.WebSocketTunnelServer] = None
-remote: typing.Union[None, tunnel.WebSocketTunnelServer] = None
-toClient: utils.BoundedQueue[data.Transport] = utils.BoundedQueue(100)
-toRemote: utils.BoundedQueue[data.Transport] = utils.BoundedQueue(100)
-
-MaxTimeout = time_utils.Minutes(1) # 丢弃超过1分钟的包
-
-class Common(tunnel.WebSocketTunnelServer):
-	def __init__(self, name="WebSocket Common", **kwargs):
-		super().__init__(name=name, log=log, **kwargs)
-
-	async def resend(self, queue: utils.BoundedQueue[data.Transport]):
-		if queue.IsEmpty(): return
-
-		items = await queue.PopAllElements()
-		log.info(f"{self.name}] Resend {len(items)} package.")
-		nowtime = time_utils.GetTimestamp()
-		for item in items:
-			if time_utils.WithInDuration(item.timestamp, nowtime, MaxTimeout):
-				await self.QueueToSend(item)
-			else:
-				log.warning(f"{self.name}] Drop package {item.seq_id} {data.TransportDataType.ToString(item.data_type)} due to outdated.")
-
 argparse = argp.ArgumentParser()
 argparse = Configuration.SetupParser(argparse)
 args = argparse.parse_args()
 conf = Configuration(args)
 
+class Common(tunnel.WebSocketTunnelServer):
+	def __init__(self, cur_id: int, opposite_id: int, name="WebSocket Common", **kwargs):
+		super().__init__(name=name, log=log, **kwargs)
+		self.cacheQueue: utils.BoundedQueue[data.Transport] = utils.BoundedQueue(conf.cacheSize)
+		self.cur_id = cur_id
+		self.opposite_id = opposite_id
+
+servers: typing.List[typing.Union[None, Common]] = [None] * 2
+
 class Client(Common):
-	def __init__(self, name="WebSocket Client", **kwargs):
-		super().__init__(name=name, **kwargs)
+	def __init__(self, cur_id: int, opposite_id: int, name="WebSocket Client", **kwargs):
+		super().__init__(cur_id, opposite_id, name=name, **kwargs)
+
+	async def resend(self):
+		if self.cacheQueue.IsEmpty(): return
+
+		items = await self.cacheQueue.PopAllElements()
+		log.info(f"{self.name}] Resend {len(items)} package.")
+		nowtime = time_utils.GetTimestamp()
+		for item in items:
+			if time_utils.WithInDuration(item.timestamp, nowtime, conf.timeout):
+				await self.DirectSend(item)
+			else:
+				log.warning(f"{self.name}] Drop package {item.seq_id} {data.TransportDataType.ToString(item.data_type)} due to outdated.")
 
 	async def OnPreConnected(self) -> bool:
-		global client
-		if client is not None and client.IsConnected():
-			log.error("A client want to connect but already connected to a client..")
+		if servers[self.cur_id] is not None and servers[self.cur_id].IsConnected():
+			log.warning(f"A connection to {self.name} but already connected.")
 			return False
 		return await super().OnPreConnected()
-
+	
 	async def OnConnected(self):
-		global client
-		client = self
-		await self.resend(toClient)
+		servers[self.cur_id] = self
+		if conf.hasCache:
+			await self.resend()
 		await super().OnConnected()
 
 	async def OnDisconnected(self):
-		global client
-		client = None
+		servers[self.cur_id] = None
 		await super().OnDisconnected()
 
 	async def OnProcess(self, raw: data.Transport):
-		global remote
-		# drop the message
-		if remote is None or not remote.IsConnected():
-			if conf.hasCache: await toRemote.Add(raw)
-			return
-
-		await remote.QueueToSend(raw)
-
-class Remote(Common):
-	def __init__(self, name="WebSocket Remote", **kwargs):
-		super().__init__(name=name, **kwargs)
-
-	async def OnPreConnected(self) -> bool:
-		global remote
-		if remote is not None and remote.IsConnected():
-			log.error("A remote want to connect but already connected to a remote.")
-			return False
-		return await super().OnPreConnected()
-
-	async def OnConnected(self):
-		global remote
-		remote = self
-		await self.resend(toRemote)
-		await super().OnConnected()
-
-	async def OnDisconnected(self):
-		global remote
-		remote = None
-		return await super().OnDisconnected()
-
-	async def OnProcess(self, raw: data.Transport):
-		global client
-		# drop the message
-		if client is None or not client.IsConnected():
-			if conf.hasCache: await toClient.Add(raw)
-			return
-
-		await client.QueueToSend(raw)
+		if servers[self.opposite_id] is None or not servers[self.opposite_id].IsConnected():
+			if conf.hasCache:
+				raw.RenewTimestamp() # use server's timestamp
+				await servers[self.opposite_id].cacheQueue.Add(raw)
+		else:
+			log.debug(f"{self.name}] Transfer {raw.seq_id}")
+			await servers[self.opposite_id].DirectSend(raw)
 
 async def main(config: Configuration):
 	app = web.Application()
-	app.router.add_get('/client_ws', tunnel.WebSocketTunnelServerHandler(Client))
-	app.router.add_get('/remote_ws', tunnel.WebSocketTunnelServerHandler(Remote))
+	app.router.add_get('/client_ws', tunnel.WebSocketTunnelServerHandler(Client, cur_id=0, opposite_id=1, name="Client"))
+	app.router.add_get('/remote_ws', tunnel.WebSocketTunnelServerHandler(Client, cur_id=1, opposite_id=0, name="Remote"))
 	
 	runner = web.AppRunner(app)
 	await runner.setup()

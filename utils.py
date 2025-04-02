@@ -1,4 +1,4 @@
-import logging, os, typing, collections, asyncio, sys
+import logging, os, typing, collections, asyncio, sys, data
 from datetime import datetime
 T = typing.TypeVar('T')
 
@@ -56,3 +56,31 @@ class BoundedQueue(typing.Generic[T]):
 
 	def IsEmpty(self):
 		return len(self.queue) == 0
+class Chunk:
+	def __init__(self, total_cnt: int):
+		self.total_cnt = total_cnt
+		self.data: typing.List[bytes] = [None] * total_cnt
+		self.cur_idx = 0
+		self.template: data.Transport = None
+		self.lock = asyncio.Lock()
+
+	def IsFinish(self):
+		return self.cur_idx >= self.total_cnt
+
+	async def Put(self, raw: data.Transport):
+		if self.IsFinish():
+			raise Exception(f"already full(total_cnt={self.total_cnt}).")
+		
+		async with self.lock:
+			self.data[raw.cur_idx] = raw.body
+			if raw.data_type != data.TransportDataType.SUBPACKAGE:
+				self.template = raw
+			
+			self.cur_idx = self.cur_idx + 1
+	
+	def Combine(self):
+		raw = b''.join(self.data)
+		self.template.body = raw
+		self.template.cur_idx = 0
+		self.template.total_cnt = 1
+		return self.template
