@@ -41,13 +41,11 @@ class Client(tunnel.WebSocketTunnelClient):
 		await super().OnDisconnected()
 
 	async def processSSE(self, raw: data.Transport, req: data.Request, resp: aiohttp.ClientResponse):
-		isFirst = True
 		cur = 0
 		async for chunk in resp.content.iter_any():
 			if not chunk: continue
 			# 将每一行事件发送给客户端
-			if isFirst: # 第一个是response包
-				isFirst = False
+			if cur == 0: # 第一个是response包
 				respRaw = raw.CloneWithSameSeqID()
 				respRaw.ResetData(
 					data.Response(
@@ -74,7 +72,7 @@ class Client(tunnel.WebSocketTunnelClient):
 					data.TransportDataType.STREAM_SUBPACKAGE
 				)
 				respRaw.SetPackages(0, cur)
-				log.debug(f"SSE Stream {raw.seq_id} - {len(respRaw.data)} bytes")
+				log.debug(f"SSE Stream {respRaw.seq_id} - {len(respRaw.data)} bytes <<< {repr(chunk[:50])} ...>>>")
 				await self.QueueToSend(respRaw)
 			cur = cur + 1
 

@@ -51,6 +51,7 @@ class Client(tunnel.WebSocketTunnelClient):
 
 		# debug only. map from seq_id to url. 布尔值表示是否需要打印sample数据，我们只在第一次打印，后续不打印。
 		self.tracksse: typing.Dict[str, typing.Tuple[str, bool]] = {}
+		self.trackLock = asyncio.Lock()
 
 	async def OnConnected(self):
 		global client
@@ -71,8 +72,9 @@ class Client(tunnel.WebSocketTunnelClient):
 		rawResp.data = rawResp.data if self.conf.cipher is None else self.conf.cipher.Decrypt(rawResp.data)
 		resp = data.Response.FromProtobuf(rawResp.data)
 		if resp.IsSSEResponse():
-			log.debug(f"SSE Response {raw.seq_id} - {request.method} {resp.url} {resp.status_code}")
-			self.tracksse[raw.seq_id] = [request.url, True]
+			log.debug(f"SSE Response {raw.seq_id} - {request.method} {resp.url} {resp.status_code} {len(resp.body)} bytes <<< {repr(resp.body[:50])} ...>>>")
+			async with self.trackLock:
+				self.tracksse[raw.seq_id] = [request.url, True]
 		else:
 			log.debug(f"Response {raw.seq_id} - {request.method} {resp.url} {resp.status_code}")
 		return resp, raw.seq_id
@@ -81,15 +83,17 @@ class Client(tunnel.WebSocketTunnelClient):
 		url = self.tracksse[seq_id][0]
 		async for item in super().Stream(seq_id):
 			chunk = item.data if self.conf.cipher is None else self.conf.cipher.Decrypt(item.data)
-			if self.tracksse[seq_id][1] == True: # first time
-				self.tracksse[seq_id][1] = False
-				log.debug(f"SSE >>>Begin {seq_id} - {url} {len(chunk)} bytes")
-				yield chunk
+			isFirstTime = self.tracksse[seq_id][1]
+			if isFirstTime:
+				async with self.trackLock:
+					self.tracksse[seq_id][1] = False
+				log.debug(f"SSE >>>Begin {seq_id} - {url} {len(chunk)} bytes <<< {repr(chunk[:50])} ...>>>")
 			else:
-				log.debug(f"SSE Stream {seq_id} - {len(chunk)} bytes")
-				yield chunk
+				log.debug(f"SSE Stream {seq_id} - {len(chunk)} bytes <<< {repr(chunk[:50])} ...>>>")
+			yield chunk
 		log.debug(f"SSE <<<End {seq_id} - {url}")
-		del self.tracksse[seq_id]
+		async with self.trackLock:
+			del self.tracksse[seq_id]
 
 	async def OnRecvStreamPackage(self, raw: data.Transport):
 		await self.putStream(raw)

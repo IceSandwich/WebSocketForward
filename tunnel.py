@@ -1,6 +1,6 @@
-﻿import typing, abc, logging, utils
+﻿import typing, abc, logging, queue
 import asyncio, aiohttp
-import time_utils, data, encrypt
+import time_utils, data, encrypt, utils
 import aiohttp.web as web
 
 tunlog = logging.getLogger(__name__)
@@ -70,7 +70,7 @@ class TunnelClient(Tunnel):
 		self.sessionMap: typing.Dict[str, data.Transport] = {}
 		self.sessionCondition = asyncio.Condition()
 
-		self.streamMap: typing.Dict[str, asyncio.Queue[data.Transport]] = {}
+		self.streamMap: typing.Dict[str, queue.Queue[data.Transport]] = {}
 		self.streamCondition = asyncio.Condition()
 
 	async def Session(self, raw: data.Transport):
@@ -78,7 +78,8 @@ class TunnelClient(Tunnel):
 		发送一个raw，等待回应一个raw。适合于非流的数据传输。
 		注意：需要在OnRecvPackage()调用putSession()将包放到session中该函数才起效。
 		"""
-		self.sessionMap[raw.seq_id] = None
+		async with self.sessionCondition:
+			self.sessionMap[raw.seq_id] = None
 		await self.QueueSendSmartSegments(raw)
 
 		async with self.sessionCondition:
@@ -91,11 +92,16 @@ class TunnelClient(Tunnel):
 		"""
 		注意：需要在OnRecvStreamPackage()调用putStream()将包放到stream中该函数才起效。
 		"""
-		self.streamMap[seq_id] = asyncio.Queue()
+		async with self.streamCondition:
+			self.streamMap[seq_id] = queue.Queue()
+
 		while True:
-			item = await self.streamMap[seq_id].get()
+			async with self.streamCondition:
+				await self.streamCondition.wait_for(lambda: not self.streamMap[seq_id].empty())
+				item = self.streamMap[seq_id].get()
+				if item.IsEndPackage():
+					del self.streamMap[seq_id]
 			if item.IsEndPackage():
-				del self.streamMap[seq_id]
 				yield item
 				return
 			yield item
@@ -109,7 +115,9 @@ class TunnelClient(Tunnel):
 		if raw.seq_id not in self.streamMap:
 			self.log.error(f"{self.name}] Stream subpackage {raw.seq_id} is not listening. Drop this package.")
 		else:
-			await self.streamMap[raw.seq_id].put(raw)
+			async with self.streamCondition:
+				self.streamMap[raw.seq_id].put(raw)
+				self.streamCondition.notify_all()
 
 	@abc.abstractmethod
 	async def OnRecvStreamPackage(self, raw: data.Transport):
