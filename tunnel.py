@@ -1,4 +1,4 @@
-﻿import typing, abc, logging, queue
+﻿import typing, abc, logging, queue, heapq
 import asyncio, aiohttp
 import time_utils, data, encrypt, utils
 import aiohttp.web as web
@@ -70,7 +70,7 @@ class TunnelClient(Tunnel):
 		self.sessionMap: typing.Dict[str, data.Transport] = {}
 		self.sessionCondition = asyncio.Condition()
 
-		self.streamMap: typing.Dict[str, queue.Queue[data.Transport]] = {}
+		self.streamHeap: typing.Dict[str, typing.List[data.Transport]] = {}
 		self.streamCondition = asyncio.Condition()
 
 	async def Session(self, raw: data.Transport):
@@ -93,14 +93,14 @@ class TunnelClient(Tunnel):
 		注意：需要在OnRecvStreamPackage()调用putStream()将包放到stream中该函数才起效。
 		"""
 		async with self.streamCondition:
-			self.streamMap[seq_id] = queue.Queue()
+			self.streamHeap[seq_id] = []
 
-		while True:
+		for i in range(1, 999):
 			async with self.streamCondition:
-				await self.streamCondition.wait_for(lambda: not self.streamMap[seq_id].empty())
-				item = self.streamMap[seq_id].get()
+				await self.streamCondition.wait_for(lambda: len(self.streamHeap[seq_id]) > 0 or self.streamHeap[seq_id][0].cur_idx == i)
+				item = heapq.heappop(self.streamHeap[seq_id])
 				if item.IsEndPackage():
-					del self.streamMap[seq_id]
+					del self.streamHeap[seq_id]
 			if item.IsEndPackage():
 				yield item
 				return
@@ -112,11 +112,11 @@ class TunnelClient(Tunnel):
 			self.sessionCondition.notify_all()
 
 	async def putStream(self, raw: data.Transport):
-		if raw.seq_id not in self.streamMap:
+		if raw.seq_id not in self.streamHeap:
 			self.log.error(f"{self.name}] Stream subpackage {raw.seq_id} is not listening. Drop this package.")
 		else:
 			async with self.streamCondition:
-				self.streamMap[raw.seq_id].put(raw)
+				heapq.heappush(self.streamHeap[raw.seq_id], raw)
 				self.streamCondition.notify_all()
 
 	@abc.abstractmethod
@@ -151,6 +151,7 @@ class TunnelClient(Tunnel):
 				await self.chunks[raw.seq_id].Put(raw)
 				if not self.chunks[raw.seq_id].IsFinish(): return
 				ret = self.chunks[raw.seq_id].Combine()
+				self.log.debug(f"Combined {self.chunks[raw.seq_id].total_cnt} packages into one {raw.seq_id} {data.TransportDataType.ToString(raw.data_type)}.")
 				del self.chunks[raw.seq_id]
 				raw = ret
 

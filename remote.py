@@ -87,9 +87,9 @@ class Client(tunnel.WebSocketTunnelClient):
 			if isFirstTime:
 				async with self.trackLock:
 					self.tracksse[seq_id][1] = False
-				log.debug(f"SSE >>>Begin {seq_id} - {url} {len(chunk)} bytes <<< {repr(chunk[:50])} ...>>>")
+				log.debug(f"SSE >>>Begin {seq_id} - {item.cur_idx}-th {url} {len(chunk)} bytes <<< {repr(chunk[:50])} ...>>>")
 			else:
-				log.debug(f"SSE Stream {seq_id} - {len(chunk)} bytes <<< {repr(chunk[:50])} ...>>>")
+				log.debug(f"SSE Stream {seq_id} - {item.cur_idx}-th {len(chunk)} bytes <<< {repr(chunk[:50])} ...>>>")
 			yield chunk
 		log.debug(f"SSE <<<End {seq_id} - {url}")
 		async with self.trackLock:

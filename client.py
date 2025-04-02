@@ -72,14 +72,14 @@ class Client(tunnel.WebSocketTunnelClient):
 					data.TransportDataType.STREAM_SUBPACKAGE
 				)
 				respRaw.SetPackages(0, cur)
-				log.debug(f"SSE Stream {respRaw.seq_id} - {len(respRaw.data)} bytes <<< {repr(chunk[:50])} ...>>>")
+				log.debug(f"SSE Stream {respRaw.seq_id} - {cur}-th {len(respRaw.data)} bytes <<< {repr(chunk[:50])} ...>>>")
 				await self.QueueToSend(respRaw)
 			cur = cur + 1
 
 		respRaw = raw.CloneWithSameSeqID()
 		respRaw.ResetData(b'', data.TransportDataType.STREAM_SUBPACKAGE)
 		respRaw.SetPackages(data.Transport.END_PACKAGE, cur)
-		log.debug(f"SSE <<<End {respRaw.seq_id} - {resp.url} {len(respRaw.data)} bytes")
+		log.debug(f"SSE <<<End {respRaw.seq_id} - {cur}-th {resp.url} {len(respRaw.data)} bytes")
 		await self.QueueToSend(respRaw)
 		await resp.release()
 
