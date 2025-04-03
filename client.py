@@ -25,12 +25,79 @@ class Configuration:
 		parser.add_argument("--cipher", type=str, default="xor", help="Cipher to use for encryption")
 		parser.add_argument("--key", type=str, default="websocket forward", help="The key to use for the cipher. Must be the same with remote.")
 		return parser
-	
+
+class Connection:
+	"""
+	保存TCP连接
+	"""
+	def __init__(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter, seq_id: str, display: str = ""):
+		self.queue: asyncio.Queue[bytes] = asyncio.Queue()
+		self.reader = reader
+		self.writer = writer
+		self.seq_id = seq_id
+		
+		# debug only
+		self.display = display
+		self.isClosed = False
+
+	async def CopyToSender(self, callback: tunnel.Callback):
+		"""
+		TCP流量这里没有加密，大部分是TLS数据。
+		"""
+		raw = data.Transport(data.TransportDataType.STREAM_SUBPACKAGE, None, 0, 0, seq_id=self.seq_id)
+		raw.total_cnt = 0
+		raw.cur_idx = 0
+		try:
+			while not self.reader.at_eof():
+				pkg = await self.reader.read(4096)
+				if not pkg: break
+				raw.data = pkg
+				log.debug(f'TCP {self.seq_id} Send {len(raw.data)} bytes')
+				await callback.DirectSend(raw)
+				raw.cur_idx = raw.cur_idx + 1
+		except Exception as e:
+			print(f"LocalToRemote {self.display} error: {e}")
+		finally:
+			if self.isClosed == False:
+				raw.data = b''
+				raw.total_cnt = -1
+				await callback.DirectSend(raw)
+
+				self.isClosed = True
+				await self.queue.put(b'')
+
+	async def copyFromReader(self):
+		while True:
+			item = await self.queue.get()
+			if item == b'' and self.isClosed:
+				print(f"Close connection {self.display}")
+				self.isClosed = True
+				self.reader.feed_eof()
+				break
+			print(f"Recv {len(item)} bytes")
+			self.writer.write(item)
+			await self.writer.drain()
+
+	async def PutData(self, raw: bytes):
+		pass
+
+	async def MainLoop(self, callback: tunnel.Callback):
+		await callback.OnConnected()
+		await asyncio.gather(self.CopyToSender(), self.copyFromReader())
+		await callback.OnDisconnected()
+
+	async def Close(self):
+		self.isClosed = True
+		await self.queue.put(b'') # inform signal
+
+
 class Client(tunnel.HttpUpgradedWebSocketClient):
 	def __init__(self, config: Configuration):
 		super().__init__(config.server)
 		self.config = config
 		self.forward_session: aiohttp.ClientSession = None
+
+		self.tcpConnections: typing.Dict[str, Connection] = {}
 
 	def GetLogger(self) -> logging.Logger:
 		return log
@@ -92,10 +159,24 @@ class Client(tunnel.HttpUpgradedWebSocketClient):
 		await resp.release()
 
 	async def OnRecvStreamPackage(self, raw: data.Transport) -> None:
-		raise RuntimeError('should not happened')
-
+		raise RuntimeError('Client should not receive stream package.')
+	
+	async def Session(self, raw: data.Transport):
+		raise RuntimeError("Client doesn't support session.")
+	
+	async def Stream(self, seq_id: str):
+		# raise RuntimeError("Client doesn't support stream.")
+		pass
+	
 	async def OnRecvPackage(self, raw: data.Transport) -> None:
-		assert(raw.data_type == data.TransportDataType.REQUEST)
+		if raw.data_type == data.TransportDataType.REQUEST:
+			await self.processRequestPackage(raw)
+		elif raw.data_type == data.TransportDataType.TCP_CONNECT:
+			await self.processTCPConnectPackage(raw)
+		else:
+			raise RuntimeError(f"Unsupported package data type: {data.TransportDataType.ToString(raw.data_type)}")
+
+	async def processRequestPackage(self, raw: data.Transport):
 		rawData = raw.data if self.config.cipher is None else self.config.cipher.Decrypt(raw.data)
 
 		try:
@@ -138,6 +219,44 @@ class Client(tunnel.HttpUpgradedWebSocketClient):
 			raw.data = raw.data if self.config.cipher is None else self.config.cipher.Encrypt(raw.data)
 			await self.DirectSend(raw)
 			await resp.release()
+
+	async def processTCPConnectPackage(self, raw: data.Transport):
+		if raw.total_cnt != -1: # 开启连接
+			package = data.TCPConnect.FromProtobuf(raw.data)
+			print(f"Connect {package.host}:{package.port}")
+
+			# 连接到目标主机
+			resp = data.Transport(data.TransportDataType.RESPONSE, None, 0, 0, raw.seq_id)
+			try:
+				remote_reader, remote_writer = await asyncio.open_connection(package.host, package.port)
+				self.tcpConnections[raw.seq_id] = Connection(remote_reader, remote_writer, display=f"{package.host}:{package.host}")
+
+				class CB(tunnel.Callback):
+					def __init__(self, seq_id: str):
+						self.seq_id = seq_id
+					async def OnConnected(that):
+						pass
+					async def OnDisconnected(that):
+						del self.tcpConnection[that.seq_id]
+					async def DirectSend(that, raw: data.Transport) -> None:
+						return await that.DirectSend(raw)
+				
+				asyncio.create_task(self.tcpConnections[raw.seq_id].MainLoop(CB(raw.seq_id)))
+
+				resp.data = data.Response("", 200, {},
+					b'HTTP/1.1 200 Connection Established\r\n\r\n'
+				).ToProtobuf()
+				resp.data = resp.data if self.config.cipher is None else self.config.cipher.Encrypt(resp.data)
+				await self.DirectSend(resp)
+			except Exception as e:
+				log.error(f"TCP] Failed to connnect {package.host}:{package.port}, err: {e}")
+				resp.data = data.Response("", 502, {},
+					b'HTTP/1.1 502 Bad Gateway\r\n\r\n'
+				).ToProtobuf()
+				resp.data = resp.data if self.config.cipher is None else self.config.cipher.Encrypt(resp.data)
+				await self.DirectSend(resp)
+		else: # 关闭连接
+			self.tcpConnections[raw.seq_id].Close()
 
 async def main(config: Configuration):
 	client = Client(config)

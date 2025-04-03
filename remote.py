@@ -95,21 +95,6 @@ class Client(tunnel.HttpUpgradedWebSocketClient):
 			rawData = raw.data if self.conf.cipher is None else self.conf.cipher.Decrypt(raw.data)
 			yield rawData
 
-	async def processSSE(self, raw: data.Transport):
-		async with self.sseCondition:
-			rawData = raw.data if self.conf.cipher is None else self.conf.cipher.Decrypt(raw.data)
-			if raw.total_cnt == -1: # 结束SSE流，结束包是不带数据的
-				log.debug(f"SSE <<<End {raw.seq_id} - {self.tracksse[raw.seq_id][0]} {len(rawData)} bytes")
-				del self.tracksse[raw.seq_id]
-			else:
-				log.debug(f"SSE Stream {raw.seq_id} - {len(rawData)} bytes")
-				if self.tracksse[raw.seq_id][1]: # 打印第一个sse的sample
-					log.debug(f"SSE Package <<< {repr(raw.data[:50])} ...>>> to <<< {repr(rawData[:50])} ...>>>")
-					self.tracksse[raw.seq_id][1] = False # 关闭后续的sse打印sample
-			raw.data = rawData
-			await self.ssePool[raw.seq_id].put(raw)
-			self.sseCondition.notify_all()
-
 	async def OnRecvPackage(self, raw: data.Transport) -> None:
 		assert(raw.data_type == data.TransportDataType.RESPONSE)
 		rawData = raw.data if self.conf.cipher is None else self.conf.cipher.Decrypt(raw.data)
@@ -126,7 +111,7 @@ class Client(tunnel.HttpUpgradedWebSocketClient):
 			log.debug(f"SSE >>>Begin {raw.seq_id} - {resp.url} {len(resp.body)} bytes")
 			self.tracksse[raw.seq_id] = [resp.url, True]
 		
-		await super().OnRecvPackage(raw)
+		return await super().OnRecvPackage(raw)
 
 class HttpServer:
 	def __init__(self, conf: Configuration) -> None:
