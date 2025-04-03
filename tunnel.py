@@ -93,16 +93,21 @@ class TunnelClient(Callback):
 		在这里处理流包，默认将流包推到Stream()队列。如果需要Stream()起作用，必须调用TunnelClient.OnRecvStreamPackage()。
 		"""
 		if raw.seq_id not in self.streamHeap:
-			self.GetLogger().error(f"{self.GetName()}] Stream subpackage {raw.seq_id} is not listening. Drop this package.")
-		else:
+			# self.GetLogger().error(f"{self.GetName()}] Stream subpackage {raw.seq_id} is not listening. Drop this package.")
 			async with self.streamCondition:
-				if raw.total_cnt == -1:
-					self.GetLogger().debug(f"Stream <<<End {raw.seq_id} {len(raw.data)} bytes")
-				else:
-					self.GetLogger().debug(f"Stream {raw.seq_id} - {len(raw.data)} bytes")
-				heapq.heappush(self.streamHeap[raw.seq_id], raw)
-				# print(f"Stream got {raw.seq_id} - {raw.cur_idx}-ith, current heaq: {[x.cur_idx for x in self.streamHeap[raw.seq_id]]}")
-				self.streamCondition.notify_all()
+				self.streamHeap[raw.seq_id] = []
+
+		async with self.streamCondition:
+			if raw.total_cnt == -1:
+				self.GetLogger().debug(f"Stream <<<End {raw.seq_id} {len(raw.data)} bytes")
+			else:
+				self.GetLogger().debug(f"Stream {raw.seq_id} - {len(raw.data)} bytes")
+			heapq.heappush(self.streamHeap[raw.seq_id], raw)
+			if len(self.streamHeap[raw.seq_id]) > 20:
+				self.GetLogger().warning(f"Stream {raw.seq_id} seems dead. Drop cache packages. headq: {[x.cur_idx for x in self.streamHeap[raw.seq_id]]}")
+				del self.streamHeap[raw.seq_id]
+			# print(f"Stream got {raw.seq_id} - {raw.cur_idx}-ith, current heaq: {[x.cur_idx for x in self.streamHeap[raw.seq_id]]}")
+			self.streamCondition.notify_all()
 	
 	# ==================== 以下函数无需再实现 ==============================
 
@@ -120,12 +125,11 @@ class TunnelClient(Callback):
 			return resp
 
 	async def Stream(self, seq_id: str):
-		self.streamHeap[seq_id] = []
 		# print(f"Listening stream on {seq_id}...")
 		expectIdx = 1
 		while True:
 			async with self.streamCondition:
-				await self.streamCondition.wait_for(lambda: len(self.streamHeap[seq_id]) > 0 and self.streamHeap[seq_id][0].cur_idx == expectIdx)
+				await self.streamCondition.wait_for(lambda: seq_id in self.streamHeap and len(self.streamHeap[seq_id]) > 0 and self.streamHeap[seq_id][0].cur_idx == expectIdx)
 				item = heapq.heappop(self.streamHeap[seq_id])
 				expectIdx = expectIdx + 1
 				# print(f"SSE pop stream {seq_id} - {item.cur_idx}")
