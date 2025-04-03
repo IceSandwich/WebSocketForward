@@ -211,19 +211,20 @@ class Client(tunnel.HttpUpgradedWebSocketClient):
 			if not needCompressImage:
 				log.debug(f"Response {raw.seq_id} - {req.method} {resp.url} {resp.status}")
 			respData = await resp.content.read()
+			headers = dict(resp.headers)
+			if needCompressImage:
+				rawData = utils.CompressImageToWebP(respData)
+				compress_ratio = utils.ComputeCompressRatio(len(respData), len(rawData))
+				respData = rawData
+				headers['WSF-Compress'] = 'image/webp'
+				log.debug(f"Response(Compress {int(compress_ratio*10000)/100}%) {raw.seq_id} - {req.method} {resp.url} {resp.status}")
 			raw.data_type = data.TransportDataType.RESPONSE
 			raw.data = data.Response(
 				req.url,
 				resp.status,
-				dict(resp.headers),
+				headers,
 				respData
 			).ToProtobuf()
-			if needCompressImage:
-				rawData = utils.CompressImageToWebP(raw.data)
-				compress_ratio = utils.ComputeCompressRatio(len(raw.data), len(rawData))
-				raw.data = rawData
-				resp.headers['WSF-Compress'] == 'image/webp'
-				log.debug(f"Response(Compress {int(compress_ratio*10000)/100}%) {raw.seq_id} - {req.method} {resp.url} {resp.status}")
 			raw.data = raw.data if self.config.cipher is None else self.config.cipher.Encrypt(raw.data)
 			await self.DirectSend(raw)
 			await resp.release()

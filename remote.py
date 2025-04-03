@@ -146,7 +146,7 @@ class StableDiffusionCachingClient(Client):
 		resp = data.Response(url, 200, {
 			'Content-Type': mimetypes.guess_type(filename)[0] or "application/octet-stream"
 		}, body)
-		return resp, data.Transport().seq_id
+		return resp, utils.NewSeqId()
 	
 	async def Session(self, request: data.Request):
 		parsed_url = urlparse(request.url)
@@ -154,7 +154,7 @@ class StableDiffusionCachingClient(Client):
 		if len(components) == 0: return await super().Session(request)
 		
 		if components[0] in self.assets_dir:
-			targetfn = os.path.join(self.root_dir, **components)
+			targetfn = os.path.join(self.root_dir, *components)
 			if os.path.exists(targetfn):
 				return self.readCache(targetfn, request.url)
 			else:
@@ -167,7 +167,7 @@ class StableDiffusionCachingClient(Client):
 		elif components[0].startswith('file='):
 			targetfn = parsed_url.path[len('/file='):]
 			if targetfn.startswith(self.sdprefix):
-				targetfn = targetfn[self.sdprefix:]
+				targetfn = targetfn[len(self.sdprefix):]
 			fullfn = os.path.join(self.root_dir, targetfn)
 			if os.path.exists(fullfn):
 				return self.readCache(fullfn, request.url)
@@ -186,6 +186,8 @@ class StableDiffusionCachingClient(Client):
 						f.write(resp.body)
 						log.info(f'Cache {parsed_url.path} to {fullfn}')
 				return resp, seq_id
+		else:
+			return await super().Session(request)
 
 class HttpServer:
 	def __init__(self, conf: Configuration) -> None:

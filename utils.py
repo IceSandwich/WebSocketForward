@@ -2,6 +2,7 @@ import logging, os, typing, collections, asyncio, sys, io
 from datetime import datetime
 from PIL import Image
 import data
+import uuid
 T = typing.TypeVar('T')
 
 # 配置 logging
@@ -97,3 +98,9 @@ def CompressImageToWebP(raw: bytes, quality: int = 75):
     img_bytes = io.BytesIO()
     image.save(img_bytes, format='WebP', quality=quality)
     return img_bytes.getvalue()
+
+def ComputeCompressRatio(source: int, target: int):
+	return 1.0 - (target / source)
+
+def NewSeqId():
+	return str(uuid.uuid4())
