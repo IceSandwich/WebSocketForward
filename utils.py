@@ -1,5 +1,7 @@
-import logging, os, typing, collections, asyncio, sys, data
+import logging, os, typing, collections, asyncio, sys, io
 from datetime import datetime
+from PIL import Image
+import data
 T = typing.TypeVar('T')
 
 # 配置 logging
@@ -86,3 +88,12 @@ class Chunk:
 		self.template.cur_idx = 0
 		self.template.total_cnt = 1
 		return self.template
+
+def DecodeImageFromBytes(raw: bytes):
+    return Image.open(io.BytesIO(raw))
+
+def CompressImageToWebP(raw: bytes, quality: int = 75):
+    image = DecodeImageFromBytes(raw)
+    img_bytes = io.BytesIO()
+    image.save(img_bytes, format='WebP', quality=quality)
+    return img_bytes.getvalue()

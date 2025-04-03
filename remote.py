@@ -1,10 +1,16 @@
-import asyncio, logging
+import asyncio, logging, os
+from urllib.parse import urlparse
+from pathlib import Path
 import data
 import utils, typing
 import aiohttp.web as web
 import argparse as argp
 import tunnel
 import encrypt
+from PIL import Image
+import io
+import mimetypes
+mimetypes.add_type("text/plain; charset=utf-8", ".woff2")
 
 log = logging.getLogger(__name__)
 utils.SetupLogging(log, "remote")
@@ -113,6 +119,74 @@ class Client(tunnel.HttpUpgradedWebSocketClient):
 		
 		return await super().OnRecvPackage(raw)
 
+class StableDiffusionCachingClient(Client):
+	def __init__(self, config: Configuration):
+		super().__init__(config)
+		
+		self.root_dir = 'cache_sdwebui'
+		self.assets_dir = ['assets', 'webui-assets']
+		self.sdprefix = 'D:/GITHUB/stable-diffusion-webui-forge/'
+		
+		
+		os.makedirs(self.root_dir,exist_ok=True)
+		for assets_fd in self.assets_dir:
+			os.makedirs(os.path.join(self.root_dir, assets_fd), exist_ok=True)
+
+		#http://127.0.0.1:7860/assets/Index-_i8s1y64.js
+		#http://127.0.0.1:7860/webui-assets/fonts/sourcesanspro/6xKydSBYKcSV-LCoeQqfX1RYOo3i54rwlxdu.woff2
+		#http://127.0.0.1:7860/file=D:/GITHUB/stable-diffusion-webui-forge/extensions/a1111-sd-webui-tagcomplete/tags/temp/wc_yaml.json?1743699414113=
+		#http://127.0.0.1:7860/file=D:/GITHUB/stable-diffusion-webui-forge/outputs/txt2img-grids/2025-04-04/grid-0037.png
+		#http://127.0.0.1:7860/file=D:/GITHUB/stable-diffusion-webui-forge/outputs/txt2img-images/2025-04-04/00146-3244803616.png
+		#http://127.0.0.1:7860/file=extensions/a1111-sd-webui-tagcomplete/javascript/ext_umi.js?1729071885.9683821=
+
+	def readCache(self, filename: str, url: str):
+		log.info(f'Using cache: {url} => {filename}')
+		with open(filename, 'rb') as f:
+			body = f.read()
+		resp = data.Response(url, 200, {
+			'Content-Type': mimetypes.guess_type(filename)[0] or "application/octet-stream"
+		}, body)
+		return resp, data.Transport().seq_id
+	
+	async def Session(self, request: data.Request):
+		parsed_url = urlparse(request.url)
+		components = parsed_url.path.strip('/').split('/')
+		if len(components) == 0: return await super().Session(request)
+		
+		if components[0] in self.assets_dir:
+			targetfn = os.path.join(self.root_dir, **components)
+			if os.path.exists(targetfn):
+				return self.readCache(targetfn, request.url)
+			else:
+				resp, seq_id = await super().Session(request)
+				os.makedirs(os.path.dirname(targetfn), exist_ok=True)
+				with open(targetfn, 'wb') as f:
+					f.write(resp.body)
+					log.info(f'Cache {parsed_url.path} to {targetfn}')
+				return resp, seq_id
+		elif components[0].startswith('file='):
+			targetfn = parsed_url.path[len('/file='):]
+			if targetfn.startswith(self.sdprefix):
+				targetfn = targetfn[self.sdprefix:]
+			fullfn = os.path.join(self.root_dir, targetfn)
+			if os.path.exists(fullfn):
+				return self.readCache(fullfn, request.url)
+			else:
+				if targetfn.startswith('outputs/'):
+					request.headers['WSF-Compress'] = 'image/webp'
+					resp, seq_id = await super().Session(request)
+					img = utils.DecodeImageFromBytes(resp.body)
+					os.makedirs(os.path.dirname(fullfn), exist_ok=True)
+					img.save(fullfn)
+					log.info(f'Save result: {targetfn}')
+				else:
+					resp, seq_id = await super().Session(request)
+					os.makedirs(os.path.dirname(fullfn), exist_ok=True)
+					with open(fullfn, 'wb') as f:
+						f.write(resp.body)
+						log.info(f'Cache {parsed_url.path} to {fullfn}')
+				return resp, seq_id
+
 class HttpServer:
 	def __init__(self, conf: Configuration) -> None:
 		self.config = conf
@@ -158,7 +232,7 @@ class HttpServer:
 		await asyncio.Future()
 
 async def main(config: Configuration):
-    await asyncio.gather(Client(config).MainLoop(), HttpServer(config).MainLoop())
+	await asyncio.gather(StableDiffusionCachingClient(config).MainLoop(), HttpServer(config).MainLoop())
 
 if __name__ == "__main__":
 	argparse = argp.ArgumentParser()

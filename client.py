@@ -207,7 +207,9 @@ class Client(tunnel.HttpUpgradedWebSocketClient):
 			log.debug(f"SSE Response {raw.seq_id} - {req.method} {resp.url} {resp.status}")
 			asyncio.ensure_future(self.processSSE(raw, req, resp))
 		else:
-			log.debug(f"Response {raw.seq_id} - {req.method} {resp.url} {resp.status}")
+			needCompressImage = 'WSF-Compress' in req.headers and req.headers['WSF-Compress'] == 'image/webp'
+			if not needCompressImage:
+				log.debug(f"Response {raw.seq_id} - {req.method} {resp.url} {resp.status}")
 			respData = await resp.content.read()
 			raw.data_type = data.TransportDataType.RESPONSE
 			raw.data = data.Response(
@@ -216,6 +218,12 @@ class Client(tunnel.HttpUpgradedWebSocketClient):
 				dict(resp.headers),
 				respData
 			).ToProtobuf()
+			if needCompressImage:
+				rawData = utils.CompressImageToWebP(raw.data)
+				compress_ratio = utils.ComputeCompressRatio(len(raw.data), len(rawData))
+				raw.data = rawData
+				resp.headers['WSF-Compress'] == 'image/webp'
+				log.debug(f"Response(Compress {int(compress_ratio*10000)/100}%) {raw.seq_id} - {req.method} {resp.url} {resp.status}")
 			raw.data = raw.data if self.config.cipher is None else self.config.cipher.Encrypt(raw.data)
 			await self.DirectSend(raw)
 			await resp.release()
