@@ -71,11 +71,13 @@ class Client(tunnel.HttpUpgradedWebSocketClient):
 				# log SSE Package at the first time
 				log.debug(f"SSE Package <<< {repr(raw.data[:50])} ...>>> to <<< {repr(rawData[:50])} ...>>>")
 				raw.data = rawData
+				# print(f"Send first sse {raw.seq_id} - {raw.cur_idx}-ith")
 
 				await self.DirectSend(raw)
 			else:
 				raw.data_type = data.TransportDataType.STREAM_SUBPACKAGE
 				log.debug(f"SSE Stream {raw.seq_id} - {len(chunk)} bytes")
+				# print(f"Send SSE {raw.seq_id} - {raw.cur_idx}-ith")
 				raw.data = chunk if self.config.cipher is None else self.config.cipher.Encrypt(chunk)
 				await self.DirectSend(raw)
 			# 第一个response的idx为0，第一个sse_subpackage的idx为1
@@ -85,6 +87,7 @@ class Client(tunnel.HttpUpgradedWebSocketClient):
 		raw.total_cnt = -1 # -1 表示结束
 		raw.data = b''
 		log.debug(f"SSE <<<End {raw.seq_id} - {resp.url} {len(raw.data)} bytes")
+		# print(f"Send End SSE {raw.seq_id} - {raw.cur_idx}-ith")
 		await self.DirectSend(raw)
 		await resp.release()
 

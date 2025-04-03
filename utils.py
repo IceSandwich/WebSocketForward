@@ -57,22 +57,24 @@ class BoundedQueue(typing.Generic[T]):
 	def IsEmpty(self):
 		return len(self.queue) == 0
 class Chunk:
-	def __init__(self, total_cnt: int):
+	def __init__(self, total_cnt: int, start_idx: int):
+		self.start_idx = start_idx
+		self.count = total_cnt - start_idx
 		self.total_cnt = total_cnt
-		self.data: typing.List[bytes] = [None] * total_cnt
+		self.data: typing.List[bytes] = [None] * self.count
 		self.cur_idx = 0
 		self.template: data.Transport = None
 		self.lock = asyncio.Lock()
 
 	def IsFinish(self):
-		return self.cur_idx >= self.total_cnt
+		return self.cur_idx >= self.count
 
 	async def Put(self, raw: data.Transport):
 		if self.IsFinish():
 			raise Exception(f"already full(total_cnt={self.total_cnt}).")
 		
 		async with self.lock:
-			self.data[raw.cur_idx] = raw.body
+			self.data[raw.cur_idx - self.start_idx] = raw.body
 			if raw.data_type != data.TransportDataType.SUBPACKAGE:
 				self.template = raw
 			

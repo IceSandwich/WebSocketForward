@@ -71,29 +71,70 @@ class TunnelClient(Callback):
 		self.sessionMap: typing.Dict[str, data.Transport] = {}
 		self.sessionCondition = asyncio.Condition()
 
+		# 最小堆，根据cur_idx排序
 		self.streamHeap: typing.Dict[str, typing.List[data.Transport]] = {}
 		self.streamCondition = asyncio.Condition()
-
 
 		self.sendQueue: asyncio.Queue[data.Transport] = asyncio.Queue()
 
 	# ======================= 以下函数由用户实现 ============================
 	
-	@abc.abstractmethod
 	async def OnRecvPackage(self, raw: data.Transport) -> None:
 		"""
-		在这里处理除了流包
+		在这里处理除了流包的数据包，默认将非流包推到Session()队列。
+		如果你需要重写该函数并且希望Session()起作用，记得调用TunnelClient.OnRecvPackage()。
 		"""
-		raise NotImplementedError()
+		async with self.sessionCondition:
+			self.sessionMap[raw.seq_id] = raw
+			self.sessionCondition.notify_all()
 	
-	@abc.abstractmethod
 	async def OnRecvStreamPackage(self, raw: data.Transport) -> None:
 		"""
-		在这里处理流包
+		在这里处理流包，默认将流包推到Stream()队列。如果需要Stream()起作用，必须调用TunnelClient.OnRecvStreamPackage()。
 		"""
-		raise NotImplementedError()
+		if raw.seq_id not in self.streamHeap:
+			self.GetLogger().error(f"{self.GetName()}] Stream subpackage {raw.seq_id} is not listening. Drop this package.")
+		else:
+			async with self.streamCondition:
+				if raw.total_cnt == -1:
+					self.GetLogger().debug(f"Stream <<<End {raw.seq_id} {len(raw.data)} bytes")
+				else:
+					self.GetLogger().debug(f"Stream {raw.seq_id} - {len(raw.data)} bytes")
+				heapq.heappush(self.streamHeap[raw.seq_id], raw)
+				# print(f"Stream got {raw.seq_id} - {raw.cur_idx}-ith, current heaq: {[x.cur_idx for x in self.streamHeap[raw.seq_id]]}")
+				self.streamCondition.notify_all()
 	
 	# ==================== 以下函数无需再实现 ==============================
+
+	async def Session(self, raw: data.Transport):
+		"""
+		发送一个raw，等待回应一个raw。适合于非流的数据传输。
+		注意：需要调用TunnelClient.OnRecvPackage()将包放到session队列中，该函数才起效。
+		"""
+		await self.DirectSend(raw)
+
+		async with self.sessionCondition:
+			await self.sessionCondition.wait_for(lambda: raw.seq_id in self.sessionMap)
+			resp = self.sessionMap[raw.seq_id]
+			del self.sessionMap[raw.seq_id]
+			return resp
+
+	async def Stream(self, seq_id: str):
+		self.streamHeap[seq_id] = []
+		# print(f"Listening stream on {seq_id}...")
+		expectIdx = 1
+		while True:
+			async with self.streamCondition:
+				await self.streamCondition.wait_for(lambda: len(self.streamHeap[seq_id]) > 0 and self.streamHeap[seq_id][0].cur_idx == expectIdx)
+				item = heapq.heappop(self.streamHeap[seq_id])
+				expectIdx = expectIdx + 1
+				# print(f"SSE pop stream {seq_id} - {item.cur_idx}")
+				if item.total_cnt == -1:
+					del self.streamHeap[seq_id]
+			yield item
+			if item.total_cnt == -1:
+				break
+		# print(f"End listening stream on {seq_id}...")
 	
 	async def resendCachePackages(self):
 		"""

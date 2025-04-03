@@ -43,7 +43,7 @@ class TypeHintClient(tunnel.HttpUpgradedWebSocketClient):
 		"""
 		raise NotImplementedError()
 
-	def SessionSSE(self, seq_id: str) -> typing.AsyncGenerator[bytes, None]:
+	def Stream(self, seq_id: str) -> typing.AsyncGenerator[bytes, None]:
 		"""
 		返回无加密的SSE数据
 		"""
@@ -58,12 +58,6 @@ class Client(tunnel.HttpUpgradedWebSocketClient):
 		
 		# debug only. map from seq_id to url. 布尔值表示是否需要打印sample数据，我们只在第一次打印，后续不打印。
 		self.tracksse: typing.Dict[str, typing.Tuple[str, bool]] = {}
-		# 放sse_subpackage的容器，内容已经解密了的
-		self.ssePool: typing.Dict[str, asyncio.PriorityQueue[data.Transport]] = {}
-		self.sseCondition = asyncio.Condition()
-
-		self.recvMaps: typing.Dict[str, data.Response] = {}
-		self.recvCondition = asyncio.Condition()
 
 	def GetName(self) -> str:
 		return "Remote"
@@ -85,26 +79,21 @@ class Client(tunnel.HttpUpgradedWebSocketClient):
 		raw = data.Transport(data.TransportDataType.REQUEST, request.ToProtobuf(), 0, 0)
 		log.debug(f"Request {raw.seq_id} - {request.method} {request.url}")
 		raw.data = raw.data if self.conf.cipher is None else self.conf.cipher.Encrypt(raw.data)
-		await self.DirectSend(raw)
+		rawResp = await super().Session(raw)
+		assert(rawResp.data_type == data.TransportDataType.RESPONSE)
+		rawResp.data = rawResp.data if self.conf.cipher is None else self.conf.cipher.Decrypt(rawResp.data)
+		resp = data.Response.FromProtobuf(rawResp.data)
+		if resp.IsSSEResponse():
+			log.debug(f"SSE Response {raw.seq_id} - {request.method} {resp.url} {resp.status_code} {len(resp.body)} bytes <<< {repr(resp.body[:50])} ...>>>")
+			self.tracksse[raw.seq_id] = [request.url, True]
+		else:
+			log.debug(f"Response {raw.seq_id} - {request.method} {resp.url} {resp.status_code}")
+		return resp, raw.seq_id
 
-		async with self.recvCondition:
-			await self.recvCondition.wait_for(lambda: raw.seq_id in self.recvMaps)
-			resp = self.recvMaps[raw.seq_id]
-			del self.recvMaps[raw.seq_id]
-			if resp.IsSSEResponse():
-				log.debug(f"SSE Response {raw.seq_id} - {request.method} {resp.url} {resp.status_code}")
-			else:
-				log.debug(f"Response {raw.seq_id} - {request.method} {resp.url} {resp.status_code}")
-			return resp, raw.seq_id
-
-	async def SessionSSE(self, seq_id: str):
-		while True:
-			item = await self.ssePool[seq_id].get()
-			if item.total_cnt == -1:
-				del self.ssePool[seq_id]
-				yield item.data
-				return
-			yield item.data
+	async def Stream(self, seq_id: str):
+		async for raw in super().Stream(seq_id):
+			rawData = raw.data if self.conf.cipher is None else self.conf.cipher.Decrypt(raw.data)
+			yield rawData
 
 	async def processSSE(self, raw: data.Transport):
 		async with self.sseCondition:
@@ -121,9 +110,6 @@ class Client(tunnel.HttpUpgradedWebSocketClient):
 			await self.ssePool[raw.seq_id].put(raw)
 			self.sseCondition.notify_all()
 
-	async def OnRecvStreamPackage(self, raw: data.Transport) -> None:
-		return await self.processSSE(raw)
-
 	async def OnRecvPackage(self, raw: data.Transport) -> None:
 		assert(raw.data_type == data.TransportDataType.RESPONSE)
 		rawData = raw.data if self.conf.cipher is None else self.conf.cipher.Decrypt(raw.data)
@@ -139,15 +125,8 @@ class Client(tunnel.HttpUpgradedWebSocketClient):
 		if resp.IsSSEResponse():
 			log.debug(f"SSE >>>Begin {raw.seq_id} - {resp.url} {len(resp.body)} bytes")
 			self.tracksse[raw.seq_id] = [resp.url, True]
-			self.ssePool[raw.seq_id] = asyncio.PriorityQueue()
-			async with self.recvCondition:
-				self.recvMaps[raw.seq_id] = resp
-				self.recvCondition.notify_all()
-		else:
-			async with self.recvCondition:
-				# log.debug(f"recv http: {resp.url}")
-				self.recvMaps[raw.seq_id] = resp
-				self.recvCondition.notify_all()
+		
+		await super().OnRecvPackage(raw)
 
 class HttpServer:
 	def __init__(self, conf: Configuration) -> None:
@@ -155,7 +134,7 @@ class HttpServer:
 
 	async def processSSE(self, resp: data.Response, seq_id: str):
 		yield resp.body
-		async for package in client.SessionSSE(seq_id):
+		async for package in client.Stream(seq_id):
 			yield package
 
 	async def MainLoopOnRequest(self, request: web.BaseRequest):
