@@ -30,7 +30,7 @@ class Configuration:
 		parser.add_argument("--key", type=str, default="websocket forward", help="The key to use for the cipher. Must be the same with client.")
 		return parser
 
-class TypeHintClient(tunnel.WebSocketTunnelClient):
+class TypeHintClient(tunnel.HttpUpgradedWebSocketClient):
 	"""
 	该类仅用于类型提示，不要实例它
 	"""
@@ -38,69 +38,116 @@ class TypeHintClient(tunnel.WebSocketTunnelClient):
 		raise SyntaxError("Do not instantiate this class.")
 	
 	async def Session(self, request: data.Request) -> typing.Tuple[data.Response, str]:
-		pass
-	def Stream(self, seq_id: str) -> typing.AsyncGenerator[bytes, None]:
-		pass
+		"""
+		接受无加密的request，返回无加密的response和seq_id。
+		"""
+		raise NotImplementedError()
 
-client: typing.Union[None, TypeHintClient] = None
+	def SessionSSE(self, seq_id: str) -> typing.AsyncGenerator[bytes, None]:
+		"""
+		返回无加密的SSE数据
+		"""
+		raise NotImplementedError()
 
-class Client(tunnel.WebSocketTunnelClient):
+client: typing.Optional[TypeHintClient] = None
+
+class Client(tunnel.HttpUpgradedWebSocketClient):
 	def __init__(self, config: Configuration):
-		super().__init__(config.server, name="WebSocket Remote")
+		super().__init__(config.server)
 		self.conf = config
-
+		
 		# debug only. map from seq_id to url. 布尔值表示是否需要打印sample数据，我们只在第一次打印，后续不打印。
 		self.tracksse: typing.Dict[str, typing.Tuple[str, bool]] = {}
-		self.trackLock = asyncio.Lock()
+		# 放sse_subpackage的容器，内容已经解密了的
+		self.ssePool: typing.Dict[str, asyncio.PriorityQueue[data.Transport]] = {}
+		self.sseCondition = asyncio.Condition()
+
+		self.recvMaps: typing.Dict[str, data.Response] = {}
+		self.recvCondition = asyncio.Condition()
+
+	def GetName(self) -> str:
+		return "Remote"
+	
+	def GetLogger(self) -> logging.Logger:
+		return log
 
 	async def OnConnected(self):
 		global client
 		client = self
-		await super().OnConnected()
+		return await super().OnConnected()
 	
 	async def OnDisconnected(self):
 		global client
 		client = None
-		await super().OnDisconnected()
+		return await super().OnDisconnected()
 	
 	async def Session(self, request: data.Request):
 		raw = data.Transport(data.TransportDataType.REQUEST, request.ToProtobuf(), 0, 0)
 		log.debug(f"Request {raw.seq_id} - {request.method} {request.url}")
 		raw.data = raw.data if self.conf.cipher is None else self.conf.cipher.Encrypt(raw.data)
-		rawResp = await super().Session(raw)
-		assert(rawResp.data_type == data.TransportDataType.RESPONSE)
-		rawResp.data = rawResp.data if self.conf.cipher is None else self.conf.cipher.Decrypt(rawResp.data)
-		resp = data.Response.FromProtobuf(rawResp.data)
-		if resp.IsSSEResponse():
-			log.debug(f"SSE Response {raw.seq_id} - {request.method} {resp.url} {resp.status_code} {len(resp.body)} bytes <<< {repr(resp.body[:50])} ...>>>")
-			async with self.trackLock:
-				self.tracksse[raw.seq_id] = [request.url, True]
-		else:
-			log.debug(f"Response {raw.seq_id} - {request.method} {resp.url} {resp.status_code}")
-		return resp, raw.seq_id
-	
-	async def Stream(self, seq_id: str):
-		url = self.tracksse[seq_id][0]
-		async for item in super().Stream(seq_id):
-			chunk = item.data if self.conf.cipher is None else self.conf.cipher.Decrypt(item.data)
-			isFirstTime = self.tracksse[seq_id][1]
-			if isFirstTime:
-				async with self.trackLock:
-					self.tracksse[seq_id][1] = False
-				log.debug(f"SSE >>>Begin {seq_id} - {item.cur_idx}-th {url} {len(chunk)} bytes <<< {repr(chunk[:50])} ...>>>")
+		await self.DirectSend(raw)
+
+		async with self.recvCondition:
+			await self.recvCondition.wait_for(lambda: raw.seq_id in self.recvMaps)
+			resp = self.recvMaps[raw.seq_id]
+			del self.recvMaps[raw.seq_id]
+			if resp.IsSSEResponse():
+				log.debug(f"SSE Response {raw.seq_id} - {request.method} {resp.url} {resp.status_code}")
 			else:
-				log.debug(f"SSE Stream {seq_id} - {item.cur_idx}-th {len(chunk)} bytes <<< {repr(chunk[:50])} ...>>>")
-			yield chunk
-		log.debug(f"SSE <<<End {seq_id} - {url}")
-		async with self.trackLock:
-			del self.tracksse[seq_id]
+				log.debug(f"Response {raw.seq_id} - {request.method} {resp.url} {resp.status_code}")
+			return resp, raw.seq_id
 
-	async def OnRecvStreamPackage(self, raw: data.Transport):
-		await self.putStream(raw)
+	async def SessionSSE(self, seq_id: str):
+		while True:
+			item = await self.ssePool[seq_id].get()
+			if item.total_cnt == -1:
+				del self.ssePool[seq_id]
+				yield item.data
+				return
+			yield item.data
 
-	async def OnRecvPackage(self, raw: data.Transport):
-		if self.checkTransportDataType(raw, [data.TransportDataType.RESPONSE]) == False: return
-		await self.putSession(raw)
+	async def processSSE(self, raw: data.Transport):
+		async with self.sseCondition:
+			rawData = raw.data if self.conf.cipher is None else self.conf.cipher.Decrypt(raw.data)
+			if raw.total_cnt == -1: # 结束SSE流，结束包是不带数据的
+				log.debug(f"SSE <<<End {raw.seq_id} - {self.tracksse[raw.seq_id][0]} {len(rawData)} bytes")
+				del self.tracksse[raw.seq_id]
+			else:
+				log.debug(f"SSE Stream {raw.seq_id} - {len(rawData)} bytes")
+				if self.tracksse[raw.seq_id][1]: # 打印第一个sse的sample
+					log.debug(f"SSE Package <<< {repr(raw.data[:50])} ...>>> to <<< {repr(rawData[:50])} ...>>>")
+					self.tracksse[raw.seq_id][1] = False # 关闭后续的sse打印sample
+			raw.data = rawData
+			await self.ssePool[raw.seq_id].put(raw)
+			self.sseCondition.notify_all()
+
+	async def OnRecvStreamPackage(self, raw: data.Transport) -> None:
+		return await self.processSSE(raw)
+
+	async def OnRecvPackage(self, raw: data.Transport) -> None:
+		assert(raw.data_type == data.TransportDataType.RESPONSE)
+		rawData = raw.data if self.conf.cipher is None else self.conf.cipher.Decrypt(raw.data)
+
+		try:
+			resp = data.Response.FromProtobuf(rawData)
+		except Exception as e:
+			log.error(f"Failed to parse {raw.seq_id} response, maybe the cipher problem: {e}")
+			log.error(f"{raw.seq_id}] Source raw data: {raw.data[:100]}")
+			log.error(f"{raw.seq_id}] Target raw data: {rawData[:100]}")
+			raise e # rethrow the exception
+		
+		if resp.IsSSEResponse():
+			log.debug(f"SSE >>>Begin {raw.seq_id} - {resp.url} {len(resp.body)} bytes")
+			self.tracksse[raw.seq_id] = [resp.url, True]
+			self.ssePool[raw.seq_id] = asyncio.PriorityQueue()
+			async with self.recvCondition:
+				self.recvMaps[raw.seq_id] = resp
+				self.recvCondition.notify_all()
+		else:
+			async with self.recvCondition:
+				# log.debug(f"recv http: {resp.url}")
+				self.recvMaps[raw.seq_id] = resp
+				self.recvCondition.notify_all()
 
 class HttpServer:
 	def __init__(self, conf: Configuration) -> None:
@@ -108,7 +155,7 @@ class HttpServer:
 
 	async def processSSE(self, resp: data.Response, seq_id: str):
 		yield resp.body
-		async for package in client.Stream(seq_id):
+		async for package in client.SessionSSE(seq_id):
 			yield package
 
 	async def MainLoopOnRequest(self, request: web.BaseRequest):

@@ -12,7 +12,7 @@ class Configuration:
 		self.server: str = args.server
 		self.hasCache: bool = args.cache
 		self.timeout = time_utils.Seconds(args.timeout)
-		self.cacheSize = args.cache_size
+		self.cacheSize: int = args.cache_size
 
 	@classmethod
 	def SetupParser(cls, parser: argp.ArgumentParser):
@@ -39,18 +39,21 @@ argparse = Configuration.SetupParser(argparse)
 args = argparse.parse_args()
 conf = Configuration(args)
 
-class Common(tunnel.WebSocketTunnelServer):
-	def __init__(self, cur_id: int, opposite_id: int, name="WebSocket Common", **kwargs):
-		super().__init__(name=name, log=log, **kwargs)
-		self.cacheQueue: utils.BoundedQueue[data.Transport] = utils.BoundedQueue(conf.cacheSize)
+servers: typing.List[typing.Optional[tunnel.HttpUpgradedWebSocketServer]] = [None] * 2
+cacheQueues: typing.List[utils.BoundedQueue[data.Transport]] = [ utils.BoundedQueue(conf.cacheSize) for _ in range(len(servers))]
+
+class Client(tunnel.HttpUpgradedWebSocketServer):
+	def __init__(self, cur_id: int, opposite_id: int, name="WebSocket Client", **kwargs):
+		super().__init__(**kwargs)
 		self.cur_id = cur_id
 		self.opposite_id = opposite_id
+		self.name = name
 
-servers: typing.List[typing.Union[None, Common]] = [None] * 2
-
-class Client(Common):
-	def __init__(self, cur_id: int, opposite_id: int, name="WebSocket Client", **kwargs):
-		super().__init__(cur_id, opposite_id, name=name, **kwargs)
+	def GetName(self) -> str:
+		return self.name
+	
+	def GetLogger(self) -> logging.Logger:
+		return log
 
 	async def resend(self):
 		if self.cacheQueue.IsEmpty(): return
@@ -80,19 +83,19 @@ class Client(Common):
 		servers[self.cur_id] = None
 		await super().OnDisconnected()
 
-	async def OnProcess(self, raw: data.Transport):
+	async def ProcessPackage(self, raw: data.Transport):
 		if servers[self.opposite_id] is None or not servers[self.opposite_id].IsConnected():
 			if conf.hasCache:
 				raw.RenewTimestamp() # use server's timestamp
-				await servers[self.opposite_id].cacheQueue.Add(raw)
+				await cacheQueues[self.opposite_id].Add(raw)
 		else:
 			log.debug(f"{self.name}] Transfer {raw.seq_id}")
 			await servers[self.opposite_id].DirectSend(raw)
 
 async def main(config: Configuration):
 	app = web.Application()
-	app.router.add_get('/client_ws', tunnel.WebSocketTunnelServerHandler(Client, cur_id=0, opposite_id=1, name="Client"))
-	app.router.add_get('/remote_ws', tunnel.WebSocketTunnelServerHandler(Client, cur_id=1, opposite_id=0, name="Remote"))
+	app.router.add_get('/client_ws', tunnel.HttpUpgradedWebSocketServerHandler(Client, cur_id=0, opposite_id=1, name="Client"))
+	app.router.add_get('/remote_ws', tunnel.HttpUpgradedWebSocketServerHandler(Client, cur_id=1, opposite_id=0, name="Remote"))
 	
 	runner = web.AppRunner(app)
 	await runner.setup()
