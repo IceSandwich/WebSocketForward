@@ -13,6 +13,8 @@ class Configuration:
 		self.hasCache: bool = args.cache
 		self.timeout = time_utils.Seconds(args.timeout)
 		self.cacheSize: int = args.cache_size
+		self.remote_listen: str = args.remote_listen
+		self.client_listen: str = args.client_listen
 
 	@classmethod
 	def SetupParser(cls, parser: argp.ArgumentParser):
@@ -20,6 +22,8 @@ class Configuration:
 		parser.add_argument("--cache", action='store_true', help="Resend package when reconnecting.")
 		parser.add_argument("--cache_size", type=int, default=128, help="The maximum number of packages to cache.")
 		parser.add_argument("--timeout", type=int, default=10, help="The maximum seconds to resend packages.")
+		parser.add_argument("--remote_listen", type=str, default="/wsf/remote_ws", help="Listen url in remote websocket.")
+		parser.add_argument("--client_listen", type=str, default="/wsf/client_ws", help="Listen url in client websocket.")
 		return parser
 
 	def GetListenedAddress(self):
@@ -94,8 +98,8 @@ class Client(tunnel.HttpUpgradedWebSocketServer):
 
 async def main(config: Configuration):
 	app = web.Application()
-	app.router.add_get('/client_ws', tunnel.HttpUpgradedWebSocketServerHandler(Client, cur_id=0, opposite_id=1, name="Client"))
-	app.router.add_get('/remote_ws', tunnel.HttpUpgradedWebSocketServerHandler(Client, cur_id=1, opposite_id=0, name="Remote"))
+	app.router.add_get(config.client_listen, tunnel.HttpUpgradedWebSocketServerHandler(Client, cur_id=0, opposite_id=1, name="Client"))
+	app.router.add_get(config.remote_listen, tunnel.HttpUpgradedWebSocketServerHandler(Client, cur_id=1, opposite_id=0, name="Remote"))
 	
 	runner = web.AppRunner(app)
 	await runner.setup()
@@ -107,6 +111,7 @@ async def main(config: Configuration):
 	await site.start()
 	
 	log.info(f"Server started on {config.GetListenedAddress()}")
+	log.info(f"Please run remote.py to connect `{config.remote_listen}` and client.py to connect `{config.client_listen}`.")
 	await asyncio.Future()
 
 if __name__ == "__main__":
