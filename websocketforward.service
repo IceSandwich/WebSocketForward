@@ -5,7 +5,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/opt/WebSocketForward/venv/bin/python /opt/WebSocketForward/server.py --server 127.0.0.1:12228
+ExecStart=/opt/WebSocketForward/venv/bin/python /opt/WebSocketForward/server.py --server 127.0.0.1:12228 --cache
 WorkingDirectory=/opt/WebSocketForward
 
 [Install]

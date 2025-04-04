@@ -15,6 +15,6 @@ python -m pip install -r requirements.txt
 
 # 4. 运行 server.py 脚本
 echo "[2/2] 运行..."
-nohup python server.py --server 127.0.0.1:12228 &
+nohup python server.py --server 127.0.0.1:12228 --cache &
 echo $! > server.pid
 echo 'server.py 已在后台运行。使用 `kill $(cat server.pid)` 停止它。'
