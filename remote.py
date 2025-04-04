@@ -20,6 +20,7 @@ class Configuration:
 		self.server: str = args.server
 		self.port: int = args.port
 		self.prefix: str = args.prefix
+		self.img_quality:int = args.prefer_img_quality
 		if args.cipher != "":
 			self.cipher = encrypt.NewCipher(args.cipher, args.key)
 		else:
@@ -34,6 +35,7 @@ class Configuration:
 		parser.add_argument("--port", type=int, default=8130, help="The port to listen on.")
 		parser.add_argument("--cipher", type=str, default="xor", help=f"The cipher to use. Available: [{', '.join(encrypt.GetAvailableCipherMethods())}]")
 		parser.add_argument("--key", type=str, default="websocket forward", help="The key to use for the cipher. Must be the same with client.")
+		parser.add_argument("--prefer_img_quality", type=int, default=75, help="Compress the image to transfer fasterly.")
 		return parser
 
 class TypeHintClient(tunnel.HttpUpgradedWebSocketClient):
@@ -140,7 +142,7 @@ class StableDiffusionCachingClient(Client):
 		#http://127.0.0.1:7860/file=extensions/a1111-sd-webui-tagcomplete/javascript/ext_umi.js?1729071885.9683821=
 
 	def readCache(self, filename: str, url: str):
-		log.info(f'Using cache: {url} => {filename}')
+		log.debug(f'Using cache: {url} => {filename}')
 		with open(filename, 'rb') as f:
 			body = f.read()
 		resp = data.Response(url, 200, {
@@ -152,43 +154,38 @@ class StableDiffusionCachingClient(Client):
 		parsed_url = urlparse(request.url)
 		components = parsed_url.path.strip('/').split('/')
 		if len(components) == 0: return await super().Session(request)
-		
+
 		if components[0] in self.assets_dir:
-			targetfn = os.path.join(self.root_dir, *components)
-			if os.path.exists(targetfn):
-				return self.readCache(targetfn, request.url)
+			relativefn = parsed_url.path[1:]
+		elif components[0].startswith('file='):
+			relativefn = parsed_url.path[len('/file='):]
+			if relativefn.startswith(self.sdprefix):
+				relativefn = relativefn[len(self.sdprefix):].strip('/')
+		else:
+			return await super().Session(request)
+		targetfn = os.path.join(self.root_dir, relativefn)
+
+		if os.path.exists(targetfn):
+			return self.readCache(targetfn, request.url)
+		else:
+			if relativefn.startswith('outputs/'):
+				utils.SetWSFCompress(request, utils.MIMETYPE_WEBP, self.img_quality)
+				resp, seq_id = await super().Session(request)
+				img = utils.DecodeImageFromBytes(resp.body)
+				os.makedirs(os.path.dirname(targetfn), exist_ok=True)
+				img.save(targetfn)
+				log.info(f'Save result: {targetfn}')
+				with open(targetfn, 'rb') as f:
+					resp.body = f.read()
+					if 'Content-Length' in resp.headers:
+						resp.headers['Content-Length'] = str(len(resp.body))
 			else:
 				resp, seq_id = await super().Session(request)
 				os.makedirs(os.path.dirname(targetfn), exist_ok=True)
 				with open(targetfn, 'wb') as f:
 					f.write(resp.body)
-					log.info(f'Cache {parsed_url.path} to {targetfn}')
-				return resp, seq_id
-		elif components[0].startswith('file='):
-			targetfn = parsed_url.path[len('/file='):]
-			if targetfn.startswith(self.sdprefix):
-				targetfn = targetfn[len(self.sdprefix):]
-			fullfn = os.path.join(self.root_dir, targetfn)
-			print(f"====> fullfn: {fullfn}")
-			if os.path.exists(fullfn):
-				return self.readCache(fullfn, request.url)
-			else:
-				if targetfn.startswith('outputs/'):
-					utils.SetWSFCompress(request, utils.MIMETYPE_WEBP, 75)
-					resp, seq_id = await super().Session(request)
-					img = utils.DecodeImageFromBytes(resp.body)
-					os.makedirs(os.path.dirname(fullfn), exist_ok=True)
-					img.save(fullfn)
-					log.info(f'Save result: {targetfn}')
-				else:
-					resp, seq_id = await super().Session(request)
-					os.makedirs(os.path.dirname(fullfn), exist_ok=True)
-					with open(fullfn, 'wb') as f:
-						f.write(resp.body)
-						log.info(f'Cache {parsed_url.path} to {fullfn}')
-				return resp, seq_id
-		else:
-			return await super().Session(request)
+					log.debug(f'Cache {parsed_url.path} to {targetfn}')
+			return resp, seq_id
 
 class HttpServer:
 	def __init__(self, conf: Configuration) -> None:

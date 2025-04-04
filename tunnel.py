@@ -242,7 +242,7 @@ class HttpUpgradedWebSocketClient(TunnelClient):
 					await self.OnConnected()
 					curTries = 0 # reset tries
 					if not self.cacheQueue.empty():
-						asyncio.create_task(self.resendCachePackages())
+						await self.resendCachePackages()
 					async for msg in self.handler:
 						if msg.type == aiohttp.WSMsgType.ERROR:
 							self.OnError(self.handler.exception())

@@ -58,11 +58,14 @@ class Client(tunnel.HttpUpgradedWebSocketServer):
 	
 	def GetLogger(self) -> logging.Logger:
 		return log
+	
+	def GetQueue(self):
+		return cacheQueues[self.cur_id]
 
 	async def resend(self):
-		if self.cacheQueue.IsEmpty(): return
+		if self.GetQueue().IsEmpty(): return
 
-		items = await self.cacheQueue.PopAllElements()
+		items = await self.GetQueue().PopAllElements()
 		log.info(f"{self.name}] Resend {len(items)} package.")
 		nowtime = time_utils.GetTimestamp()
 		for item in items:
