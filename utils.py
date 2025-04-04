@@ -91,16 +91,51 @@ class Chunk:
 		return self.template
 
 def DecodeImageFromBytes(raw: bytes):
-    return Image.open(io.BytesIO(raw))
+	return Image.open(io.BytesIO(raw))
 
-def CompressImageToWebP(raw: bytes, quality: int = 75):
-    image = DecodeImageFromBytes(raw)
-    img_bytes = io.BytesIO()
-    image.save(img_bytes, format='WebP', quality=quality)
-    return img_bytes.getvalue()
+MIMETYPE_WEBP = 'image/webp'
+
+def CompressImage(raw: bytes, target_mimetype: str, quality: int = 75):
+	"""
+	根据Mimetype压缩图片，如果不支持这个Mimetype，返回最终使用的Mimetype和字节流。
+	"""
+	mimetypeToFormat = {
+		MIMETYPE_WEBP: 'WebP'
+	}
+	if target_mimetype not in mimetypeToFormat:
+		print(f"Cannot compress image, unknown target mimetype: {target_mimetype}. Use WebP as default.")
+		target_mimetype = MIMETYPE_WEBP
+
+	image = DecodeImageFromBytes(raw)
+	img_bytes = io.BytesIO()
+	image.save(img_bytes, format=mimetypeToFormat[target_mimetype], quality=quality)
+	return target_mimetype, img_bytes.getvalue()
 
 def ComputeCompressRatio(source: int, target: int):
 	return 1.0 - (target / source)
 
 def NewSeqId():
 	return str(uuid.uuid4())
+
+def SetWSFCompress(req: typing.Union[data.Request, typing.Dict[str, str]],image_type: str = "image/webp", quality: int = 75):
+	"""
+	quality设置-1表示这是一个通知信息
+	"""
+	value = f'{image_type}' if quality == -1 else f'{image_type},{quality}'
+	if type(req) == data.Request:
+		req.headers['WSF-Compress'] = value
+	else:
+		req['WSF-Compress'] = value
+
+def HasWSFCompress(req: data.Request):
+	return 'WSF-Compress' in req.headers
+
+def GetWSFCompress(req: data.Request):
+	"""
+	解析Compress头，返回MIMETYPE和图片质量。
+	注意，调用前请使用HasWSFCompress()确保包含Compress头。
+	"""
+	compress = req.headers['WSF-Compress']
+	sp = compress.split(',')
+	assert(len(sp) == 2)
+	return (sp[0], int(sp[1]))

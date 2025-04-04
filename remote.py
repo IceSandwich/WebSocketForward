@@ -174,7 +174,7 @@ class StableDiffusionCachingClient(Client):
 				return self.readCache(fullfn, request.url)
 			else:
 				if targetfn.startswith('outputs/'):
-					request.headers['WSF-Compress'] = 'image/webp'
+					utils.SetWSFCompress(request, utils.MIMETYPE_WEBP, 75)
 					resp, seq_id = await super().Session(request)
 					img = utils.DecodeImageFromBytes(resp.body)
 					os.makedirs(os.path.dirname(fullfn), exist_ok=True)

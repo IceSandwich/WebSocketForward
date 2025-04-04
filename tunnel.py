@@ -40,7 +40,7 @@ class Callback(abc.ABC):
 	@abc.abstractmethod
 	def DirectSend(self, raw: data.Transport) -> None:
 		"""
-		直接发送包，raw应当是加密后的。
+		直接发送包，raw应当是加密后的。这是一个底层api，请优先使用QueueSend。
 		"""
 		raise NotImplementedError()
 	
