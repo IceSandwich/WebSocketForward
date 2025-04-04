@@ -169,6 +169,7 @@ class StableDiffusionCachingClient(Client):
 			if targetfn.startswith(self.sdprefix):
 				targetfn = targetfn[len(self.sdprefix):]
 			fullfn = os.path.join(self.root_dir, targetfn)
+			print(f"====> fullfn: {fullfn}")
 			if os.path.exists(fullfn):
 				return self.readCache(fullfn, request.url)
 			else:

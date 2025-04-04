@@ -48,6 +48,7 @@ class Callback(abc.ABC):
 	async def MainLoop(self) -> None:
 		"""
 		主循环，连接远端，应当在另一线程或协程运行。
+		MainLoop实现中需要对isConnected变量进行修改。
 		"""
 		raise NotImplementedError()
 	
@@ -74,8 +75,6 @@ class TunnelClient(Callback):
 		# 最小堆，根据cur_idx排序
 		self.streamHeap: typing.Dict[str, typing.List[data.Transport]] = {}
 		self.streamCondition = asyncio.Condition()
-
-		self.sendQueue: asyncio.Queue[data.Transport] = asyncio.Queue()
 
 	# ======================= 以下函数由用户实现 ============================
 	
@@ -110,13 +109,30 @@ class TunnelClient(Callback):
 			self.streamCondition.notify_all()
 	
 	# ==================== 以下函数无需再实现 ==============================
+	
+	async def QueueSend(self, raw: data.Transport):
+		"""
+		缓存发包，当连接断开时暂时缓存包，等到再次连上时重新发送。
+		"""
+		if self.isConnected:
+			try:
+				await self.DirectSend(raw)
+			except aiohttp.ClientConnectionResetError:
+				# send failed, caching data
+				await self.cacheQueue.put(raw)
+			except Exception as e:
+				# skip package for unknown reason
+				print(f"{self.GetName()}] Unknown exception on QueueToSend(): {e}")
+		else:
+			# not connected, cacheing data
+			await self.cacheQueue.put(raw)
 
 	async def Session(self, raw: data.Transport):
 		"""
 		发送一个raw，等待回应一个raw。适合于非流的数据传输。
 		注意：需要调用TunnelClient.OnRecvPackage()将包放到session队列中，该函数才起效。
 		"""
-		await self.DirectSend(raw)
+		await self.QueueSend(raw)
 
 		async with self.sessionCondition:
 			await self.sessionCondition.wait_for(lambda: raw.seq_id in self.sessionMap)
@@ -144,17 +160,17 @@ class TunnelClient(Callback):
 		"""
 		重发因网络原因未发送的包，应当在重新连接上时立刻调用。
 		"""
-		self.GetLogger().info(f"{self.GetName()}] Resend {len(self.sendQueue)} requests.")
+		self.GetLogger().info(f"{self.GetName()}] Resend {len(self.cacheQueue)} requests.")
 		nowtime = time_utils.GetTimestamp()
-		while self.IsConnected() and not self.sendQueue.empty():
-			item = await self.sendQueue.get()
+		while self.IsConnected() and not self.cacheQueue.empty():
+			item = await self.cacheQueue.get()
 			if time_utils.WithInDuration(item.timestamp, nowtime, self.resendDuration):
 				try:
 					await self.DirectSend(item)
 				except aiohttp.ClientConnectionResetError as e:
 					if not self.IsConnected():
 						self.GetLogger().error(f"{self.GetName()}] Failed to resend {item.seq_id} but luckily it's ClientConnectionResetError in disconnected mode so we plan to resent it next time: {e}")
-						await self.sendQueue.put(item) # put it back
+						await self.cacheQueue.put(item) # put it back
 						return # wait for next resend
 					else:
 						self.GetLogger().error(f"{self.GetName()}] Failed to resend {item.seq_id}, err: {e}")

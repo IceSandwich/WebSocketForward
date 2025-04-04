@@ -140,13 +140,13 @@ class Client(tunnel.HttpUpgradedWebSocketClient):
 				raw.data = rawData
 				# print(f"Send first sse {raw.seq_id} - {raw.cur_idx}-ith")
 
-				await self.DirectSend(raw)
+				await self.QueueSend(raw)
 			else:
 				raw.data_type = data.TransportDataType.STREAM_SUBPACKAGE
 				log.debug(f"SSE Stream {raw.seq_id} - {len(chunk)} bytes")
 				# print(f"Send SSE {raw.seq_id} - {raw.cur_idx}-ith")
 				raw.data = chunk if self.config.cipher is None else self.config.cipher.Encrypt(chunk)
-				await self.DirectSend(raw)
+				await self.QueueSend(raw)
 			# 第一个response的idx为0，第一个sse_subpackage的idx为1
 			raw.cur_idx = raw.cur_idx + 1
 		
@@ -155,7 +155,7 @@ class Client(tunnel.HttpUpgradedWebSocketClient):
 		raw.data = b''
 		log.debug(f"SSE <<<End {raw.seq_id} - {resp.url} {len(raw.data)} bytes")
 		# print(f"Send End SSE {raw.seq_id} - {raw.cur_idx}-ith")
-		await self.DirectSend(raw)
+		await self.QueueSend(raw)
 		await resp.release()
 
 	async def OnRecvStreamPackage(self, raw: data.Transport) -> None:
@@ -201,7 +201,7 @@ class Client(tunnel.HttpUpgradedWebSocketClient):
 				f'=== Proxy server cannot request: {e}'.encode('utf8'),
 			).ToProtobuf()
 			raw.data = raw.data if self.config.cipher is None else self.config.cipher.Encrypt(raw.data)
-			return await self.DirectSend(raw)
+			return await self.QueueSend(raw)
 
 		if 'text/event-stream' in resp.headers['Content-Type']:
 			log.debug(f"SSE Response {raw.seq_id} - {req.method} {resp.url} {resp.status}")
@@ -226,7 +226,7 @@ class Client(tunnel.HttpUpgradedWebSocketClient):
 				respData
 			).ToProtobuf()
 			raw.data = raw.data if self.config.cipher is None else self.config.cipher.Encrypt(raw.data)
-			await self.DirectSend(raw)
+			await self.QueueSend(raw)
 			await resp.release()
 
 	async def processTCPConnectPackage(self, raw: data.Transport):
@@ -248,7 +248,7 @@ class Client(tunnel.HttpUpgradedWebSocketClient):
 					async def OnDisconnected(that):
 						del self.tcpConnection[that.seq_id]
 					async def DirectSend(that, raw: data.Transport) -> None:
-						return await that.DirectSend(raw)
+						return await self.QueueSend(raw)
 				
 				asyncio.create_task(self.tcpConnections[raw.seq_id].MainLoop(CB(raw.seq_id)))
 
@@ -256,14 +256,14 @@ class Client(tunnel.HttpUpgradedWebSocketClient):
 					b'HTTP/1.1 200 Connection Established\r\n\r\n'
 				).ToProtobuf()
 				resp.data = resp.data if self.config.cipher is None else self.config.cipher.Encrypt(resp.data)
-				await self.DirectSend(resp)
+				await self.QueueSend(resp)
 			except Exception as e:
 				log.error(f"TCP] Failed to connnect {package.host}:{package.port}, err: {e}")
 				resp.data = data.Response("", 502, {},
 					b'HTTP/1.1 502 Bad Gateway\r\n\r\n'
 				).ToProtobuf()
 				resp.data = resp.data if self.config.cipher is None else self.config.cipher.Encrypt(resp.data)
-				await self.DirectSend(resp)
+				await self.QueueSend(resp)
 		else: # 关闭连接
 			self.tcpConnections[raw.seq_id].Close()
 
