@@ -15,6 +15,8 @@ class Configuration:
 		self.cacheSize: int = args.cache_size
 		self.remote_listen: str = args.remote_listen
 		self.client_listen: str = args.client_listen
+		if self.hasCache:
+			log.info("Using cache queue.")
 
 	@classmethod
 	def SetupParser(cls, parser: argp.ArgumentParser):
@@ -45,6 +47,21 @@ conf = Configuration(args)
 
 servers: typing.List[typing.Optional[tunnel.HttpUpgradedWebSocketServer]] = [None] * 2
 cacheQueues: typing.List[utils.BoundedQueue[data.Transport]] = [ utils.BoundedQueue(conf.cacheSize) for _ in range(len(servers))]
+
+def Boardcast(msg: str, skip_id: int):
+	pkg = data.Transport(
+		data.TransportDataType.CONTROL,
+		data.Control(
+			data.ControlDataType.PRINT, 
+			data.PrintControlMsg("Server", msg).Serialize()
+		).ToProtobuf(),
+		-1,
+		-1
+	)
+	for i, server in enumerate(servers):
+		if not server: continue
+		if i == skip_id: continue
+		server.DirectSend(pkg)         
 
 class Client(tunnel.HttpUpgradedWebSocketServer):
 	def __init__(self, cur_id: int, opposite_id: int, name="WebSocket Client", **kwargs):
@@ -91,8 +108,11 @@ class Client(tunnel.HttpUpgradedWebSocketServer):
 		await super().OnDisconnected()
 
 	async def ProcessPackage(self, raw: data.Transport):
+		log.info(f"{self.name}] Received package {raw.seq_id}")
 		if servers[self.opposite_id] is None or not servers[self.opposite_id].IsConnected():
+			log.error(f"{self.name}] Opposite is down. Consider to cache.")
 			if conf.hasCache:
+				log.info(f"{self.GetName()}] Cache {raw.seq_id} to queue.")
 				raw.RenewTimestamp() # use server's timestamp
 				await cacheQueues[self.opposite_id].Add(raw)
 		else:

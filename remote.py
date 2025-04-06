@@ -140,6 +140,7 @@ class StableDiffusionCachingClient(Client):
 		#http://127.0.0.1:7860/file=D:/GITHUB/stable-diffusion-webui-forge/outputs/txt2img-grids/2025-04-04/grid-0037.png
 		#http://127.0.0.1:7860/file=D:/GITHUB/stable-diffusion-webui-forge/outputs/txt2img-images/2025-04-04/00146-3244803616.png
 		#http://127.0.0.1:7860/file=extensions/a1111-sd-webui-tagcomplete/javascript/ext_umi.js?1729071885.9683821=
+		#http://127.0.0.1:7860/file=C:/Users/xxx/AppData/Local/Temp/gradio/tmpey_xm_6q.png
 
 	def readCache(self, filename: str, url: str):
 		log.debug(f'Using cache: {url} => {filename}')
@@ -181,7 +182,11 @@ class StableDiffusionCachingClient(Client):
 						resp.headers['Content-Length'] = str(len(resp.body))
 			else:
 				resp, seq_id = await super().Session(request)
-				os.makedirs(os.path.dirname(targetfn), exist_ok=True)
+				try:
+					dirname = os.path.dirname(targetfn)
+					os.makedirs(dirname, exist_ok=True)
+				except Exception as e:
+					log.error(f"Failed to create dir: {dirname} for request url: {request.url}")
 				with open(targetfn, 'wb') as f:
 					f.write(resp.body)
 					log.debug(f'Cache {parsed_url.path} to {targetfn}')

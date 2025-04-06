@@ -3,7 +3,36 @@ import protocol_pb2
 from uuid import uuid4
 import time_utils
 
-class TransportDataType:
+class DataTypeBase:
+	"""
+	子类定义 Mappings: typing.List[typing.Tuple[int, str, typing.Any]] 类变量
+	"""
+	@classmethod
+	def ToString(cls, t: int):
+		TypeToName: typing.Dict[int, str] = { x[0]: x[1] for x in cls.Mappings }
+		PBToType: typing.Dict[typing.Any, int] = { x[2] : x[0] for x in cls.Mappings }
+		if t in PBToType:
+			return TypeToName[PBToType[t]]
+		else:
+			raise Exception(f'unknown data type: {t}')
+		
+	@classmethod
+	def ToPB(cls, t: int):
+		TypeToPB: typing.Dict[int, typing.Any] = { x[0] : x[2] for x in cls.Mappings }
+		if t in TypeToPB:
+			return TypeToPB[t]
+		else:
+			raise Exception(f'unknown data type: {t}')
+
+	@classmethod
+	def FromPB(cls, t: typing.Any):
+		PBToType: typing.Dict[typing.Any, int] = { x[2] : x[0] for x in cls.Mappings }
+		if t in PBToType:
+			return PBToType[t]
+		else:
+			raise Exception(f'unknown data type: {t}')
+
+class TransportDataType(DataTypeBase):
 	CONTROL = 0
 	REQUEST = 1
 	RESPONSE = 2
@@ -21,31 +50,6 @@ class TransportDataType:
 		[TCP_CONNECT, 'TCP_CONNECT', protocol_pb2.TransportDataType.TCP_CONNECT],
 		# [TCP_MESSAGE, 'TCP_MESSAGE', protocol_pb2.TransportDataType.TCP_MESSAGE]
 	]
-
-	TypeToPB = { x[0] : x[2] for x in Mappings }
-	TypeToName = { x[0]: x[1] for x in Mappings }
-	PBToType = { x[2] : x[0] for x in Mappings }
-
-	@classmethod
-	def ToString(cls, t: int):
-		if t in cls.PBToType:
-			return cls.TypeToName[cls.PBToType[t]]
-		else:
-			raise Exception(f'unknown data type: {t}')
-		
-	@classmethod
-	def ToPB(cls, t: int):
-		if t in cls.TypeToPB:
-			return cls.TypeToPB[t]
-		else:
-			raise Exception(f'unknown data type: {t}')
-
-	@classmethod
-	def FromPB(cls, t: typing.Any):
-		if t in cls.PBToType:
-			return cls.PBToType[t]
-		else:
-			raise Exception(f'unknown data type: {t}')
 
 class Transport:
 	END_PACKAGE = -1
@@ -190,3 +194,51 @@ class TCPConnect:
         pb.ParseFromString(data)
         ret = TCPConnect(pb.host, pb.port)
         return ret
+
+class ControlDataType(DataTypeBase):
+	HEARTBEAT = 0
+	PRINT = 1
+	EXIT = 2
+
+	Mappings: typing.List[typing.Tuple[int, str, typing.Any]] = [
+		[HEARTBEAT, 'HEARTBEAT', protocol_pb2.ControlDataType.HEARTBEAT],
+		[PRINT, 'PRINT', protocol_pb2.ControlDataType.PRINT],
+		[EXIT, 'EXIT', protocol_pb2.ControlDataType.EXIT]
+	]
+
+class Control:
+	def __init__(self, data_type: ControlDataType, msg: str):
+		self.data_type = data_type
+		self.msg = msg
+
+	def ToProtobuf(self) -> bytes:
+		pb  = protocol_pb2.Control()
+		pb.data_type = ControlDataType.ToPB(self.data_type)
+		pb.message = self.msg
+		return pb.SerializeToString()
+	
+	@classmethod
+	def FromProtobuf(cls, data: bytes):
+		pb = protocol_pb2.Response()
+		pb.ParseFromString(data)
+		ret = Control(ControlDataType.FromPB(pb.data_type), pb.message)
+		return ret
+	
+class PrintControlMsg:
+	def __init__(self, fromWho: str, message: str):
+		self.fromWho = fromWho
+		self.message = message
+
+	def Serialize(self):
+		return json.dumps({
+			"from": self.fromWho,
+			"msg": self.message
+		})
+	
+	@classmethod
+	def From(self, serialize: str):
+		ret = json.loads(serialize)
+		return PrintControlMsg(ret["from"], ret["msg"])
+
+if __name__ == '__main__':
+	print(ControlDataType.ToString(ControlDataType.PRINT))

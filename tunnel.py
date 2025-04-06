@@ -80,7 +80,7 @@ class TunnelClient(Callback):
 	
 	async def OnRecvPackage(self, raw: data.Transport) -> None:
 		"""
-		在这里处理除了流包的数据包，默认将非流包推到Session()队列。
+		在这里处理除了流包和控制包的数据包，默认将包推到Session()队列。
 		如果你需要重写该函数并且希望Session()起作用，记得调用TunnelClient.OnRecvPackage()。
 		"""
 		async with self.sessionCondition:
@@ -108,6 +108,12 @@ class TunnelClient(Callback):
 			# print(f"Stream got {raw.seq_id} - {raw.cur_idx}-ith, current heaq: {[x.cur_idx for x in self.streamHeap[raw.seq_id]]}")
 			self.streamCondition.notify_all()
 	
+	async def OnRecvCtrlPackage(self, raw: data.Transport) -> bool:
+		"""
+		返回False退出MainLoop。
+		"""
+		return True
+
 	# ==================== 以下函数无需再实现 ==============================
 	
 	async def QueueSend(self, raw: data.Transport):
@@ -119,12 +125,14 @@ class TunnelClient(Callback):
 				await self.DirectSend(raw)
 			except aiohttp.ClientConnectionResetError:
 				# send failed, caching data
+				self.GetLogger().error(f"{self.GetName()}] Disconnected while sending package. Cacheing package: {raw.seq_id}")
 				await self.cacheQueue.put(raw)
 			except Exception as e:
 				# skip package for unknown reason
-				print(f"{self.GetName()}] Unknown exception on QueueToSend(): {e}")
+				self.GetLogger().error(f"{self.GetName()}] Unknown exception on QueueToSend(): {e}")
 		else:
 			# not connected, cacheing data
+			self.GetLogger().error(f"{self.GetName()}] Not connected client. Cacheing package: {raw.seq_id}")
 			await self.cacheQueue.put(raw)
 
 	async def Session(self, raw: data.Transport):
@@ -178,14 +186,19 @@ class TunnelClient(Callback):
 			else:
 				self.GetLogger().warning(f"{self.GetName()}] Skip resending{item.seq_id} because the package is too old.")
 	
-	async def processPackage(self, raw: data.Transport) -> None:
+	async def processPackage(self, raw: data.Transport) -> bool:
 		"""
 		处理收到的一切包。在此分流到OnRecvStreamPackage()和OnRecvPackage()。
+		返回False退出MainLoop。
 		"""
 		if raw.data_type == data.TransportDataType.STREAM_SUBPACKAGE:
-			return await self.OnRecvStreamPackage(raw)
+			await self.OnRecvStreamPackage(raw)
+			return True
+		elif raw.data_type == data.TransportDataType.CONTROL:
+			return await self.OnRecvCtrlPackage(raw)
 		
 		await self.OnRecvPackage(raw)
+		return True
 		# if raw.data_type == data.TransportDataType.STREAM_SUBPACKAGE or raw.total_cnt == -1:
 		# 	if raw.seq_id not in self.chunks:
 		# 		assert(raw.total_cnt != -1)
@@ -232,6 +245,7 @@ class HttpUpgradedWebSocketClient(TunnelClient):
 
 	async def MainLoop(self):
 		curTries = 0
+		exitSignal = False
 		while curTries < self.maxRetries:
 			async with aiohttp.ClientSession() as session:
 				async with session.ws_connect(self.url, headers=HttpUpgradedWebSocketHeaders, max_msg_size=WebSocketMaxMessageSize) as ws:
@@ -248,10 +262,16 @@ class HttpUpgradedWebSocketClient(TunnelClient):
 							self.OnError(self.handler.exception())
 						elif msg.type == aiohttp.WSMsgType.TEXT or msg.type == aiohttp.WSMsgType.BINARY:
 							parsed = data.Transport.FromProtobuf(msg.data)
-							await self.processPackage(parsed)
-			curTries += 1
-			self.GetLogger().info(f"{self.GetName()}] Reconnecting({curTries}/{self.maxRetries})...")
+							if parsed.data_type == data.TransportDataType.CONTROL:
+								if await self.processControlPackage(parsed) == False:
+									exitSignal = True
+									break
+							else:
+								await self.processPackage(parsed)
 			self.isConnected = False
+			if exitSignal == False:
+				self.GetLogger().info(f"{self.GetName()}] Reconnecting({curTries}/{self.maxRetries})...")
+				curTries += 1
 			await self.OnDisconnected()
 		bakHandler = self.handler
 		self.handler = None
