@@ -55,13 +55,13 @@ class Transport:
 	END_PACKAGE = -1
 	SINGLE_PACKAGE = 1
 
-	def __init__(self, data_type: TransportDataType, data: bytes, remote_id: int, client_id: int, seq_id: str = None):
+	def __init__(self, data_type: TransportDataType, data: bytes, from_uid: str, to_uid: str, seq_id: str = None):
 		"""
 		默认开启新的seq_id
 		"""
 		self.timestamp = time_utils.GetTimestamp()
-		self.remote_id = remote_id
-		self.client_id = client_id
+		self.from_uid = from_uid
+		self.to_uid = to_uid
 		self.seq_id = str(uuid4()) if seq_id is None else seq_id
 		self.cur_idx = 0
 		self.total_cnt = 1
@@ -95,14 +95,14 @@ class Transport:
 		"""
 		保留seq_id和data_type，更新时间戳
 		"""
-		ret = Transport(self.data_type, None, self.remote_id, self.client_id, seq_id=self.seq_id)
+		ret = Transport(self.data_type, None, self.from_uid, self.to_uid, seq_id=self.seq_id)
 		return ret
 
 	def ToProtobuf(self) -> bytes:
 		pb = protocol_pb2.Transport()
 		pb.timestamp = self.timestamp
-		pb.remote_id = self.remote_id
-		pb.client_id = self.client_id
+		pb.from_uid = self.from_uid
+		pb.to_uid = self.to_uid
 		pb.seq_id = self.seq_id
 		pb.cur_idx = self.cur_idx
 		pb.total_cnt = self.total_cnt
@@ -114,7 +114,7 @@ class Transport:
 	def FromProtobuf(cls, buffer: bytes):
 		pb = protocol_pb2.Transport()
 		pb.ParseFromString(buffer)
-		ret = Transport(TransportDataType.FromPB(pb.data_type), pb.data, pb.remote_id, pb.client_id, seq_id=pb.seq_id)
+		ret = Transport(TransportDataType.FromPB(pb.data_type), pb.data, pb.from_uid, pb.to_uid, seq_id=pb.seq_id)
 		ret.timestamp = pb.timestamp
 		ret.cur_idx = pb.cur_idx
 		ret.total_cnt = pb.total_cnt
@@ -125,6 +125,9 @@ class Transport:
 
 	def __lt__(self, other):
 		return self.cur_idx < other.cur_idx
+	
+	def SwapSenderReciver(self):
+		self.from_uid, self.to_uid = self.to_uid, self.from_uid
 
 class Request:
 	def __init__(self, url: str, method: str, headers: typing.Dict[str, str], body: bytes = None):
@@ -199,11 +202,13 @@ class ControlDataType(DataTypeBase):
 	HEARTBEAT = 0
 	PRINT = 1
 	EXIT = 2
+	QUERY_CLIENTS = 3
 
 	Mappings: typing.List[typing.Tuple[int, str, typing.Any]] = [
 		[HEARTBEAT, 'HEARTBEAT', protocol_pb2.ControlDataType.HEARTBEAT],
 		[PRINT, 'PRINT', protocol_pb2.ControlDataType.PRINT],
-		[EXIT, 'EXIT', protocol_pb2.ControlDataType.EXIT]
+		[EXIT, 'EXIT', protocol_pb2.ControlDataType.EXIT],
+		[QUERY_CLIENTS, 'QUERY', protocol_pb2.ControlDataType.QUERY_CLIENTS]
 	]
 
 class Control:
@@ -219,7 +224,7 @@ class Control:
 	
 	@classmethod
 	def FromProtobuf(cls, data: bytes):
-		pb = protocol_pb2.Response()
+		pb = protocol_pb2.Control()
 		pb.ParseFromString(data)
 		ret = Control(ControlDataType.FromPB(pb.data_type), pb.message)
 		return ret
@@ -239,6 +244,19 @@ class PrintControlMsg:
 	def From(self, serialize: str):
 		ret = json.loads(serialize)
 		return PrintControlMsg(ret["from"], ret["msg"])
+
+class QueryClientsControlMsg:
+	def __init__(self,):
+		# self.uid = uid
+		pass
+
+	def Serialize(self):
+		return ''
+	
+	@classmethod
+	def From(self, serialize: str):
+		return HelloRequestControlMsg()
+
 
 if __name__ == '__main__':
 	print(ControlDataType.ToString(ControlDataType.PRINT))

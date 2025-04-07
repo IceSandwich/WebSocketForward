@@ -13,8 +13,8 @@ enum TransportDataType {
 
 message Transport {
 	int32 timestamp = 1;
-	int32 remote_id = 2;
-	int32 client_id = 3;
+	string from_uid = 2;
+	string to_uid = 3;
 	string seq_id = 4;
 	int32 cur_idx = 5; // from 0, range in [0, total_cnt-1]
 	int32 total_cnt = 6; // -1 means the sse is end
@@ -45,6 +45,7 @@ enum ControlDataType {
 	HEARTBEAT = 0;
 	PRINT = 1;
 	EXIT = 2;
+	QUERY_CLIENTS = 3;
 }
 
 message Control {

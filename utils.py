@@ -3,6 +3,7 @@ from datetime import datetime
 from PIL import Image
 import data
 import uuid
+import aiohttp.web as web
 T = typing.TypeVar('T')
 
 # 配置 logging
@@ -94,6 +95,16 @@ def DecodeImageFromBytes(raw: bytes):
 	return Image.open(io.BytesIO(raw))
 
 MIMETYPE_WEBP = 'image/webp'
+CONTENTTYPE_UTF8HTML = 'text/html; charset=utf-8'
+
+def ReponseText(msg: str, status_code: int):
+	return web.Response(
+		body=msg.encode('utf-8'),
+		headers={
+			'Content-Type': CONTENTTYPE_UTF8HTML
+		},
+		status=status_code
+	)
 
 def CompressImage(raw: bytes, target_mimetype: str, quality: int = 75):
 	"""

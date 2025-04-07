@@ -18,12 +18,14 @@ class Configuration:
 			self.cipher = None
 		if self.cipher is not None:
 			log.info(f"Using cipher: {self.cipher.GetName()}")
+		self.uid: str = args.uid
 
 	@classmethod
 	def SetupParser(cls, parser: argp.ArgumentParser):
-		parser.add_argument("--server", type=str, default="http://127.0.0.1:8030/client_ws", help="Server address")
+		parser.add_argument("--server", type=str, default="http://127.0.0.1:8030/wsf/ws", help="Server address")
 		parser.add_argument("--cipher", type=str, default="xor", help="Cipher to use for encryption")
-		parser.add_argument("--key", type=str, default="websocket forward", help="The key to use for the cipher. Must be the same with remote.")
+		parser.add_argument("--key", type=str, default="WebSocket@Forward通讯密钥，必须跟另一端保持一致。", help="The key to use for the cipher. Must be the same with remote.")
+		parser.add_argument("--uid", type=str, default="Client")
 		return parser
 
 class Connection:
@@ -40,11 +42,13 @@ class Connection:
 		self.display = display
 		self.isClosed = False
 
+		raise RuntimeError("Not ready to use.")
+
 	async def CopyToSender(self, callback: tunnel.Callback):
 		"""
 		TCP流量这里没有加密，大部分是TLS数据。
 		"""
-		raw = data.Transport(data.TransportDataType.STREAM_SUBPACKAGE, None, 0, 0, seq_id=self.seq_id)
+		raw = data.Transport(data.TransportDataType.STREAM_SUBPACKAGE, None, "", "", seq_id=self.seq_id)
 		raw.total_cnt = 0
 		raw.cur_idx = 0
 		try:
@@ -92,17 +96,17 @@ class Connection:
 
 class Client(tunnel.HttpUpgradedWebSocketClient):
 	def __init__(self, config: Configuration):
-		super().__init__(config.server)
 		self.config = config
 		self.forward_session: aiohttp.ClientSession = None
 
 		self.tcpConnections: typing.Dict[str, Connection] = {}
+		super().__init__(f"{config.server}?uid={config.uid}")
 
 	def GetLogger(self) -> logging.Logger:
 		return log
 	
 	def GetName(self) -> str:
-		return "Client"
+		return self.config.uid
 	
 	async def OnConnected(self):
 		self.forward_session = aiohttp.ClientSession()
@@ -118,10 +122,26 @@ class Client(tunnel.HttpUpgradedWebSocketClient):
 	async def Session(self, raw: data.Transport):
 		raise RuntimeError("Client doesn't support session.")
 	
+	async def SessionControl(self, raw: data.Control, uid: str):
+		raise RuntimeError("Client doesn't support session control.")
+	
 	async def Stream(self, seq_id: str):
 		raise RuntimeError("Client doesn't support stream.")
 	
+	async def OnRecvCtrlPackage(self, raw: data.Transport) -> bool:
+		ctrl = data.Control.FromProtobuf(raw.data)
+		if ctrl.data_type == data.ControlDataType.EXIT:
+			log.info(f"{self.GetName()}] Receive exit signal. Exit the program.")
+			return False
+		elif ctrl.data_type == data.ControlDataType.PRINT:
+			printStruct = data.PrintControlMsg.From(ctrl.msg)
+			log.info(f"CTRL {printStruct.fromWho}] {printStruct.message}")
+		return True
+	
 	async def OnRecvPackage(self, raw: data.Transport) -> None:
+		"""
+		返回False退出
+		"""
 		if raw.data_type == data.TransportDataType.REQUEST:
 			await self.processRequestPackage(raw)
 		elif raw.data_type == data.TransportDataType.TCP_CONNECT:
@@ -135,6 +155,7 @@ class Client(tunnel.HttpUpgradedWebSocketClient):
 		"""
 		raw.cur_idx = 0
 		raw.total_cnt = 0
+		raw.SwapSenderReciver()
 		# send data.Response for the first time and send data.Subpackage for the remain sequences, set total_cnt = -1 to end
 		# 对于 SSE 流，持续读取并转发数据
 		try:
@@ -192,6 +213,7 @@ class Client(tunnel.HttpUpgradedWebSocketClient):
 			respData
 		).ToProtobuf()
 		raw.data = raw.data if self.config.cipher is None else self.config.cipher.Encrypt(raw.data)
+		raw.SwapSenderReciver()
 		await self.QueueSend(raw)
 		await resp.release()
 		
@@ -216,6 +238,7 @@ class Client(tunnel.HttpUpgradedWebSocketClient):
 			rawData
 		).ToProtobuf()
 		raw.data = raw.data if self.config.cipher is None else self.config.cipher.Encrypt(raw.data)
+		raw.SwapSenderReciver()
 		await self.QueueSend(raw)
 		await resp.release()
 
@@ -244,6 +267,7 @@ class Client(tunnel.HttpUpgradedWebSocketClient):
 				f'=== Proxy server cannot request: {e}'.encode('utf8'),
 			).ToProtobuf()
 			raw.data = raw.data if self.config.cipher is None else self.config.cipher.Encrypt(raw.data)
+			raw.SwapSenderReciver()
 			return await self.QueueSend(raw)
 
 		if 'text/event-stream' in resp.headers['Content-Type']:
@@ -255,12 +279,14 @@ class Client(tunnel.HttpUpgradedWebSocketClient):
 			await self.processRegularRequestPackage(raw, req, resp)
 
 	async def processTCPConnectPackage(self, raw: data.Transport):
+		raise RuntimeError("Not ready to use")
+	
 		if raw.total_cnt != -1: # 开启连接
 			package = data.TCPConnect.FromProtobuf(raw.data)
 			print(f"Connect {package.host}:{package.port}")
 
 			# 连接到目标主机
-			resp = data.Transport(data.TransportDataType.RESPONSE, None, 0, 0, raw.seq_id)
+			resp = data.Transport(data.TransportDataType.RESPONSE, None, "", "", raw.seq_id)
 			try:
 				remote_reader, remote_writer = await asyncio.open_connection(package.host, package.port)
 				self.tcpConnections[raw.seq_id] = Connection(remote_reader, remote_writer, display=f"{package.host}:{package.host}")

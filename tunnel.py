@@ -20,11 +20,11 @@ class Callback(abc.ABC):
 	def GetLogger(self) -> logging.Logger:
 		raise NotImplementedError()
 	
-	async def OnPreConnected(self) -> bool:
+	async def OnPreConnected(self) -> str:
 		"""
-		连接前可以在此函数判断是否需要取消连接，返回False取消连接。
+		连接前可以在此函数判断是否需要取消连接，返回非空字符串取消连接。
 		"""
-		return True
+		return ''
 
 	async def OnConnected(self):
 		self.GetLogger().info(f"{self.GetName()}] Connected.")
@@ -72,6 +72,9 @@ class TunnelClient(Callback):
 		self.sessionMap: typing.Dict[str, data.Transport] = {}
 		self.sessionCondition = asyncio.Condition()
 
+		self.controlSessionMap: typing.Dict[str, data.Transport] = {}
+		self.controlSessionCondition = asyncio.Condition()
+
 		# 最小堆，根据cur_idx排序
 		self.streamHeap: typing.Dict[str, typing.List[data.Transport]] = {}
 		self.streamCondition = asyncio.Condition()
@@ -110,8 +113,11 @@ class TunnelClient(Callback):
 	
 	async def OnRecvCtrlPackage(self, raw: data.Transport) -> bool:
 		"""
-		返回False退出MainLoop。
+		返回False退出MainLoop。Ctrl包是没有加密的。默认将包推到SessionControl()队列。
 		"""
+		async with self.controlSessionCondition:
+			self.controlSessionMap[raw.seq_id] = raw
+			self.controlSessionCondition.notify_all()
 		return True
 
 	# ==================== 以下函数无需再实现 ==============================
@@ -123,7 +129,7 @@ class TunnelClient(Callback):
 		if self.isConnected:
 			try:
 				await self.DirectSend(raw)
-			except aiohttp.ClientConnectionResetError:
+			except aiohttp.ClientConnectionResetError as e:
 				# send failed, caching data
 				self.GetLogger().error(f"{self.GetName()}] Disconnected while sending package. Cacheing package: {raw.seq_id}")
 				await self.cacheQueue.put(raw)
@@ -148,12 +154,35 @@ class TunnelClient(Callback):
 			del self.sessionMap[raw.seq_id]
 			return resp
 
+	async def SessionControl(self, raw: data.Control, uid: str):
+		tp = data.Transport(data.TransportDataType.CONTROL, raw.ToProtobuf(), from_uid=uid, to_uid='')
+		await self.DirectSend(tp)
+
+		if raw.data_type in [data.ControlDataType.EXIT, data.ControlDataType.PRINT]:
+			return # 没有回复的类型，应在OnRecvCtrlPackage()过滤
+
+		async with self.controlSessionCondition:
+			await self.controlSessionCondition.wait_for(lambda: tp.seq_id in self.controlSessionMap)
+			resp = self.controlSessionMap[tp.seq_id]
+			del self.controlSessionMap[tp.seq_id]
+			return resp
+
 	async def Stream(self, seq_id: str):
 		# print(f"Listening stream on {seq_id}...")
 		expectIdx = 1
+		waitForSequencePkg = 0
+		maxWaitSequences = 5
 		while True:
 			async with self.streamCondition:
-				await self.streamCondition.wait_for(lambda: seq_id in self.streamHeap and len(self.streamHeap[seq_id]) > 0 and self.streamHeap[seq_id][0].cur_idx == expectIdx)
+				await self.streamCondition.wait_for(lambda: seq_id in self.streamHeap and len(self.streamHeap[seq_id]) > 0)
+				if self.streamHeap[seq_id][0].cur_idx != expectIdx:
+					if waitForSequencePkg == maxWaitSequences:
+						self.GetLogger().error(f"Stream {seq_id} recv {maxWaitSequences}+ packages but not in sequences, maybe lost package. expect: {expectIdx}, heap: {[x.cur_idx for x in self.streamHeap[seq_id]]}")
+						# pop one anyway
+					else:
+						waitForSequencePkg = waitForSequencePkg + 1
+						continue
+				waitForSequencePkg = 1
 				item = heapq.heappop(self.streamHeap[seq_id])
 				expectIdx = expectIdx + 1
 				# print(f"SSE pop stream {seq_id} - {item.cur_idx}")
@@ -188,7 +217,7 @@ class TunnelClient(Callback):
 	
 	async def processPackage(self, raw: data.Transport) -> bool:
 		"""
-		处理收到的一切包。在此分流到OnRecvStreamPackage()和OnRecvPackage()。
+		处理收到的一切包。在此分流到OnRecvStreamPackage()、OnRecvCtrlPackage()和OnRecvPackage()。
 		返回False退出MainLoop。
 		"""
 		if raw.data_type == data.TransportDataType.STREAM_SUBPACKAGE:
@@ -206,20 +235,6 @@ class TunnelClient(Callback):
 		# 	await self.chunks[raw.seq_id].Put(raw)
 
 class TunnelServer(Callback):
-	@abc.abstractmethod
-	async def Prepare(self, request: web.BaseRequest) -> None:
-		"""
-		为request准备回应
-		"""
-		raise NotImplementedError()
-	
-	@abc.abstractmethod
-	def GetHandler(self) -> typing.Any:
-		"""
-		获取句柄
-		"""
-		raise NotImplementedError()
-	
 	@abc.abstractmethod
 	async def ProcessPackage(self, raw: data.Transport) -> None:
 		"""
@@ -249,7 +264,7 @@ class HttpUpgradedWebSocketClient(TunnelClient):
 		while curTries < self.maxRetries:
 			async with aiohttp.ClientSession() as session:
 				async with session.ws_connect(self.url, headers=HttpUpgradedWebSocketHeaders, max_msg_size=WebSocketMaxMessageSize) as ws:
-					if await self.OnPreConnected() == False:
+					if await self.OnPreConnected() != '':
 						break
 					self.isConnected = True
 					self.handler = ws
@@ -262,34 +277,31 @@ class HttpUpgradedWebSocketClient(TunnelClient):
 							self.OnError(self.handler.exception())
 						elif msg.type == aiohttp.WSMsgType.TEXT or msg.type == aiohttp.WSMsgType.BINARY:
 							parsed = data.Transport.FromProtobuf(msg.data)
-							if parsed.data_type == data.TransportDataType.CONTROL:
-								if await self.processControlPackage(parsed) == False:
-									exitSignal = True
-									break
-							else:
-								await self.processPackage(parsed)
+							if await self.processPackage(parsed) == False:
+								exitSignal = True
+								break
 			self.isConnected = False
 			if exitSignal == False:
 				self.GetLogger().info(f"{self.GetName()}] Reconnecting({curTries}/{self.maxRetries})...")
 				curTries += 1
 			await self.OnDisconnected()
+			if exitSignal:
+				break
 		bakHandler = self.handler
 		self.handler = None
 		return bakHandler
-	
+
 class HttpUpgradedWebSocketServer(TunnelServer):
 	"""
-	在服务器端使用的WebSocket隧道，因为服务器无需重连机制，也无需重发包
+	在服务器端使用的WebSocket隧道，服务器无需重连机制，支持重发包
 	"""
-	def __init__(self, **kwargs):
+	def __init__(self, cacheSize: int = 100, timeout: int = 10, **kwargs):
+		self.ws: web.WebSocketResponse = None
+		self.cacheQueue: utils.BoundedQueue[data.Transport] = utils.BoundedQueue(cacheSize)
+		self.timeout = timeout
+		self.useCache = (cacheSize != 0)
+		self.GetLogger().info(f"{self.GetName()}] Use cache queue.")
 		super().__init__(**kwargs)
-		self.ws = web.WebSocketResponse(max_msg_size=WebSocketMaxMessageSize)
-
-	async def Prepare(self, request: web.BaseRequest):
-		await self.ws.prepare(request)
-
-	def GetHandler(self):
-		return self.ws
 
 	async def MainLoop(self):
 		async for msg in self.ws:
@@ -301,20 +313,54 @@ class HttpUpgradedWebSocketServer(TunnelServer):
 
 	async def DirectSend(self, raw: data.Transport):
 		return await self.ws.send_bytes(raw.ToProtobuf())
+	
+	async def resend(self):
+		if not self.useCache: return
+		if self.cacheQueue.IsEmpty(): return
 
-def HttpUpgradedWebSocketServerHandler(cls: typing.Type[HttpUpgradedWebSocketServer], **kwargs):
-	async def mainloop(request: web.BaseRequest):
-		instance = cls(**kwargs)
-		if await instance.OnPreConnected() == False:
-			return None
-		await instance.Prepare(request)
-		instance.isConnected = True
-		await instance.OnConnected()
+		items = await self.cacheQueue.PopAllElements()
+		self.GetLogger().info(f"{self.GetName()}] Resend {len(items)} package.")
+		nowtime = time_utils.GetTimestamp()
+		for item in items:
+			if time_utils.WithInDuration(item.timestamp, nowtime, self.timeout):
+				await self.DirectSend(item)
+				self.GetLogger().debug(f"{self.GetName()}] Sent {item.seq_id}")
+			else:
+				self.GetLogger().warning(f"{self.GetName()}] Drop resend package {item.seq_id} {data.TransportDataType.ToString(item.data_type)} due to outdated.")
+	
+	async def QueueSend(self, raw: data.Transport):
+		if not self.useCache:
+			return await self.DirectSend(raw)
+		
+		if self.IsConnected():
+			try:
+				await self.DirectSend(raw)
+			except Exception as e:
+				self.GetLogger().error(f"{self.GetName()}] Cannot send {raw.seq_id}, err: {e}. Put it in cache.")
+				raw.RenewTimestamp() # use server's timestamp
+				await self.cacheQueue.Add(raw)
+		else:
+			self.GetLogger().debug(f"{self.GetName()} is not connected. Queue {raw.seq_id} to send.")
+			raw.RenewTimestamp()
+			await self.cacheQueue.Add(raw)
+
+	async def MainLoopWithRequest(self, request: web.BaseRequest):
+		preconnected = await self.OnPreConnected()
+		preconnected = preconnected.strip()
+		if preconnected != '':
+			return utils.ReponseText(preconnected, 403)
+		
+		self.ws = web.WebSocketResponse(max_msg_size=WebSocketMaxMessageSize)
+		await self.ws.prepare(request)
+		self.isConnected = True
+		await self.OnConnected()
+		await self.resend()
 		try:
-			await instance.MainLoop()
+			await self.MainLoop()
 		except Exception as ex:
-			instance.OnError(ex)
-		instance.isConnected = False
-		await instance.OnDisconnected()
-		return instance.GetHandler()
-	return mainloop
+			self.OnError(ex)
+		self.isConnected = False
+		await self.OnDisconnected()
+		bakws = self.ws
+		self.ws = None
+		return bakws

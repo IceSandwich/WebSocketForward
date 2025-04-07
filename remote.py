@@ -8,8 +8,9 @@ import argparse as argp
 import tunnel
 import encrypt
 from PIL import Image
-import io
+import re
 import mimetypes
+import json
 mimetypes.add_type("text/plain; charset=utf-8", ".woff2")
 
 log = logging.getLogger(__name__)
@@ -18,9 +19,6 @@ utils.SetupLogging(log, "remote")
 class Configuration:
 	def __init__(self, args):
 		self.server: str = args.server
-		self.port: int = args.port
-		self.prefix: str = args.prefix
-		self.img_quality:int = args.prefer_img_quality
 		if args.cipher != "":
 			self.cipher = encrypt.NewCipher(args.cipher, args.key)
 		else:
@@ -28,63 +26,46 @@ class Configuration:
 		if self.cipher is not None:
 			log.info(f"Using cipher: {self.cipher.GetName()}")
 
+		self.prefix: str = args.prefix
+		self.port: int = args.port
+
+		self.uid: str = args.uid
+		self.target_uid: str = args.target_uid
+
+		self.img_quality:int = args.prefer_img_quality
+
 	@classmethod
 	def SetupParser(cls, parser: argp.ArgumentParser):
-		parser.add_argument("--server", type=str, default="http://127.0.0.1:8030/remote_ws", help="The websocket server to connect to.")
+		parser.add_argument("--server", type=str, default="http://127.0.0.1:8030/wsf/ws", help="The websocket server to connect to.")
+		parser.add_argument("--cipher", type=str, default="xor", help=f"The cipher to use. Available: [{', '.join(encrypt.GetAvailableCipherMethods())}]")
+		parser.add_argument("--key", type=str, default="WebSocket@Forward通讯密钥，必须跟另一端保持一致。", help="The key to use for the cipher. Must be the same with client.")
+
 		parser.add_argument("--prefix", type=str, default="http://127.0.0.1:7860", help="The prefix of your requests.")
 		parser.add_argument("--port", type=int, default=8130, help="The port to listen on.")
-		parser.add_argument("--cipher", type=str, default="xor", help=f"The cipher to use. Available: [{', '.join(encrypt.GetAvailableCipherMethods())}]")
-		parser.add_argument("--key", type=str, default="websocket forward", help="The key to use for the cipher. Must be the same with client.")
+
+		parser.add_argument("--uid", type=str, default="Remote")
+		parser.add_argument("--target_uid", type=str, default="Client")
+
 		parser.add_argument("--prefer_img_quality", type=int, default=75, help="Compress the image to transfer fasterly.")
 		return parser
 
-class TypeHintClient(tunnel.HttpUpgradedWebSocketClient):
-	"""
-	该类仅用于类型提示，不要实例它
-	"""
-	def __init__(self):
-		raise SyntaxError("Do not instantiate this class.")
-	
-	async def Session(self, request: data.Request) -> typing.Tuple[data.Response, str]:
-		"""
-		接受无加密的request，返回无加密的response和seq_id。
-		"""
-		raise NotImplementedError()
-
-	def Stream(self, seq_id: str) -> typing.AsyncGenerator[bytes, None]:
-		"""
-		返回无加密的SSE数据
-		"""
-		raise NotImplementedError()
-
-client: typing.Optional[TypeHintClient] = None
-
 class Client(tunnel.HttpUpgradedWebSocketClient):
 	def __init__(self, config: Configuration):
-		super().__init__(config.server)
 		self.conf = config
 		
 		# debug only. map from seq_id to url. 布尔值表示是否需要打印sample数据，我们只在第一次打印，后续不打印。
 		self.tracksse: typing.Dict[str, typing.Tuple[str, bool]] = {}
 
+		super().__init__(f"{config.server}?uid={config.uid}")
+
 	def GetName(self) -> str:
-		return "Remote"
+		return self.conf.uid
 	
 	def GetLogger(self) -> logging.Logger:
 		return log
-
-	async def OnConnected(self):
-		global client
-		client = self
-		return await super().OnConnected()
-	
-	async def OnDisconnected(self):
-		global client
-		client = None
-		return await super().OnDisconnected()
 	
 	async def Session(self, request: data.Request):
-		raw = data.Transport(data.TransportDataType.REQUEST, request.ToProtobuf(), 0, 0)
+		raw = data.Transport(data.TransportDataType.REQUEST, request.ToProtobuf(), self.conf.uid, self.conf.target_uid)
 		log.debug(f"Request {raw.seq_id} - {request.method} {request.url}")
 		raw.data = raw.data if self.conf.cipher is None else self.conf.cipher.Encrypt(raw.data)
 		rawResp = await super().Session(raw)
@@ -97,6 +78,24 @@ class Client(tunnel.HttpUpgradedWebSocketClient):
 		else:
 			log.debug(f"Response {raw.seq_id} - {request.method} {resp.url} {resp.status_code}")
 		return resp, raw.seq_id
+	
+	async def ControlQuery(self):
+		"""
+		Query控制包以Control的形式返回。
+		"""
+		raw = data.Control(data.ControlDataType.QUERY_CLIENTS, '')
+		rawResp: data.Transport = await super().SessionControl(raw, self.conf.uid)
+		assert(rawResp.data_type == data.TransportDataType.CONTROL)
+		resp = data.Control.FromProtobuf(rawResp.data)
+		assert(resp.data_type == data.ControlDataType.QUERY_CLIENTS)
+		return json.loads(resp.msg)
+	
+	async def ControlExit(self):
+		"""
+		Exit控制包是没有返回的。
+		"""
+		raw = data.Control(data.ControlDataType.EXIT, self.conf.target_uid)
+		await super().SessionControl(raw, self.conf.uid)
 
 	async def Stream(self, seq_id: str):
 		async for raw in super().Stream(seq_id):
@@ -120,6 +119,14 @@ class Client(tunnel.HttpUpgradedWebSocketClient):
 			self.tracksse[raw.seq_id] = [resp.url, True]
 		
 		return await super().OnRecvPackage(raw)
+
+	async def OnRecvCtrlPackage(self, raw: data.Transport) -> bool:
+		ctrl = data.Control.FromProtobuf(raw.data)
+		if ctrl.data_type == data.ControlDataType.PRINT:
+			printMsg = data.PrintControlMsg.From(ctrl.msg)
+			log.info(f"CTRL {printMsg.fromWho}] {printMsg.message}")
+			return True
+		return await super().OnRecvCtrlPackage(raw)
 
 class StableDiffusionCachingClient(Client):
 	def __init__(self, config: Configuration):
@@ -162,6 +169,10 @@ class StableDiffusionCachingClient(Client):
 			relativefn = parsed_url.path[len('/file='):]
 			if relativefn.startswith(self.sdprefix):
 				relativefn = relativefn[len(self.sdprefix):].strip('/')
+			pattern = r'^C:/Users/[a-zA-Z0-9._-]+/AppData/Local/Temp/'
+			if re.match(pattern, relativefn):
+				# 使用re.sub()去掉匹配的前缀部分
+				relativefn = re.sub(pattern, '', relativefn)
 		else:
 			return await super().Session(request)
 		targetfn = os.path.join(self.root_dir, relativefn)
@@ -193,23 +204,20 @@ class StableDiffusionCachingClient(Client):
 			return resp, seq_id
 
 class HttpServer:
-	def __init__(self, conf: Configuration) -> None:
+	def __init__(self, conf: Configuration, client: Client) -> None:
 		self.config = conf
+		self.client = client
 
 	async def processSSE(self, resp: data.Response, seq_id: str):
 		yield resp.body
-		async for package in client.Stream(seq_id):
+		async for package in self.client.Stream(seq_id):
 			yield package
 
 	async def MainLoopOnRequest(self, request: web.BaseRequest):
-		global client
-		if client is None or not client.IsConnected():
-			return web.Response(status=503, text="No client connected")
-			
 		# 提取请求的相关信息
 		body = await request.read() if request.can_read_body else None
 		req = data.Request(self.config.prefix + str(request.url.path_qs), request.method, dict(request.headers), body=body)
-		resp, seq_id = await client.Session(req)
+		resp, seq_id = await self.client.Session(req)
 
 		if resp.IsSSEResponse():
 			return web.Response(
@@ -224,8 +232,25 @@ class HttpServer:
 				body=resp.body
 			)
 		
+	async def handlerControlPage(self, request: web.BaseRequest):
+		return web.FileResponse(os.path.join(os.getcwd(), 'assets', 'control.html'))
+	
+	async def handlerControlQuery(self, request: web.BaseRequest):
+		jsonObj = await self.client.ControlQuery()
+		output = {
+			"connected": self.config.target_uid in jsonObj and jsonObj[self.config.target_uid]
+		}
+		return web.json_response(output)
+	
+	async def handlerControlExit(self, request: web.BaseRequest):
+		await self.client.ControlExit()
+		return web.Response(status=200)
+		
 	async def MainLoop(self):
 		app = web.Application(client_max_size=100 * 1024 * 1024)
+		app.router.add_get("/wsf-control", self.handlerControlPage)
+		app.router.add_get("/wsf-control/query", self.handlerControlQuery)
+		app.router.add_post("/wsf-control/exit", self.handlerControlExit)
 		app.router.add_route('*', '/{tail:.*}', self.MainLoopOnRequest)  # HTTP服务
 		
 		runner = web.AppRunner(app)
@@ -237,11 +262,18 @@ class HttpServer:
 		await asyncio.Future()
 
 async def main(config: Configuration):
-	await asyncio.gather(StableDiffusionCachingClient(config).MainLoop(), HttpServer(config).MainLoop())
+	client = StableDiffusionCachingClient(config)
+	httpserver = HttpServer(config, client)
+	await asyncio.gather(client.MainLoop(), httpserver.MainLoop())
 
 if __name__ == "__main__":
 	argparse = argp.ArgumentParser()
 	argparse = Configuration.SetupParser(argparse)
 	args = argparse.parse_args()
 	conf = Configuration(args)
-	asyncio.run(main(conf))
+
+	loop = asyncio.get_event_loop()
+	try:
+		loop.run_until_complete(main(conf))
+	except KeyboardInterrupt:
+		print(f"==== Mainloop exit due to keyboard interrupt")
