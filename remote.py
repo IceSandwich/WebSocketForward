@@ -1,17 +1,8 @@
-import asyncio, logging, os
+import asyncio, logging, os, typing, re, json, aiohttp
 from urllib.parse import urlparse
-from pathlib import Path
-import data
-import utils, typing
 import aiohttp.web as web
 import argparse as argp
-import tunnel
-import encrypt
-from PIL import Image
-import re
-import mimetypes
-import json
-mimetypes.add_type("text/plain; charset=utf-8", ".woff2")
+import data, tunnel, utils, encrypt
 
 log = logging.getLogger(__name__)
 utils.SetupLogging(log, "remote")
@@ -65,8 +56,11 @@ class Client(tunnel.HttpUpgradedWebSocketClient):
 		return log
 	
 	async def Session(self, request: data.Request):
+		"""
+		发送Request包，返回Response包，内部会处理加解密的工作。
+		"""
 		raw = data.Transport(data.TransportDataType.REQUEST, request.ToProtobuf(), self.conf.uid, self.conf.target_uid)
-		log.debug(f"Request {raw.seq_id} - {request.method} {request.url}")
+		log.debug(f"Request {raw.seq_id} - {request.method} {request.url} " + ("" if request.body is None else f"{len(request.body)} bytes"))
 		raw.data = raw.data if self.conf.cipher is None else self.conf.cipher.Encrypt(raw.data)
 		rawResp = await super().Session(raw)
 		assert(rawResp.data_type == data.TransportDataType.RESPONSE)
@@ -76,7 +70,7 @@ class Client(tunnel.HttpUpgradedWebSocketClient):
 			log.debug(f"SSE Response {raw.seq_id} - {request.method} {resp.url} {resp.status_code} {len(resp.body)} bytes <<< {repr(resp.body[:50])} ...>>>")
 			self.tracksse[raw.seq_id] = [request.url, True]
 		else:
-			log.debug(f"Response {raw.seq_id} - {request.method} {resp.url} {resp.status_code}")
+			log.debug(f"Response {raw.seq_id} - {request.method} {resp.url} {resp.status_code} {len(resp.body)} bytes")
 		return resp, raw.seq_id
 	
 	async def ControlQuery(self):
@@ -102,7 +96,13 @@ class Client(tunnel.HttpUpgradedWebSocketClient):
 			rawData = raw.data if self.conf.cipher is None else self.conf.cipher.Decrypt(raw.data)
 			yield rawData
 
-	async def OnRecvPackage(self, raw: data.Transport) -> None:
+	async def SendStreamEndSignal(self, seq_id: str):
+		pkg = data.Transport(data.TransportDataType.STREAM_SUBPACKAGE, b'', self.conf.uid, self.conf.target_uid, seq_id=seq_id)
+		pkg.cur_idx = 0 # Fixme: ?
+		pkg.total_cnt = -1
+		await self.QueueSend(pkg)
+
+	async def OnRecvOtherPackage(self, raw: data.Transport) -> None:
 		assert(raw.data_type == data.TransportDataType.RESPONSE)
 		rawData = raw.data if self.conf.cipher is None else self.conf.cipher.Decrypt(raw.data)
 
@@ -118,10 +118,11 @@ class Client(tunnel.HttpUpgradedWebSocketClient):
 			log.debug(f"SSE >>>Begin {raw.seq_id} - {resp.url} {len(resp.body)} bytes")
 			self.tracksse[raw.seq_id] = [resp.url, True]
 		
-		return await super().OnRecvPackage(raw)
+		return await super().OnRecvOtherPackage(raw)
 
 	async def OnRecvCtrlPackage(self, raw: data.Transport) -> bool:
 		ctrl = data.Control.FromProtobuf(raw.data)
+		log.debug(f'{self.GetName()}] Receive control package {raw.seq_id} {data.ControlDataType.ToString(ctrl.data_type)} - {raw.from_uid} => {raw.to_uid}')
 		if ctrl.data_type == data.ControlDataType.PRINT:
 			printMsg = data.PrintControlMsg.From(ctrl.msg)
 			log.info(f"CTRL {printMsg.fromWho}] {printMsg.message}")
@@ -135,7 +136,6 @@ class StableDiffusionCachingClient(Client):
 		self.root_dir = 'cache_sdwebui'
 		self.assets_dir = ['assets', 'webui-assets']
 		self.sdprefix = 'D:/GITHUB/stable-diffusion-webui-forge/'
-		
 		
 		os.makedirs(self.root_dir,exist_ok=True)
 		for assets_fd in self.assets_dir:
@@ -154,14 +154,14 @@ class StableDiffusionCachingClient(Client):
 		with open(filename, 'rb') as f:
 			body = f.read()
 		resp = data.Response(url, 200, {
-			'Content-Type': mimetypes.guess_type(filename)[0] or "application/octet-stream"
+			'Content-Type': utils.GuessMimetype(filename),
+			'Content-Length': str(len(body))
 		}, body)
 		return resp, utils.NewSeqId()
 	
 	async def Session(self, request: data.Request):
 		parsed_url = urlparse(request.url)
 		components = parsed_url.path.strip('/').split('/')
-		if len(components) == 0: return await super().Session(request)
 
 		if components[0] in self.assets_dir:
 			relativefn = parsed_url.path[1:]
@@ -173,6 +173,8 @@ class StableDiffusionCachingClient(Client):
 			if re.match(pattern, relativefn):
 				# 使用re.sub()去掉匹配的前缀部分
 				relativefn = re.sub(pattern, '', relativefn)
+		elif parsed_url.path == '/':
+			relativefn = 'index.html' # cache index.html
 		else:
 			return await super().Session(request)
 		targetfn = os.path.join(self.root_dir, relativefn)
@@ -213,6 +215,18 @@ class HttpServer:
 		async for package in self.client.Stream(seq_id):
 			yield package
 
+	async def processSSE2(self, writer: web.StreamResponse, resp: data.Response, seq_id: str):
+		print("=== OpenSSE " + seq_id)
+		await writer.write(resp.body)
+		try:
+			async for package in self.client.Stream(seq_id):
+				await writer.write(package)
+		except aiohttp.ClientConnectionResetError:
+			print("===="  + seq_id + "关闭了")
+			await self.client.SendStreamEndSignal(seq_id)
+		print("==== CloseSSE " + seq_id)
+		return writer
+
 	async def MainLoopOnRequest(self, request: web.BaseRequest):
 		# 提取请求的相关信息
 		body = await request.read() if request.can_read_body else None
@@ -220,6 +234,12 @@ class HttpServer:
 		resp, seq_id = await self.client.Session(req)
 
 		if resp.IsSSEResponse():
+			# response = web.StreamResponse(
+			# 	status=resp.status_code,
+			# 	headers=resp.headers,
+			# )
+			# await response.prepare(request)
+			# return await self.processSSE2(response, resp, seq_id)
 			return web.Response(
 				status=resp.status_code,
 				headers=resp.headers,

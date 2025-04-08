@@ -24,7 +24,7 @@ python -m pip install -r requirements.txt
 
 # 检查参数
 if [ $# -ne 1 ]; then
-    echo "用法: $0 {install|uninstall|run}"
+    echo "用法: $0 {install|uninstall|run|stop}"
     exit 1
 fi
 
@@ -60,13 +60,16 @@ case "$COMMAND" in
         fi
         ;;
 	run)
-		nohup python server.py --server 127.0.0.1:12228 --cache &
+		nohup python server.py --server 127.0.0.1:12228 &
 		echo $! > server.pid
-		echo 'server.py 已在后台运行。使用 `kill $(cat server.pid)` 停止它。'
+		echo 'server.py 已在后台运行。使用 `setup.sh stop` 停止它。'
         ;;
+	stop)
+		kill $(cat server.pid)
+		;;
     *)
         echo "无效指令: $COMMAND"
-        echo "用法: $0 {install|uninstall|run}"
+        echo "用法: $0 {install|uninstall|run|stop}"
         exit 1
         ;;
 esac

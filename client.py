@@ -1,10 +1,6 @@
-import asyncio, aiohttp, logging
-import data
+import asyncio, aiohttp, logging, typing
 import argparse as argp
-import utils
-import tunnel
-import encrypt
-import typing
+import data, utils, tunnel, encrypt, time_utils
 
 log = logging.getLogger(__name__)
 utils.SetupLogging(log, "client")
@@ -99,6 +95,9 @@ class Client(tunnel.HttpUpgradedWebSocketClient):
 		self.config = config
 		self.forward_session: aiohttp.ClientSession = None
 
+		# key = seq_id, value = [ isRunning, needSendEndSubstreamPackage ]
+		self.sseTrack: typing.Dict[str, typing.Tuple[bool, bool]] = {}
+
 		self.tcpConnections: typing.Dict[str, Connection] = {}
 		super().__init__(f"{config.server}?uid={config.uid}")
 
@@ -117,7 +116,15 @@ class Client(tunnel.HttpUpgradedWebSocketClient):
 		await super().OnDisconnected()
 
 	async def OnRecvStreamPackage(self, raw: data.Transport) -> None:
-		raise RuntimeError('Client should not receive stream package.')
+		if raw.total_cnt != -1:
+			raise RuntimeError(f'Client only receive stream package with -1 total_cnt. but got {raw.total_cnt}')
+	
+		if raw.seq_id not in self.sseTrack:
+			print(f"attempt to close sse {raw.seq_id} but not in list.")
+			return
+		
+		print(f"==== Receive close stream {raw.seq_id}")
+		self.sseTrack[raw.seq_id] = [False, False]
 	
 	async def Session(self, raw: data.Transport):
 		raise RuntimeError("Client doesn't support session.")
@@ -130,6 +137,7 @@ class Client(tunnel.HttpUpgradedWebSocketClient):
 	
 	async def OnRecvCtrlPackage(self, raw: data.Transport) -> bool:
 		ctrl = data.Control.FromProtobuf(raw.data)
+		log.debug(f'{self.GetName()}] Receive control package {raw.seq_id} {data.ControlDataType.ToString(ctrl.data_type)} - {raw.from_uid} => {raw.to_uid}')
 		if ctrl.data_type == data.ControlDataType.EXIT:
 			log.info(f"{self.GetName()}] Receive exit signal. Exit the program.")
 			return False
@@ -138,16 +146,132 @@ class Client(tunnel.HttpUpgradedWebSocketClient):
 			log.info(f"CTRL {printStruct.fromWho}] {printStruct.message}")
 		return True
 	
-	async def OnRecvPackage(self, raw: data.Transport) -> None:
-		"""
-		返回False退出
-		"""
+	async def OnRecvOtherPackage(self, raw: data.Transport):
 		if raw.data_type == data.TransportDataType.REQUEST:
 			await self.processRequestPackage(raw)
 		elif raw.data_type == data.TransportDataType.TCP_CONNECT:
 			await self.processTCPConnectPackage(raw)
 		else:
 			raise RuntimeError(f"Unsupported package data type: {data.TransportDataType.ToString(raw.data_type)}")
+		
+	async def processRequestPackage(self, raw: data.Transport):
+		rawData = raw.data if self.config.cipher is None else self.config.cipher.Decrypt(raw.data)
+
+		try:
+			req = data.Request.FromProtobuf(rawData)
+		except Exception as e:
+			log.error(f"Failed to parse {raw.seq_id} request, maybe the cipher problem: {e}")
+			log.error(f"{raw.seq_id}] Source raw data: {raw.data[:100]}")
+			log.error(f"{raw.seq_id}] Target raw data: {rawData[:100]}")
+			raise e # rethrow the exception
+		
+		log.debug(f"Request {raw.seq_id} - {req.method} {req.url} {len(req.body)} bytes")
+
+		try:
+			resp = await self.forward_session.request(req.method, req.url, headers=req.headers, data=req.body)
+		except aiohttp.ClientConnectorError as e:
+			log.error(f'Failed to forward request {req.url}: {e}')
+			raw.data_type = data.TransportDataType.RESPONSE
+			raw.data = data.Response(req.url, 502,
+				{
+					'Content-Type': 'text/plain; charset=utf-8',
+				},
+				f'=== Proxy server cannot request: {e}'.encode('utf8'),
+			).ToProtobuf()
+			raw.data = raw.data if self.config.cipher is None else self.config.cipher.Encrypt(raw.data)
+			raw.SwapSenderReciver()
+			return await self.QueueSendSmartSegments(raw)
+
+		if 'text/event-stream' in resp.headers['Content-Type']:
+			log.debug(f"SSE Response {raw.seq_id} - {req.method} {resp.url} {resp.status}")
+			asyncio.ensure_future(self.processSSE(raw, req, resp))
+			# asyncio.create_task(self.processSSE(raw, req, resp))
+		elif utils.HasWSFCompress(req):
+			await self.processCompressImageRequestPackage(raw, req, resp)
+		else:
+			await self.processRegularRequestPackage(raw, req, resp)
+
+	# fixme: no correct
+	async def processSSE2(self, raw: data.Transport, req: data.Request, resp: aiohttp.ClientResponse):
+		"""
+		由processSSE()释放resp。raw是模板，函数里会填充数据再发送。
+		首先发送RESPONSE，后续都发送STREAM_SUBPACKAGE，使用total_cnt=-1表示结束。
+		"""
+		raw.cur_idx = 0
+		raw.total_cnt = 0
+		raw.SwapSenderReciver()
+		self.sseTrack[raw.seq_id] = [True, True]
+		print(f">>> Open sse {raw.seq_id}")
+		# send data.Response for the first time and send data.Subpackage for the remain sequences, set total_cnt = -1 to end
+		# 对于 SSE 流，持续读取并转发数据
+
+		receiveQueue: asyncio.Queue[bytes] = asyncio.Queue()
+		async def sseInternalReader():
+			try:
+				async for chunk in resp.content.iter_any():
+					if not chunk: continue
+					await receiveQueue.put(chunk)
+
+				# 正常结束，需要发送结束包
+				print("exit normally " + raw.seq_id)
+				self.sseTrack[raw.seq_id] = [False, True]
+			except asyncio.CancelledError:
+				print("任务被取消")
+				pass
+		task = asyncio.create_task(sseInternalReader())
+
+		while True:
+			try:
+				chunk = await asyncio.wait_for(receiveQueue.get(), timeout=time_utils.Seconds(1))
+				# 将每一行事件发送给客户端
+				if raw.cur_idx == 0:
+					raw.data_type = data.TransportDataType.RESPONSE
+					raw.data = data.Response(
+						req.url,
+						resp.status,
+						dict(resp.headers),
+						chunk
+					).ToProtobuf()
+					log.debug(f"SSE >>>Begin {raw.seq_id} - {resp.url} {len(raw.data)} bytes")
+					rawData = raw.data if self.config.cipher is None else self.config.cipher.Encrypt(raw.data)
+
+					# log SSE Package at the first time
+					log.debug(f"SSE Package <<< {repr(raw.data[:50])} ...>>> to <<< {repr(rawData[:50])} ...>>>")
+					raw.data = rawData
+					# print(f"Send first sse {raw.seq_id} - {raw.cur_idx}-ith")
+
+					await self.QueueSend(raw)
+				else:
+					raw.data_type = data.TransportDataType.STREAM_SUBPACKAGE
+					log.debug(f"SSE Stream {raw.seq_id} - {len(chunk)} bytes")
+					# print(f"Send SSE {raw.seq_id} - {raw.cur_idx}-ith")
+					raw.data = chunk if self.config.cipher is None else self.config.cipher.Encrypt(chunk)
+					await self.QueueSend(raw)
+				# 第一个response的idx为0，第一个sse_subpackage的idx为1
+				raw.cur_idx = raw.cur_idx + 1
+			except asyncio.TimeoutError as e:
+				if self.sseTrack[raw.seq_id][0] == False:
+					print(f"Close sse {raw.seq_id}")
+					task.cancel()
+					await task
+			except Exception as e:
+				print(f'SSE {raw.seq_id} end iter unexpectally. err: {e}')
+				self.sseTrack[raw.seq_id] = [False, True]
+				
+			if self.sseTrack[raw.seq_id][0] == False:
+				if self.sseTrack[raw.seq_id][1] == True:
+					print(f"Send end to {raw.seq_id}")
+					raw.data_type = data.TransportDataType.STREAM_SUBPACKAGE
+					raw.total_cnt = -1 # -1 表示结束
+					raw.data = b''
+					log.debug(f"SSE <<<End {raw.seq_id} - {resp.url} {len(raw.data)} bytes")
+					await self.QueueSend(raw)
+				del self.sseTrack[raw.seq_id]
+				break
+
+		await resp.release()
+
+		print(f"Close sse {raw.seq_id}")
 
 	async def processSSE(self, raw: data.Transport, req: data.Request, resp: aiohttp.ClientResponse):
 		"""
@@ -197,25 +321,6 @@ class Client(tunnel.HttpUpgradedWebSocketClient):
 			# print(f"Send End SSE {raw.seq_id} - {raw.cur_idx}-ith")
 			await self.QueueSend(raw)
 			await resp.release()
-
-	async def processRegularRequestPackage(self, raw: data.Transport, req: data.Request, resp: aiohttp.ClientResponse):
-		"""
-		resp由本函数释放。
-		"""
-		log.debug(f"Response {raw.seq_id} - {req.method} {resp.url} {resp.status}")
-
-		respData = await resp.content.read()
-		raw.data_type = data.TransportDataType.RESPONSE
-		raw.data = data.Response(
-			req.url,
-			resp.status,
-			dict(resp.headers),
-			respData
-		).ToProtobuf()
-		raw.data = raw.data if self.config.cipher is None else self.config.cipher.Encrypt(raw.data)
-		raw.SwapSenderReciver()
-		await self.QueueSend(raw)
-		await resp.release()
 		
 	async def processCompressImageRequestPackage(self, raw: data.Transport, req: data.Request, resp: aiohttp.ClientResponse):
 		"""
@@ -228,8 +333,6 @@ class Client(tunnel.HttpUpgradedWebSocketClient):
 		compress_ratio = utils.ComputeCompressRatio(len(respData), len(rawData))
 		utils.SetWSFCompress(headers, mimetype, quality=-1)
 
-		log.debug(f"Response(Compress {int(compress_ratio*10000)/100}%) {raw.seq_id} - {req.method} {resp.url} {resp.status}")
-
 		raw.data_type = data.TransportDataType.RESPONSE
 		raw.data = data.Response(
 			req.url,
@@ -238,45 +341,28 @@ class Client(tunnel.HttpUpgradedWebSocketClient):
 			rawData
 		).ToProtobuf()
 		raw.data = raw.data if self.config.cipher is None else self.config.cipher.Encrypt(raw.data)
+		log.debug(f"Response(Compress {int(compress_ratio*10000)/100}%) {raw.seq_id} - {req.method} {resp.url} {resp.status} {len(raw.data)} bytes")
 		raw.SwapSenderReciver()
-		await self.QueueSend(raw)
+		await self.QueueSendSmartSegments(raw)
 		await resp.release()
 
-	async def processRequestPackage(self, raw: data.Transport):
-		rawData = raw.data if self.config.cipher is None else self.config.cipher.Decrypt(raw.data)
-
-		try:
-			req = data.Request.FromProtobuf(rawData)
-		except Exception as e:
-			log.error(f"Failed to parse {raw.seq_id} request, maybe the cipher problem: {e}")
-			log.error(f"{raw.seq_id}] Source raw data: {raw.data[:100]}")
-			log.error(f"{raw.seq_id}] Target raw data: {rawData[:100]}")
-			raise e # rethrow the exception
-		
-		log.debug(f"Request {raw.seq_id} - {req.method} {req.url}")
-
-		try:
-			resp = await self.forward_session.request(req.method, req.url, headers=req.headers, data=req.body)
-		except aiohttp.ClientConnectorError as e:
-			log.error(f'Failed to forward request {req.url}: {e}')
-			raw.data_type = data.TransportDataType.RESPONSE
-			raw.data = data.Response(req.url, 502,
-				{
-					'Content-Type': 'text/plain; charset=utf-8',
-				},
-				f'=== Proxy server cannot request: {e}'.encode('utf8'),
-			).ToProtobuf()
-			raw.data = raw.data if self.config.cipher is None else self.config.cipher.Encrypt(raw.data)
-			raw.SwapSenderReciver()
-			return await self.QueueSend(raw)
-
-		if 'text/event-stream' in resp.headers['Content-Type']:
-			log.debug(f"SSE Response {raw.seq_id} - {req.method} {resp.url} {resp.status}")
-			asyncio.ensure_future(self.processSSE(raw, req, resp))
-		elif utils.HasWSFCompress(req):
-			await self.processCompressImageRequestPackage(raw, req, resp)
-		else:
-			await self.processRegularRequestPackage(raw, req, resp)
+	async def processRegularRequestPackage(self, raw: data.Transport, req: data.Request, resp: aiohttp.ClientResponse):
+		"""
+		resp由本函数释放。
+		"""
+		respData = await resp.content.read()
+		log.debug(f"Response {raw.seq_id} - {req.method} {resp.url} {resp.status} {len(respData)} bytes")
+		raw.data_type = data.TransportDataType.RESPONSE
+		raw.data = data.Response(
+			req.url,
+			resp.status,
+			dict(resp.headers),
+			respData
+		).ToProtobuf()
+		raw.data = raw.data if self.config.cipher is None else self.config.cipher.Encrypt(raw.data)
+		raw.SwapSenderReciver()
+		await self.QueueSendSmartSegments(raw)
+		await resp.release()
 
 	async def processTCPConnectPackage(self, raw: data.Transport):
 		raise RuntimeError("Not ready to use")

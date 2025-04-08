@@ -1,10 +1,16 @@
-import logging, os, typing, collections, asyncio, sys, io
-from datetime import datetime
+import logging, os, collections, asyncio, sys, io, uuid, datetime
 from PIL import Image
-import data
-import uuid
 import aiohttp.web as web
+import data
+
+import typing
 T = typing.TypeVar('T')
+
+import mimetypes
+mimetypes.add_type("text/plain; charset=utf-8", ".woff2")
+
+MIMETYPE_WEBP = 'image/webp'
+CONTENTTYPE_UTF8HTML = 'text/html; charset=utf-8'
 
 # 配置 logging
 # logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -22,12 +28,15 @@ def SetupLogging(log: logging.Logger, id: str, terminalLevel: int = logging.INFO
 		log_dir = "logs"
 		os.makedirs(log_dir, exist_ok=True)
 
-		timestr = datetime.now().strftime("%Y%m%d_%H%M%S")
+		timestr = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
 		log_file = os.path.join(log_dir, f"{id}-{timestr}.log")
 		fhandler = logging.FileHandler(log_file, encoding='utf-8', mode='a')
 		fhandler.setFormatter(formatter)
 		fhandler.setLevel(logging.DEBUG)
 		log.addHandler(fhandler)
+
+def GuessMimetype(filename: str):
+	return mimetypes.guess_type(filename)[0] or "application/octet-stream"
 
 class BoundedQueue(typing.Generic[T]):
 	"""
@@ -60,6 +69,7 @@ class BoundedQueue(typing.Generic[T]):
 
 	def IsEmpty(self):
 		return len(self.queue) == 0
+	
 class Chunk:
 	def __init__(self, total_cnt: int, start_idx: int):
 		self.start_idx = start_idx
@@ -75,10 +85,10 @@ class Chunk:
 
 	async def Put(self, raw: data.Transport):
 		if self.IsFinish():
-			raise Exception(f"already full(total_cnt={self.total_cnt}).")
+			raise Exception(f"Chunk] {raw.seq_id} already full(total_cnt={self.total_cnt}, cur_idx={self.cur_idx}).")
 		
 		async with self.lock:
-			self.data[raw.cur_idx - self.start_idx] = raw.body
+			self.data[raw.cur_idx - self.start_idx] = raw.data
 			if raw.data_type != data.TransportDataType.SUBPACKAGE:
 				self.template = raw
 			
@@ -86,7 +96,7 @@ class Chunk:
 	
 	def Combine(self):
 		raw = b''.join(self.data)
-		self.template.body = raw
+		self.template.data = raw
 		self.template.cur_idx = 0
 		self.template.total_cnt = 1
 		return self.template
@@ -94,8 +104,6 @@ class Chunk:
 def DecodeImageFromBytes(raw: bytes):
 	return Image.open(io.BytesIO(raw))
 
-MIMETYPE_WEBP = 'image/webp'
-CONTENTTYPE_UTF8HTML = 'text/html; charset=utf-8'
 
 def ReponseText(msg: str, status_code: int):
 	return web.Response(

@@ -57,11 +57,12 @@ class TunnelClient(Callback):
 	在客户端使用的隧道，支持重连机制和重发机制，支持分包接收
 	"""
 
-	def __init__(self, maxRetries: int = 3, resendDuration: int = time_utils.Seconds(10)):
+	def __init__(self, maxRetries: int = 3, resendDuration: int = time_utils.Seconds(10), safeSegmentSize: int = 768 * 1024):
 		super().__init__()
 
 		self.maxRetries = maxRetries
 		self.resendDuration = resendDuration
+		self.safeSegmentSize = safeSegmentSize
 
 		# 管理分包传输，key为seq_id
 		self.chunks: typing.Dict[str, utils.Chunk] = {}
@@ -81,10 +82,10 @@ class TunnelClient(Callback):
 
 	# ======================= 以下函数由用户实现 ============================
 	
-	async def OnRecvPackage(self, raw: data.Transport) -> None:
+	async def OnRecvOtherPackage(self, raw: data.Transport) -> None:
 		"""
 		在这里处理除了流包和控制包的数据包，默认将包推到Session()队列。
-		如果你需要重写该函数并且希望Session()起作用，记得调用TunnelClient.OnRecvPackage()。
+		如果你需要重写该函数并且希望Session()起作用，记得调用TunnelClient.OnRecvOtherPackage()。
 		"""
 		async with self.sessionCondition:
 			self.sessionMap[raw.seq_id] = raw
@@ -135,7 +136,7 @@ class TunnelClient(Callback):
 				await self.cacheQueue.put(raw)
 			except Exception as e:
 				# skip package for unknown reason
-				self.GetLogger().error(f"{self.GetName()}] Unknown exception on QueueToSend(): {e}")
+				self.GetLogger().error(f"{self.GetName()}] Unknown exception on QueueSend(): {e}")
 		else:
 			# not connected, cacheing data
 			self.GetLogger().error(f"{self.GetName()}] Not connected client. Cacheing package: {raw.seq_id}")
@@ -215,42 +216,93 @@ class TunnelClient(Callback):
 			else:
 				self.GetLogger().warning(f"{self.GetName()}] Skip resending{item.seq_id} because the package is too old.")
 	
-	async def processPackage(self, raw: data.Transport) -> bool:
+	async def OnProcess(self, raw: data.Transport) -> bool:
 		"""
 		处理收到的一切包。在此分流到OnRecvStreamPackage()、OnRecvCtrlPackage()和OnRecvPackage()。
 		返回False退出MainLoop。
 		"""
-		if raw.data_type == data.TransportDataType.STREAM_SUBPACKAGE:
+		if raw.data_type == data.TransportDataType.STREAM_SUBPACKAGE: # 流包的total_cnt=-1表示结束，为了区分Subpackage，先判断它
 			await self.OnRecvStreamPackage(raw)
 			return True
 		elif raw.data_type == data.TransportDataType.CONTROL:
 			return await self.OnRecvCtrlPackage(raw)
+		elif raw.data_type == data.TransportDataType.SUBPACKAGE or raw.total_cnt == -1:
+			"""
+			分包规则；前n-1个包为subpackage，最后一个包为resp、req。
+			返回None表示Segments还没收全。若收全了返回合并的data.Transport对象。
+			单包或者流包直接返回。
+			"""
+			# seq_id not in chunks and total_cnt = 32     =>     new chunk container
+			# seq_id in chunks and total_cnt = 32         =>     save to existed chunk container
+			# seq_id in chunks and total_cnt = -1         =>     end subpackage
+			# seq_id not in chunks and total_cnt = -1     =>     error, should not happend
+			if raw.seq_id not in self.chunks and raw.total_cnt <= 0:
+				self.GetLogger().error(f"Invalid end subpackage {raw.seq_id} not in chunk but has total_cnt {raw.total_cnt}")
+				return True
+			
+			if raw.seq_id not in self.chunks:
+				self.chunks[raw.seq_id] = utils.Chunk(raw.total_cnt, 0)
+			self.GetLogger().debug(f"Receive {raw.seq_id} subpackage({raw.cur_idx}/{raw.total_cnt}) - {len(raw.data)} bytes <<< {repr(raw.data[:50])} ...>>>")
+			await self.chunks[raw.seq_id].Put(raw)
+			if not self.chunks[raw.seq_id].IsFinish():
+				# current package is a subpackage. we should not invoke internal callbacks until all package has received.
+				return True
+			ret = self.chunks[raw.seq_id].Combine()
+			del self.chunks[raw.seq_id]
+			raw = ret
 		
-		await self.OnRecvPackage(raw)
+		await self.OnRecvOtherPackage(raw)
 		return True
-		# if raw.data_type == data.TransportDataType.STREAM_SUBPACKAGE or raw.total_cnt == -1:
-		# 	if raw.seq_id not in self.chunks:
-		# 		assert(raw.total_cnt != -1)
-		# 		self.chunks[raw.seq_id] = utils.Chunk(raw.total_cnt)
-		# 	await self.chunks[raw.seq_id].Put(raw)
+
+	async def QueueSendSmartSegments(self, raw: data.Transport):
+		"""
+		自动判断是否需要分包，若需要则分包发送，否则单独发送。raw应该是加密后的包。
+		多个Subpackage，先发送Subpackage，然后最后一个发送源data_type。
+		分包不支持流包的分包，因为分包需要用到序号，而流包的序号有特殊含义和发包顺序。如果你希望序号不变，请使用QueueSend()。
+		"""
+		if raw.IsStreamPackage():
+			raise Exception("Stream package cannot use in QueueSendSmartSegments(), please use QueueToSend() instead.")
+		
+		splitDatas: typing.List[bytes] = [ raw.data[i: i + self.safeSegmentSize] for i in range(0, len(raw.data), self.safeSegmentSize) ]
+		if len(splitDatas) == 1: #包比较小，单独发送即可
+			raw.total_cnt = 1
+			raw.cur_idx = 0
+			return await self.QueueSend(raw)
+		self.GetLogger().debug(f"Transport {raw.seq_id} is too large({len(raw.data)}), will be split into {len(splitDatas)} packages to send.")
+
+		subpackageRaw = raw.CloneWithSameSeqID()
+		subpackageRaw.data_type = data.TransportDataType.SUBPACKAGE
+		subpackageRaw.total_cnt = len(splitDatas)
+		for i, item in enumerate(splitDatas[:-1]):
+			subpackageRaw.data = item
+			subpackageRaw.cur_idx = i
+			self.GetLogger().debug(f"Send subpackage({subpackageRaw.cur_idx}/{subpackageRaw.total_cnt}) {subpackageRaw.seq_id} {len(subpackageRaw.data)} bytes <<< {repr(subpackageRaw.data[:50])} ...>>>")
+			await self.QueueSend(subpackageRaw)
+		
+		# 最后一个包，虽然是Resp/Req类型，但是data其实是传输数据的一部分，不是resp、req包。要全部合成一个才能解析成resp、req包。
+		raw.data = splitDatas[-1]
+		raw.total_cnt = data.Transport.END_PACKAGE
+		raw.cur_idx = len(splitDatas) - 1
+		self.GetLogger().debug(f"Send end subpackage({raw.cur_idx}/{raw.total_cnt}) {raw.seq_id} {len(raw.data)} bytes <<< {repr(raw.data[:50])} ...>>>")
+		await self.QueueSend(raw)
 
 class TunnelServer(Callback):
 	@abc.abstractmethod
-	async def ProcessPackage(self, raw: data.Transport) -> None:
+	async def OnProcess(self, raw: data.Transport) -> None:
 		"""
 		处理收到的一切包。
 		"""
 
 HttpUpgradedWebSocketHeaders = {"Upgrade": "websocket", "Connection": "Upgrade"}
-WebSocketMaxMessageSize = 12 * 1024 * 1024 # 12MB
-WebSocketSafeMaxMsgSize = 10 * 1024 * 1024 # 10MB
+WebSocketMaxReadingMessageSize = 12 * 1024 * 1024 # 12MB
+WebSocketSafeMaxMsgSize = 768 * 1024 # 768KB, up to 1MB
 
 class HttpUpgradedWebSocketClient(TunnelClient):
 	"""
 	在客户端使用的Websocket隧道，支持重连机制和重发机制，支持分包接收
 	"""
-	def __init__(self, url: str, **kwargs):
-		super().__init__(**kwargs)
+	def __init__(self, url: str, safeSegmentSize: int = WebSocketSafeMaxMsgSize, **kwargs):
+		super().__init__(safeSegmentSize = safeSegmentSize, **kwargs)
 
 		self.url = url
 		self.handler: typing.Optional[aiohttp.ClientWebSocketResponse] = None
@@ -263,7 +315,7 @@ class HttpUpgradedWebSocketClient(TunnelClient):
 		exitSignal = False
 		while curTries < self.maxRetries:
 			async with aiohttp.ClientSession() as session:
-				async with session.ws_connect(self.url, headers=HttpUpgradedWebSocketHeaders, max_msg_size=WebSocketMaxMessageSize) as ws:
+				async with session.ws_connect(self.url, headers=HttpUpgradedWebSocketHeaders, max_msg_size=WebSocketMaxReadingMessageSize) as ws:
 					if await self.OnPreConnected() != '':
 						break
 					self.isConnected = True
@@ -277,7 +329,7 @@ class HttpUpgradedWebSocketClient(TunnelClient):
 							self.OnError(self.handler.exception())
 						elif msg.type == aiohttp.WSMsgType.TEXT or msg.type == aiohttp.WSMsgType.BINARY:
 							parsed = data.Transport.FromProtobuf(msg.data)
-							if await self.processPackage(parsed) == False:
+							if await self.OnProcess(parsed) == False:
 								exitSignal = True
 								break
 			self.isConnected = False
@@ -301,6 +353,7 @@ class HttpUpgradedWebSocketServer(TunnelServer):
 		self.timeout = timeout
 		self.useCache = (cacheSize != 0)
 		self.GetLogger().info(f"{self.GetName()}] Use cache queue.")
+		self.isConnectedLock = asyncio.Lock()
 		super().__init__(**kwargs)
 
 	async def MainLoop(self):
@@ -309,7 +362,7 @@ class HttpUpgradedWebSocketServer(TunnelServer):
 				self.OnError(self.ws.exception())
 			elif msg.type == aiohttp.WSMsgType.TEXT or msg.type == aiohttp.WSMsgType.BINARY:
 				transport = data.Transport.FromProtobuf(msg.data)
-				await self.ProcessPackage(transport)
+				await self.OnProcess(transport)
 
 	async def DirectSend(self, raw: data.Transport):
 		return await self.ws.send_bytes(raw.ToProtobuf())
@@ -345,22 +398,24 @@ class HttpUpgradedWebSocketServer(TunnelServer):
 			await self.cacheQueue.Add(raw)
 
 	async def MainLoopWithRequest(self, request: web.BaseRequest):
-		preconnected = await self.OnPreConnected()
-		preconnected = preconnected.strip()
-		if preconnected != '':
-			return utils.ReponseText(preconnected, 403)
-		
-		self.ws = web.WebSocketResponse(max_msg_size=WebSocketMaxMessageSize)
-		await self.ws.prepare(request)
-		self.isConnected = True
+		async with self.isConnectedLock:
+			preconnected = await self.OnPreConnected()
+			preconnected = preconnected.strip()
+			if preconnected != '':
+				return utils.ReponseText(preconnected, 403)
+			
+			self.ws = web.WebSocketResponse(max_msg_size=WebSocketMaxReadingMessageSize, heartbeat=time_utils.Seconds(6), autoping=True)
+			await self.ws.prepare(request)
+			self.isConnected = True
 		await self.OnConnected()
 		await self.resend()
 		try:
 			await self.MainLoop()
 		except Exception as ex:
 			self.OnError(ex)
-		self.isConnected = False
-		await self.OnDisconnected()
-		bakws = self.ws
-		self.ws = None
+		async with self.isConnectedLock:
+			self.isConnected = False
+			await self.OnDisconnected()
+			bakws = self.ws
+			self.ws = None
 		return bakws

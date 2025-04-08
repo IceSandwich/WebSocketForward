@@ -43,23 +43,26 @@ conf = Configuration(args)
 class ChatRoom:
 	def __init__(self):
 		self.servers: typing.Dict[str, tunnel.HttpUpgradedWebSocketServer] = {}
+		self.serversLock = asyncio.Lock()
 
-	def Add(self, uid: str, server: tunnel.HttpUpgradedWebSocketServer) -> bool:
+	async def Add(self, uid: str, server: tunnel.HttpUpgradedWebSocketServer) -> bool:
 		"""
 		如果uid存在返回False
 		"""
 		if uid in self.servers: return False
-		self.servers[uid] = server
+		async with self.serversLock:
+			self.servers[uid] = server
 		log.info(f"ChatRoom] {server.GetName()} joined.")
 		return True
 
-	def Remove(self, uid: str) -> bool:
+	async def Remove(self, uid: str) -> bool:
 		"""
 		如果uid不存在返回False
 		"""
 		if uid not in self.servers: return False
-		log.info(f"ChatRoom] {self.servers[uid].GetName()} left.")
-		del self.servers[uid]
+		async with self.serversLock:
+			log.info(f"ChatRoom] {self.servers[uid].GetName()} left.")
+			del self.servers[uid]
 		return True
 	
 	def GetServer(self, uid:str):
@@ -90,6 +93,18 @@ class ChatRoom:
 			if uid in skip_lists: continue
 			if server.IsConnected():
 				await server.DirectSend(pkg)
+
+	async def Chat(self, msg: str, uid:str) -> bool:
+		"""
+		单独给一个client发送消息
+		"""
+		log.info(f"Chat {uid} with message: {msg}")
+		pkg = self.NewPrintControlTransport(msg, fromWho="Server")
+		async with self.serversLock:
+			if uid in self.servers:
+				await self.servers[uid].DirectSend(pkg)
+				return True
+		return False
 
 	async def Route(self, raw: data.Transport) -> bool:
 		if raw.to_uid not in self.servers:
@@ -135,6 +150,7 @@ class Client(tunnel.HttpUpgradedWebSocketServer):
 
 	async def processControlPackage(self, raw: data.Transport):
 		pkg = data.Control.FromProtobuf(raw.data)
+		log.debug(f"{self.GetName()}] Received control package {raw.seq_id} - {data.ControlDataType.ToString(pkg.data_type)}")
 		if pkg.data_type == data.ControlDataType.QUERY_CLIENTS:
 			output = chatroom.GetServerInfos()
 			resp = data.Control(data.ControlDataType.QUERY_CLIENTS, json.dumps(output))
@@ -145,19 +161,31 @@ class Client(tunnel.HttpUpgradedWebSocketServer):
 			log.info("CTRL Server] " + pkg.msg)
 		elif pkg.data_type == data.ControlDataType.EXIT:
 			if not chatroom.Has(pkg.msg):
-				log.error(f"{self.GetName()}] Attempt to exit {pkg.msg} but not found in chatroom.")
+				msg = f"Attempt to exit {pkg.msg} but not found in chatroom."
+				log.error(f"{self.GetName()}] {msg}")
+				await chatroom.Chat(msg, raw.from_uid)
 			else:
 				await chatroom.GetServer(pkg.msg).QueueSend(raw)
 
-	async def ProcessPackage(self, raw: data.Transport):
-		log.debug(f"{self.GetName()}] Received package {raw.seq_id} - {data.TransportDataType.ToString(raw.data_type)}")
+	async def processRegularPackage(self, raw: data.Transport):
+		log.debug(f"{self.GetName()}] Received {data.TransportDataType.ToString(raw.data_type)} package {raw.seq_id} - {raw.from_uid} => {raw.to_uid}")
+		await chatroom.Route(raw)
+
+	async def OnProcess(self, raw: data.Transport):
 		if raw.data_type == data.TransportDataType.CONTROL:
 			return await self.processControlPackage(raw)
 		
 		if raw.from_uid != self.uid:
 			log.warning(f"{self.GetName()}] Package {raw.seq_id} 's from_uid is not the right uid. Expect: {self.uid}. Got {raw.from_uid}.")
 			raw.from_uid = self.uid
-		await chatroom.Route(raw)
+			# quick fix and continue this package
+		if raw.to_uid == self.uid:
+			msg = f"Cannot send package {raw.seq_id} back to self. From: {raw.from_uid}, to: {raw.to_uid}. Drop package."
+			log.error(f"{self.GetName()}] {msg}")
+			await chatroom.Chat(msg, self.uid)
+			return
+		
+		return await self.processRegularPackage(raw)
 
 async def main(config: Configuration):
 	async def wraploop(request: web.BaseRequest):
@@ -169,11 +197,14 @@ async def main(config: Configuration):
 		uid = request.query['uid']
 		if not chatroom.Has(uid):
 			client = Client(uid=uid, cacheSize=config.cacheSize, timeout=config.timeout)
-			if chatroom.Add(uid, client) == False:
-				raise RuntimeError("should not happend")
+			if await chatroom.Add(uid, client) == False: # condition race result
+				return web.Response(
+					body='Already connected (at the same time).',
+					status=403
+				)
 
 		server = chatroom.GetServer(uid)
-		return await server.MainLoopWithRequest(request)
+		return await server.MainLoopWithRequest(request) # 在Mainloop里再判断是否已经存在连接，若已经存在则拒接连接
 
 	app = web.Application()
 	app.router.add_get(config.listen_route, wraploop)
