@@ -4,10 +4,10 @@ def GetTimestamp():
 	return int(time.time())
 
 def Seconds(seconds: int):
-	return seconds
+	return float(seconds)
 
 def Minutes(minutes: int):
-	return minutes * 60
+	return float(minutes * 60)
 
 def WithInDuration(oldTime: int, newTime: int, duration: int):
 	return newTime - oldTime < duration

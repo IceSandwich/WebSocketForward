@@ -4,7 +4,7 @@
 
 [Ref](https://www.haproxy.com/documentation/haproxy-configuration-tutorials/load-balancing/websocket/)
 
-``` conf
+```conf
 frontend fe_main
   bind :80
   use_backend websocket_servers if { path_beg /ws }
@@ -23,7 +23,7 @@ backend websocket_servers
 
 [Ref](http://nginx.org/en/docs/http/ngx_http_proxy_module.html#proxy_connect_timeout)
 
-``` conf
+```conf
 http {
     upstream websocket_backend {
         # 定义多个 WebSocket 后端服务器，轮询负载均衡
@@ -47,12 +47,11 @@ http {
             proxy_read_timeout 3600s;  # 设置长连接的超时时间
             proxy_send_timeout 3600s;  # 设置发送请求的超时时间
 
-			# try the following.
-			#proxy_connect_timeout 7d;
-			#proxy_send_timeout 7d;
-			#proxy_read_timeout 7d;
+            # try the following.
+            #proxy_connect_timeout 7d;
+            #proxy_send_timeout 7d;
+            #proxy_read_timeout 7d;
         }
     }
 }
-
 ```

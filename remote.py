@@ -55,6 +55,12 @@ class Client(tunnel.HttpUpgradedWebSocketClient):
 	def GetLogger(self) -> logging.Logger:
 		return log
 	
+	def GetUID(self) -> str:
+		return self.conf.uid
+	
+	def GetTargetUID(self) -> str:
+		return self.conf.target_uid
+	
 	async def Session(self, request: data.Request):
 		"""
 		发送Request包，返回Response包，内部会处理加解密的工作。
@@ -102,7 +108,10 @@ class Client(tunnel.HttpUpgradedWebSocketClient):
 		pkg.total_cnt = -1
 		await self.QueueSend(pkg)
 
-	async def OnRecvOtherPackage(self, raw: data.Transport) -> None:
+	async def OnCtrlQuerySends(self, raw: data.Transport):
+		return await self.putToSessionCtrlQueue(raw)
+
+	async def DispatchOtherPackage(self, raw: data.Transport) -> None:
 		assert(raw.data_type == data.TransportDataType.RESPONSE)
 		rawData = raw.data if self.conf.cipher is None else self.conf.cipher.Decrypt(raw.data)
 
@@ -118,16 +127,7 @@ class Client(tunnel.HttpUpgradedWebSocketClient):
 			log.debug(f"SSE >>>Begin {raw.seq_id} - {resp.url} {len(resp.body)} bytes")
 			self.tracksse[raw.seq_id] = [resp.url, True]
 		
-		return await super().OnRecvOtherPackage(raw)
-
-	async def OnRecvCtrlPackage(self, raw: data.Transport) -> bool:
-		ctrl = data.Control.FromProtobuf(raw.data)
-		log.debug(f'{self.GetName()}] Receive control package {raw.seq_id} {data.ControlDataType.ToString(ctrl.data_type)} - {raw.from_uid} => {raw.to_uid}')
-		if ctrl.data_type == data.ControlDataType.PRINT:
-			printMsg = data.PrintControlMsg.From(ctrl.msg)
-			log.info(f"CTRL {printMsg.fromWho}] {printMsg.message}")
-			return True
-		return await super().OnRecvCtrlPackage(raw)
+		return await super().DispatchOtherPackage(raw)
 
 class StableDiffusionCachingClient(Client):
 	def __init__(self, config: Configuration):
@@ -185,6 +185,8 @@ class StableDiffusionCachingClient(Client):
 			if relativefn.startswith('outputs/'):
 				utils.SetWSFCompress(request, utils.MIMETYPE_WEBP, self.conf.img_quality)
 				resp, seq_id = await super().Session(request)
+				if resp.status_code != 200:
+					return resp, seq_id
 				img = utils.DecodeImageFromBytes(resp.body)
 				os.makedirs(os.path.dirname(targetfn), exist_ok=True)
 				img.save(targetfn)
@@ -195,6 +197,8 @@ class StableDiffusionCachingClient(Client):
 						resp.headers['Content-Length'] = str(len(resp.body))
 			else:
 				resp, seq_id = await super().Session(request)
+				if resp.status_code != 200:
+					return resp, seq_id
 				try:
 					dirname = os.path.dirname(targetfn)
 					os.makedirs(dirname, exist_ok=True)

@@ -46,6 +46,8 @@ enum ControlDataType {
 	PRINT = 1;
 	EXIT = 2;
 	QUERY_CLIENTS = 3;
+	RETRIEVE_PKG = 4;
+	HISTORY_CLIENT = 5; //The history package of client to inform server to resend
 }
 
 message Control {

@@ -148,33 +148,36 @@ class Client(tunnel.HttpUpgradedWebSocketServer):
 		await chatroom.Boardcast(f"{self.GetName()} disconnected.", [self.uid])
 		await super().OnDisconnected()
 
-	async def processControlPackage(self, raw: data.Transport):
-		pkg = data.Control.FromProtobuf(raw.data)
-		log.debug(f"{self.GetName()}] Received control package {raw.seq_id} - {data.ControlDataType.ToString(pkg.data_type)}")
-		if pkg.data_type == data.ControlDataType.QUERY_CLIENTS:
-			output = chatroom.GetServerInfos()
-			resp = data.Control(data.ControlDataType.QUERY_CLIENTS, json.dumps(output))
-			raw.SwapSenderReciver()
-			raw.data = resp.ToProtobuf()
-			await self.DirectSend(raw)
-		elif pkg.data_type == data.ControlDataType.PRINT:
-			log.info("CTRL Server] " + pkg.msg)
-		elif pkg.data_type == data.ControlDataType.EXIT:
-			if not chatroom.Has(pkg.msg):
-				msg = f"Attempt to exit {pkg.msg} but not found in chatroom."
-				log.error(f"{self.GetName()}] {msg}")
-				await chatroom.Chat(msg, raw.from_uid)
-			else:
-				await chatroom.GetServer(pkg.msg).QueueSend(raw)
+	async def OnCtrlExit(self, raw: data.Transport, ctrl: data.Control) -> bool:
+		if not chatroom.Has(ctrl.msg):
+			msg = f"Attempt to exit {ctrl.msg} but not found in chatroom."
+			log.error(f"{self.GetName()}] {msg}")
+			await chatroom.Chat(msg, raw.from_uid)
+		else:
+			await chatroom.GetServer(ctrl.msg).QueueSend(raw)
 
-	async def processRegularPackage(self, raw: data.Transport):
-		log.debug(f"{self.GetName()}] Received {data.TransportDataType.ToString(raw.data_type)} package {raw.seq_id} - {raw.from_uid} => {raw.to_uid}")
-		await chatroom.Route(raw)
+	async def OnCtrlQueryClients(self, raw: data.Transport):
+		output = chatroom.GetServerInfos()
+		resp = data.Control(data.ControlDataType.QUERY_CLIENTS, json.dumps(output))
+		raw.SwapSenderReciver()
+		raw.data = resp.ToProtobuf()
+		await self.DirectSend(raw)
 
-	async def OnProcess(self, raw: data.Transport):
-		if raw.data_type == data.TransportDataType.CONTROL:
-			return await self.processControlPackage(raw)
-		
+	async def OnCtrlRetrievePackage(self, raw: data.Transport, retrieve: data.RetrieveControlMsg):
+		"""
+		优先从服务器获取缓存
+		"""
+		async with self.cacheSendQueueLock:
+			for item in self.cacheSendQueue:
+				if retrieve.pi.IsSamePackage(item):
+					log.debug(f"{self.GetName()}] Retrieve pkg {retrieve.pi.seq_id} ({retrieve.pi.cur_idx}/{retrieve.pi.total_cnt}) from local server.")
+					await self.DirectSend(item)
+					return
+
+		log.debug(f"Retrieve pkg {retrieve.pi.seq_id} ({retrieve.pi.cur_idx}/{retrieve.pi.total_cnt}) from {raw.to_uid} server.")
+		chatroom.GetServer(raw.to_uid).DirectSend(raw)
+
+	async def DispatchOtherPackage(self, raw: data.Transport):
 		if raw.from_uid != self.uid:
 			log.warning(f"{self.GetName()}] Package {raw.seq_id} 's from_uid is not the right uid. Expect: {self.uid}. Got {raw.from_uid}.")
 			raw.from_uid = self.uid
@@ -185,7 +188,13 @@ class Client(tunnel.HttpUpgradedWebSocketServer):
 			await chatroom.Chat(msg, self.uid)
 			return
 		
-		return await self.processRegularPackage(raw)
+		log.debug(f"{self.GetName()}] Received {data.TransportDataType.ToString(raw.data_type)} package {raw.seq_id} - {raw.from_uid} => {raw.to_uid}")
+		
+		# 缓存非control包
+		async with self.receiveQueueLock:
+			self.receiveQueue.Add(raw)
+		
+		await chatroom.Route(raw)
 
 async def main(config: Configuration):
 	async def wraploop(request: web.BaseRequest):

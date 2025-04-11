@@ -1,4 +1,4 @@
-import json, typing
+import json, typing, abc
 import protocol_pb2
 from uuid import uuid4
 import time_utils
@@ -203,12 +203,24 @@ class ControlDataType(DataTypeBase):
 	PRINT = 1
 	EXIT = 2
 	QUERY_CLIENTS = 3
+	RETRIEVE_PKG = 4
+	HISTORY_CLIENT = 5
 
 	Mappings: typing.List[typing.Tuple[int, str, typing.Any]] = [
 		[HEARTBEAT, 'HEARTBEAT', protocol_pb2.ControlDataType.HEARTBEAT],
 		[PRINT, 'PRINT', protocol_pb2.ControlDataType.PRINT],
 		[EXIT, 'EXIT', protocol_pb2.ControlDataType.EXIT],
-		[QUERY_CLIENTS, 'QUERY', protocol_pb2.ControlDataType.QUERY_CLIENTS]
+		[QUERY_CLIENTS, 'QUERY', protocol_pb2.ControlDataType.QUERY_CLIENTS],
+		[RETRIEVE_PKG, 'RETRIEVE_PKG', protocol_pb2.ControlDataType.RETRIEVE_PKG],
+		[HISTORY_CLIENT, 'HISTORY_CLIENT', protocol_pb2.ControlDataType.HISTORY_CLIENT],
+	]
+
+	NoResp: typing.List[int] = [
+		HEARTBEAT,
+		PRINT,
+		EXIT,
+		RETRIEVE_PKG,
+		HISTORY_CLIENT,
 	]
 
 class Control:
@@ -228,8 +240,23 @@ class Control:
 		pb.ParseFromString(data)
 		ret = Control(ControlDataType.FromPB(pb.data_type), pb.message)
 		return ret
+
+class ControlMsg(abc.ABC):
+	@abc.abstractmethod
+	def Serialize(self) -> str:
+		"""
+		序列化到字符串
+		"""
+		raise NotImplementedError
 	
-class PrintControlMsg:
+	@classmethod
+	def From(cls, serialize: str):
+		"""
+		从字符串解析
+		"""
+		raise NotImplementedError
+
+class PrintControlMsg(ControlMsg):
 	def __init__(self, fromWho: str, message: str):
 		self.fromWho = fromWho
 		self.message = message
@@ -241,21 +268,81 @@ class PrintControlMsg:
 		})
 	
 	@classmethod
-	def From(self, serialize: str):
+	def From(cls, serialize: str):
 		ret = json.loads(serialize)
 		return PrintControlMsg(ret["from"], ret["msg"])
+	
+class PackageIdentification:
+	def __init__(self, seq_id: str, cur_idx: int, total_cnt: int):
+		self.seq_id = seq_id
+		self.cur_idx = cur_idx
+		self.total_cnt = total_cnt
 
-class QueryClientsControlMsg:
-	def __init__(self,):
-		# self.uid = uid
-		pass
-
-	def Serialize(self):
-		return ''
+	def ToDict(self) -> typing.Dict[str, typing.Union[str, int]]:
+		return {
+			"seq_id": self.seq_id,
+			"cur_idx": self.cur_idx,
+			"total_cnt": self.total_cnt
+		}
 	
 	@classmethod
-	def From(self, serialize: str):
-		return HelloRequestControlMsg()
+	def FromTransport(self, raw: Transport):
+		ret = PackageIdentification(
+			raw.seq_id,
+			raw.cur_idx,
+			raw.total_cnt
+		)
+		return ret
+	
+	def IsSamePackage(self, raw: Transport):
+		return raw.seq_id == self.seq_id and raw.cur_idx == self.cur_idx and raw.total_cnt == self.total_cnt
+	
+	@classmethod
+	def FromDict(cls, serialize: typing.Dict[str, typing.Union[str, int]]):
+		return PackageIdentification(
+			serialize["seq_id"],
+			serialize["cur_idx"],
+			serialize["total_cnt"]
+		)
+
+class RetrieveControlMsg(ControlMsg):
+	def __init__(self, seq_id: str, expect_idx: int, total_cnt: int):
+		self.pi = PackageIdentification(seq_id, expect_idx, total_cnt)
+
+	def Serialize(self) -> str:
+		return json.dumps(self.pi.ToDict())
+	
+	@classmethod
+	def From(cls, serialize: str):
+		ret = json.loads(serialize)
+		return RetrieveControlMsg(ret["seq_id"], ret["cur_idx"], ret["total_cnt"])
+
+class HistoryClientControlMsg(ControlMsg):
+	def __init__(self, instanceId: int):
+		self.data: typing.List[typing.Dict[str, typing.Union[str, int]]] = []
+		self.instanceId = instanceId
+	def Add(self, pack: PackageIdentification):
+		self.data.append(pack.ToDict())
+	def Serialize(self) -> str:
+		return json.dumps({
+			"instanceId": self.instanceId,
+			"history": self.data
+		})
+	@classmethod
+	def From(cls, serialize: str):
+		sdata = json.loads(serialize)
+		ret = HistoryClientControlMsg(sdata["instanceId"])
+		ret.data = sdata["history"]
+		return ret
+	
+	def __len__(self):
+		return len(self.data)
+	
+	def __getitem__(self, idx:int):
+		return PackageIdentification.FromDict(self.data[idx])
+	
+	def GetInstanceId(self):
+		return self.instanceId
 
 
 if __name__ == '__main__':

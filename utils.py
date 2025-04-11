@@ -1,7 +1,7 @@
-import logging, os, collections, asyncio, sys, io, uuid, datetime
+import logging, os, collections, asyncio, sys, io, uuid, datetime, heapq, abc
 from PIL import Image
 import aiohttp.web as web
-import data
+import data, time_utils
 
 import typing
 T = typing.TypeVar('T')
@@ -40,36 +40,33 @@ def GuessMimetype(filename: str):
 
 class BoundedQueue(typing.Generic[T]):
 	"""
-	固定容量的Queue，当超过容量时
+	固定容量的Queue，当超过容量时。线程不安全，请自行加锁。
 	"""
 	def __init__(self, capacity: int):
 		# 初始化容量和队列
 		self.capacity = capacity
 		self.queue: typing.Deque[T] = collections.deque()
-		self.lock = asyncio.Lock()
 	
-	async def Add(self, item: T):
-		async with self.lock:
-			# 如果队列已满，删除最旧的元素
-			if len(self.queue) >= self.capacity:
-				self.queue.popleft()
-			# 添加新元素到队列末尾
-			self.queue.append(item)
+	def Add(self, item: T):
+		# 如果队列已满，删除最旧的元素
+		if len(self.queue) >= self.capacity:
+			self.queue.popleft()
+		# 添加新元素到队列末尾
+		self.queue.append(item)
 	
-	async def PopAllElements(self) -> typing.List[T]:
-		async with self.lock:
-			# 获取队列中的所有元素
-			ret = list(self.queue)
-			self.queue.clear()
-			return ret
-	
-	def GetSize(self):
+	def __len__(self):
 		# 获取当前队列的大小
 		return len(self.queue)
 
 	def IsEmpty(self):
 		return len(self.queue) == 0
+
+	def __iter__(self):
+		return self.queue.__iter__()
 	
+	def Clear(self):
+		self.queue.clear()
+
 class Chunk:
 	def __init__(self, total_cnt: int, start_idx: int):
 		self.start_idx = start_idx
@@ -158,3 +155,64 @@ def GetWSFCompress(req: data.Request):
 	sp = compress.split(',')
 	assert(len(sp) == 2)
 	return (sp[0], int(sp[1]))
+
+class TimerTask(abc.ABC):
+	def __init__(self, time: float):
+		self.timestamp = time_utils.GetTimestamp()
+		self.time = time
+
+	def __le__(self, other):
+		return self.time < other.time
+	
+	def GetTimestamp(self):
+		return self.timestamp
+	
+	@abc.abstractmethod
+	async def Run(self):
+		raise NotImplementedError()
+	
+class Timer:
+	"""
+	Not a accurate timer.
+	"""
+	def __init__(self):
+		self.tasks: typing.List[TimerTask] = []
+		self.condition = asyncio.Condition()
+		self.runningSignal = False
+
+	def Start(self):
+		"""
+		清空任务并启动协程
+		"""
+		self.runningSignal = True
+		self.tasks = []
+		self.instance = asyncio.ensure_future(self.mainloop())
+	
+	async def Stop(self):
+		self.runningSignal = False
+		self.condition.notify_all()
+		await self.instance
+
+	def AddTask(self, task: TimerTask):
+		if self.runningSignal == False:
+			print(f"Warning: Timer doesn't start at this moment but AddTask() has been called.")
+
+		with self.condition:
+			heapq.heappush(self.tasks, task)
+			self.condition.notify_all()
+
+	async def mainloop(self):
+		while True:
+			async with self.condition:
+				await self.condition.wait_for(lambda: len(self.tasks) > 0 or self.runningSignal == False)
+				if self.runningSignal == False:
+					return
+				item = heapq.heappop(self.tasks)
+			if item.time <= 0:
+				continue
+			await asyncio.sleep(item.time)
+			await item.Run()
+			async with self.condition: # this will change the new packages added during sleep time. So utils.Timer is not a accurate timer.
+				for task in self.tasks:
+					task.time -= item.time
+		 

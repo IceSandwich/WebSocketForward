@@ -15,6 +15,7 @@ class Configuration:
 		if self.cipher is not None:
 			log.info(f"Using cipher: {self.cipher.GetName()}")
 		self.uid: str = args.uid
+		self.target_uid: str = args.target_uid
 
 	@classmethod
 	def SetupParser(cls, parser: argp.ArgumentParser):
@@ -22,6 +23,7 @@ class Configuration:
 		parser.add_argument("--cipher", type=str, default="xor", help="Cipher to use for encryption")
 		parser.add_argument("--key", type=str, default="WebSocket@Forward通讯密钥，必须跟另一端保持一致。", help="The key to use for the cipher. Must be the same with remote.")
 		parser.add_argument("--uid", type=str, default="Client")
+		parser.add_argument("--target_uid", type=str, default="Remote")
 		return parser
 
 class Connection:
@@ -107,6 +109,12 @@ class Client(tunnel.HttpUpgradedWebSocketClient):
 	def GetName(self) -> str:
 		return self.config.uid
 	
+	def GetUID(self) -> str:
+		return self.config.uid
+	
+	def GetTargetUID(self) -> str:
+		return self.config.target_uid
+	
 	async def OnConnected(self):
 		self.forward_session = aiohttp.ClientSession()
 		return await super().OnConnected()
@@ -115,7 +123,7 @@ class Client(tunnel.HttpUpgradedWebSocketClient):
 		await self.forward_session.close()
 		await super().OnDisconnected()
 
-	async def OnRecvStreamPackage(self, raw: data.Transport) -> None:
+	async def DispatchStreamPackage(self, raw: data.Transport) -> None:
 		if raw.total_cnt != -1:
 			raise RuntimeError(f'Client only receive stream package with -1 total_cnt. but got {raw.total_cnt}')
 	
@@ -125,28 +133,27 @@ class Client(tunnel.HttpUpgradedWebSocketClient):
 		
 		print(f"==== Receive close stream {raw.seq_id}")
 		self.sseTrack[raw.seq_id] = [False, False]
+
+	async def OnCtrlQuerySends(self, raw: data.Transport):
+		return await self.putToSessionCtrlQueue(raw)
 	
-	async def Session(self, raw: data.Transport):
-		raise RuntimeError("Client doesn't support session.")
+	async def OnCtrlExit(self, raw: data.Transport, ctrl: data.Control) -> bool:
+		log.info(f"{self.GetName()}] Receive exit signal. Exit the program.")
+		return False
 	
-	async def SessionControl(self, raw: data.Control, uid: str):
-		raise RuntimeError("Client doesn't support session control.")
+	async def OnCtrlRetrievePackage(self, raw: data.Transport, retrieve: data.RetrieveControlMsg):
+		pkg = data.RetrieveControlMsg.From(ctrl.msg)
+		print(f"=== require history {pkg.seq_id} ({pkg.cur_idx}/{pkg.total_cnt})")
+		item = self.FetchHistoryPackage(pkg.seq_id, pkg.cur_idx, pkg.total_cnt)
+		if item is not None:
+			await self.DirectSend(item)
+		else:
+			print(f"=== require history {pkg.seq_id} but cannot find in history. ignore this control pkg.")
+
+		# =========================  ControlDispatcher 实现  ====================
+
 	
-	async def Stream(self, seq_id: str):
-		raise RuntimeError("Client doesn't support stream.")
-	
-	async def OnRecvCtrlPackage(self, raw: data.Transport) -> bool:
-		ctrl = data.Control.FromProtobuf(raw.data)
-		log.debug(f'{self.GetName()}] Receive control package {raw.seq_id} {data.ControlDataType.ToString(ctrl.data_type)} - {raw.from_uid} => {raw.to_uid}')
-		if ctrl.data_type == data.ControlDataType.EXIT:
-			log.info(f"{self.GetName()}] Receive exit signal. Exit the program.")
-			return False
-		elif ctrl.data_type == data.ControlDataType.PRINT:
-			printStruct = data.PrintControlMsg.From(ctrl.msg)
-			log.info(f"CTRL {printStruct.fromWho}] {printStruct.message}")
-		return True
-	
-	async def OnRecvOtherPackage(self, raw: data.Transport):
+	async def DispatchOtherPackage(self, raw: data.Transport):
 		if raw.data_type == data.TransportDataType.REQUEST:
 			await self.processRequestPackage(raw)
 		elif raw.data_type == data.TransportDataType.TCP_CONNECT:
