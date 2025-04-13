@@ -194,12 +194,14 @@ class TunnelClient(TunnelClientDispatcher):
 	"""
 	MaxHeapBufferSize = 20
 
-	def __init__(self, maxRetries: int = 3, resendDuration: int = time_utils.Seconds(10), cacheQueueSize: int = 100, safeSegmentSize: int = 768 * 1024):
+	def __init__(self, maxRetries: int = 3, resendDuration: int = time_utils.Seconds(10), cacheQueueSize: int = 100, safeSegmentSize: int = 768 * 1024, streamScheduleRetrieveDuration: int = time_utils.Seconds(3), streamMaxSendRetrieveTimes = 3):
 		super().__init__()
 
 		self.maxRetries = maxRetries
 		self.resendDuration = resendDuration
 		self.safeSegmentSize = safeSegmentSize
+		self.streamScheduleRetrieveDuration = streamScheduleRetrieveDuration # 当出现顺序不对时，等待多久才发送Retrieve包
+		self.streamMaxSendRetrieveTimes = streamMaxSendRetrieveTimes # 最多发送多少次retrieve包，当达到上限，无论如何都弹出一个元素
 
 		# 管理分包传输，key为seq_id
 		self.chunks: typing.Dict[str, utils.Chunk] = {}
@@ -349,9 +351,6 @@ class TunnelClient(TunnelClientDispatcher):
 	STREAM_STATE_WAIT_TO_RETRIEVE = 1
 	STREAM_STATE_SHOULD_RETRIEVE = 2
 
-	STREAM_MAX_SEND_RETRIEVE_TIMES = 3 # 最多发送多少次retrieve包，当达到上限，无论如何都弹出一个元素
-	STREAM_SCHEDULE_RETRIEVE_DURATION = time_utils.Seconds(3) # 当出现顺序不对时，等待多久才发送Retrieve包
-
 	async def Stream(self, seq_id: str):
 		# print(f"Listening stream on {seq_id}...")
 		expectIdx = 1 # 当前期望得到的cur_idx
@@ -362,7 +361,7 @@ class TunnelClient(TunnelClientDispatcher):
 		stateLock = asyncio.Lock()
 		class RetrieveTimerCallback(utils.TimerTask):
 			def __init__(that):
-				super().__init__(self.STREAM_SCHEDULE_RETRIEVE_DURATION)
+				super().__init__(self.streamScheduleRetrieveDuration)
 			
 			async def Run(that):
 				nonlocal state
@@ -394,7 +393,7 @@ class TunnelClient(TunnelClientDispatcher):
 							# 启动计时器
 							cb = RetrieveTimerCallback()
 							stateTimestamp = cb.GetTimestamp()
-						self.timer.AddTask(cb)
+						await self.timer.AddTask(cb)
 						print(f"Stream {seq_id} change from none to wait to retrieve")
 						continue
 					elif state == self.STREAM_STATE_WAIT_TO_RETRIEVE:
@@ -407,7 +406,7 @@ class TunnelClient(TunnelClientDispatcher):
 						print(f"Stream {seq_id} still waitting")
 						continue
 					elif state == self.STREAM_STATE_SHOULD_RETRIEVE:
-						if sendRetreveTimes <= self.STREAM_MAX_SEND_RETRIEVE_TIMES:
+						if sendRetreveTimes <= self.streamMaxSendRetrieveTimes:
 							print(f"Stream  {seq_id} send retrieve request, cur times: {sendRetreveTimes}")
 							retrieveRaw = data.Transport(
 								data.TransportDataType.CONTROL,
@@ -498,7 +497,7 @@ class TunnelClient(TunnelClientDispatcher):
 				self.isConnected = True
 
 class TunnelServer(ControlDispatcher):
-	def __init__(self, cacheSize: int = 100, timeout: int = time_utils.Seconds(10), **kwargs):
+	def __init__(self, cacheSize: int = 100, timeout: int = time_utils.Seconds(30), **kwargs):
 		# 缓存收到的包，从remote发到server的包，一来让remote知道server已经收到哪些包，二来让client从这个队列retrieve包。
 		self.receiveQueue: utils.BoundedQueue[data.Transport] = utils.BoundedQueue(cacheSize)
 		self.receiveQueueLock = asyncio.Lock()
@@ -588,9 +587,9 @@ class TunnelServer(ControlDispatcher):
 				if sendMask[iq] == False: continue
 				if time_utils.WithInDuration(item.timestamp, nowtime, self.timeout):
 					await self.DirectSend(item)
-					self.GetLogger().debug(f"{self.GetName()}] Sent {item.seq_id}")
+					self.GetLogger().debug(f"{self.GetName()}] Resent {item.seq_id}")
 				else:
-					self.GetLogger().warning(f"{self.GetName()}] Drop resend package {item.seq_id} {data.TransportDataType.ToString(item.data_type)} due to outdated.")
+					self.GetLogger().warning(f"{self.GetName()}] Drop resend package {item.seq_id} {data.TransportDataType.ToString(item.data_type)} due to outdated, {item.timestamp} -> {nowtime}.")
 
 			self.isConnected = True # 当释放锁时，如果不设置为True，可能在QueueSend处只缓存不发包。
 

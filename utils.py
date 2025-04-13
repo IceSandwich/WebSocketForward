@@ -193,11 +193,11 @@ class Timer:
 		self.condition.notify_all()
 		await self.instance
 
-	def AddTask(self, task: TimerTask):
+	async def AddTask(self, task: TimerTask):
 		if self.runningSignal == False:
 			print(f"Warning: Timer doesn't start at this moment but AddTask() has been called.")
 
-		with self.condition:
+		async with self.condition:
 			heapq.heappush(self.tasks, task)
 			self.condition.notify_all()
 

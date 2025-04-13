@@ -19,7 +19,7 @@ class Configuration:
 	def SetupParser(cls, parser: argp.ArgumentParser):
 		parser.add_argument("--server", type=str, default="127.0.0.1:8030", help="The address to listen on.")
 		parser.add_argument("--cache_size", type=int, default=128, help="The maximum number of packages to cache. Set 0 to disable cache.")
-		parser.add_argument("--timeout", type=int, default=10, help="The maximum seconds to resend packages.")
+		parser.add_argument("--timeout", type=int, default=30, help="The maximum seconds to resend packages.")
 		parser.add_argument("--listen_route", type=str, default='/wsf/ws')
 		return parser
 
