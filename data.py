@@ -318,14 +318,18 @@ class RetrieveControlMsg(ControlMsg):
 		return RetrieveControlMsg(ret["seq_id"], ret["cur_idx"], ret["total_cnt"])
 
 class HistoryClientControlMsg(ControlMsg):
-	def __init__(self, instanceId: int):
+	def __init__(self, instanceId: int, isRetrieve: bool = False):
 		self.data: typing.List[typing.Dict[str, typing.Union[str, int]]] = []
+		self.isRetrieve = isRetrieve
 		self.instanceId = instanceId
 	def Add(self, pack: PackageIdentification):
 		self.data.append(pack.ToDict())
+	def IsRetrieve(self) -> bool:
+		return self.isRetrieve
 	def Serialize(self) -> str:
 		return json.dumps({
 			"instanceId": self.instanceId,
+			"isRetrieve": self.isRetrieve,
 			"history": self.data
 		})
 	@classmethod
@@ -333,6 +337,7 @@ class HistoryClientControlMsg(ControlMsg):
 		sdata = json.loads(serialize)
 		ret = HistoryClientControlMsg(sdata["instanceId"])
 		ret.data = sdata["history"]
+		ret.isRetrieve = sdata["isRetrieve"]
 		return ret
 	
 	def __len__(self):

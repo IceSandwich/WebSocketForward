@@ -5,7 +5,7 @@ import argparse as argp
 import data, tunnel, utils, encrypt
 
 log = logging.getLogger(__name__)
-utils.SetupLogging(log, "remote")
+utils.SetupLogging(log, "remote", terminalLevel=logging.DEBUG)
 
 class Configuration:
 	def __init__(self, args):
@@ -79,6 +79,9 @@ class Client(tunnel.HttpUpgradedWebSocketClient):
 			log.debug(f"Response {raw.seq_id} - {request.method} {resp.url} {resp.status_code} {len(resp.body)} bytes")
 		return resp, raw.seq_id
 	
+	async def OnCtrlQueryClients(self, raw: data.Transport):
+		await self.putToSessionCtrlQueue(raw)
+	
 	async def ControlQuery(self):
 		"""
 		Query控制包以Control的形式返回。
@@ -95,7 +98,7 @@ class Client(tunnel.HttpUpgradedWebSocketClient):
 		Exit控制包是没有返回的。
 		"""
 		raw = data.Control(data.ControlDataType.EXIT, self.conf.target_uid)
-		await super().SessionControl(raw, self.conf.uid)
+		await super().SessionControl(raw, target_uid= self.conf.target_uid)
 
 	async def Stream(self, seq_id: str):
 		async for raw in super().Stream(seq_id):

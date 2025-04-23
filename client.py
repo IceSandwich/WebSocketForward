@@ -3,7 +3,7 @@ import argparse as argp
 import data, utils, tunnel, encrypt, time_utils
 
 log = logging.getLogger(__name__)
-utils.SetupLogging(log, "client")
+utils.SetupLogging(log, "client", terminalLevel=logging.DEBUG)
 
 class Configuration:
 	def __init__(self, args):
@@ -93,12 +93,16 @@ class Connection:
 		await self.queue.put(b'') # inform signal
 
 class Client(tunnel.HttpUpgradedWebSocketClient):
-	def __init__(self, config: Configuration):
+	def __init__(self, config: Configuration, cacheQueueSize = 100):
 		self.config = config
 		self.forward_session: aiohttp.ClientSession = None
 
 		# key = seq_id, value = [ isRunning, needSendEndSubstreamPackage ]
 		self.sseTrack: typing.Dict[str, typing.Tuple[bool, bool]] = {}
+
+		# 只记录非control包
+		self.historySendQueue: utils.BoundedQueue[data.Transport] = utils.BoundedQueue(cacheQueueSize)
+		self.historySendQueueLock = asyncio.Lock()
 
 		self.tcpConnections: typing.Dict[str, Connection] = {}
 		super().__init__(f"{config.server}?uid={config.uid}")
@@ -141,18 +145,21 @@ class Client(tunnel.HttpUpgradedWebSocketClient):
 		log.info(f"{self.GetName()}] Receive exit signal. Exit the program.")
 		return False
 	
-	async def OnCtrlRetrievePackage(self, raw: data.Transport, retrieve: data.RetrieveControlMsg):
-		pkg = data.RetrieveControlMsg.From(ctrl.msg)
-		print(f"=== require history {pkg.seq_id} ({pkg.cur_idx}/{pkg.total_cnt})")
-		item = self.FetchHistoryPackage(pkg.seq_id, pkg.cur_idx, pkg.total_cnt)
-		if item is not None:
-			await self.DirectSend(item)
+	async def OnCtrlRetrievePackage(self, raw: data.Transport, pkg: data.RetrieveControlMsg):
+		print(f"=== require history {pkg.pi.seq_id} ({pkg.pi.cur_idx}/{pkg.pi.total_cnt})")
+		found: typing.Optional[data.Transport] = None
+		async with self.historySendQueueLock:
+			for item in self.historySendQueue:
+				if pkg.pi.IsSamePackage(item):
+					found = item
+					break
+		if found is not None:
+			await self.DirectSend(found)
 		else:
-			print(f"=== require history {pkg.seq_id} but cannot find in history. ignore this control pkg.")
+			print(f"=== require history {pkg.pi.seq_id} but cannot find in history. ignore this control pkg.")
 
-		# =========================  ControlDispatcher 实现  ====================
+	# =========================  ControlDispatcher 实现  ====================
 
-	
 	async def DispatchOtherPackage(self, raw: data.Transport):
 		if raw.data_type == data.TransportDataType.REQUEST:
 			await self.processRequestPackage(raw)
@@ -410,6 +417,50 @@ class Client(tunnel.HttpUpgradedWebSocketClient):
 				await self.QueueSend(resp)
 		else: # 关闭连接
 			self.tcpConnections[raw.seq_id].Close()
+
+	async def QueueSend(self, raw: data.Transport):
+		async with self.historySendQueueLock:
+			self.historySendQueue.Add(raw)
+
+			if self.IsConnected():
+				await self.DirectSend(raw)
+
+	async def preMainLoop(self):
+		async with self.historySendQueueLock:
+			hc = data.HistoryClientControlMsg(self.instanceId, True)
+
+			ctrlRaw = data.Transport(
+				data.TransportDataType.CONTROL,
+				data.Control(
+					data.ControlDataType.HISTORY_CLIENT,
+					hc.Serialize()
+				).ToProtobuf(),
+				self.GetUID(),
+				""
+			)
+			await self.DirectSend(ctrlRaw)
+
+			pkg = await self.waitForOnePackage()
+			if pkg.data_type != data.TransportDataType.CONTROL:
+				self.GetLogger().error(f"The first server message must be control, but got {data.TransportDataType.ToString(pkg.data_type)}")
+				raise RuntimeError()
+			ctrlRaw = data.Control.FromProtobuf(pkg.data)
+			if ctrlRaw.data_type != data.ControlDataType.HISTORY_CLIENT:
+				self.GetLogger().error(f"The first server message must be history client control, but got {data.ControlDataType.ToString(ctrlRaw.data_type)}")
+				raise RuntimeError()
+			hc = data.HistoryClientControlMsg.From(ctrlRaw.msg)
+
+			for item in self.historySendQueue:
+				found = False
+				for i in range(len(hc)):
+					if hc[i].IsSamePackage(item):
+						found = True
+						break
+				if not found:
+					await self.DirectSend(item)
+					self.GetLogger().info(f"Resend to server {item.seq_id}")
+
+			self.isConnected = True
 
 async def main(config: Configuration):
 	client = Client(config)

@@ -85,8 +85,10 @@ class ControlDispatcher(Callback):
 		elif pkg.data_type == data.ControlDataType.RETRIEVE_PKG:
 			parsed = data.RetrieveControlMsg.From(pkg.msg)
 			await self.OnCtrlRetrievePackage(raw, parsed)
-		elif pkg.data_type == data.ControlDataType.QUERY_SENDS:
-			await self.OnCtrlQuerySends(raw)
+		elif pkg.data_type == data.ControlDataType.HISTORY_CLIENT:
+			pass
+		# elif pkg.data_type == data.ControlDataType.Qi:
+		# 	await self.OnCtrlQuerySends(raw)
 		else:
 			self.GetLogger().error(f"{self.GetName()}] Received unkown control package {raw.seq_id} - {data.ControlDataType.ToString(pkg.data_type)}")
 			return True
@@ -513,7 +515,7 @@ class TunnelServer(ControlDispatcher):
 		super().__init__(**kwargs)
 	
 	@abc.abstractmethod
-	async def waitForOnePackage(self) -> typing.Optional[data.Transport]:
+	async def waitForOnePackage(self) -> data.Transport:
 		raise NotImplementedError()
 
 	async def OnCtrlQuerySends(self, raw: data.Transport):
@@ -566,30 +568,59 @@ class TunnelServer(ControlDispatcher):
 			if history.GetInstanceId() != self.instanceId: # 此时client已经不是原来的实例了，缓存的包不要发送
 				self.instanceId = history.GetInstanceId()
 				self.cacheSendQueue.Clear()
+
+				raw = data.Transport(
+					data.TransportDataType.CONTROL,
+					data.Control(
+						data.ControlDataType.HISTORY_CLIENT,
+						data.HistoryClientControlMsg(self.instanceId).Serialize()
+					).ToProtobuf(),
+					ctrlRaw.to_uid,
+					ctrlRaw.from_uid,
+					ctrlRaw.seq_id
+				)
+				await self.DirectSend(raw)
 				print("client is new. clear cacheSendQueue.")
 				return
-		
-			if self.cacheSendQueue.IsEmpty(): return
+			
+			if history.IsRetrieve():
+				ret = data.HistoryClientControlMsg(history.instanceId)
+				for item in enumerate(self.cacheSendQueue):
+					ret.Add(data.PackageIdentification.FromTransport(item))
+				
+				raw = data.Transport(
+					data.TransportDataType.CONTROL,
+					data.Control(
+						data.ControlDataType.HISTORY_CLIENT,
+						ret.Serialize()
+					).ToProtobuf(),
+					ctrlRaw.to_uid,
+					ctrlRaw.from_uid,
+					ctrlRaw.seq_id
+				)
+				await self.DirectSend(raw)
+			else:
+				if not self.cacheSendQueue.IsEmpty():
 
-			# 上面client报告了自己收到哪些包。
-			# server发出的包应当client都收到，现在看看server发出的包中client哪些没收到，然后重发。
-			sendMask = [True] * len(self.cacheSendQueue)
-			for iq, item in enumerate(self.cacheSendQueue):
-				for i in range(len(history)):
-					if history[i].IsSamePackage(item):
-						sendMask[iq] = False
-						break
+					# 上面client报告了自己收到哪些包。
+					# server发出的包应当client都收到，现在看看server发出的包中client哪些没收到，然后重发。
+					sendMask = [True] * len(self.cacheSendQueue)
+					for iq, item in enumerate(self.cacheSendQueue):
+						for i in range(len(history)):
+							if history[i].IsSamePackage(item):
+								sendMask[iq] = False
+								break
 
-			self.GetLogger().info(f"{self.GetName()}] Resend {len([x for x in sendMask if x == True])} packages.")
+					self.GetLogger().info(f"{self.GetName()}] Resend {len([x for x in sendMask if x == True])} packages.")
 
-			nowtime = time_utils.GetTimestamp()
-			for iq, item in enumerate(self.cacheSendQueue):
-				if sendMask[iq] == False: continue
-				if time_utils.WithInDuration(item.timestamp, nowtime, self.timeout):
-					await self.DirectSend(item)
-					self.GetLogger().debug(f"{self.GetName()}] Resent {item.seq_id}")
-				else:
-					self.GetLogger().warning(f"{self.GetName()}] Drop resend package {item.seq_id} {data.TransportDataType.ToString(item.data_type)} due to outdated, {item.timestamp} -> {nowtime}.")
+					nowtime = time_utils.GetTimestamp()
+					for iq, item in enumerate(self.cacheSendQueue):
+						if sendMask[iq] == False: continue
+						if time_utils.WithInDuration(item.timestamp, nowtime, self.timeout):
+							await self.DirectSend(item)
+							self.GetLogger().debug(f"{self.GetName()}] Resent {item.seq_id}")
+						else:
+							self.GetLogger().warning(f"{self.GetName()}] Drop resend package {item.seq_id} {data.TransportDataType.ToString(item.data_type)} due to outdated, {item.timestamp} -> {nowtime}.")
 
 			self.isConnected = True # 当释放锁时，如果不设置为True，可能在QueueSend处只缓存不发包。
 
@@ -624,6 +655,15 @@ class HttpUpgradedWebSocketClient(TunnelClient):
 	async def DirectSend(self, raw: data.Transport):
 		await self.handler.send_bytes(raw.ToProtobuf())
 
+	async def waitForOnePackage(self):
+		async for msg in self.handler:
+			if msg.type == aiohttp.WSMsgType.ERROR:
+				self.OnError(self.handler.exception())
+			elif msg.type == aiohttp.WSMsgType.TEXT or msg.type == aiohttp.WSMsgType.BINARY:
+				parsed = data.Transport.FromProtobuf(msg.data)
+				print(f"Got one package: {parsed.seq_id} from {parsed.from_uid}")
+				return parsed
+
 	async def MainLoop(self):
 		curTries = 0
 		exitSignal = False
@@ -638,6 +678,7 @@ class HttpUpgradedWebSocketClient(TunnelClient):
 					curTries = 0 # reset tries
 					await self.preMainLoop()
 					self.isConnected = True
+					print(f"Start mainloop...")
 					async for msg in self.handler:
 						if msg.type == aiohttp.WSMsgType.ERROR:
 							self.OnError(self.handler.exception())
@@ -683,8 +724,8 @@ class HttpUpgradedWebSocketServer(TunnelServer):
 				self.OnError(self.ws.exception())
 			elif msg.type == aiohttp.WSMsgType.TEXT or msg.type == aiohttp.WSMsgType.BINARY:
 				transport = data.Transport.FromProtobuf(msg.data)
+				print(f"Got one package: {transport.seq_id} from {transport.from_uid}")
 				return transport
-		return None
 	
 	async def DirectSend(self, raw: data.Transport):
 		return await self.ws.send_bytes(raw.ToProtobuf())

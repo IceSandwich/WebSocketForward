@@ -154,7 +154,7 @@ class Client(tunnel.HttpUpgradedWebSocketServer):
 			log.error(f"{self.GetName()}] {msg}")
 			await chatroom.Chat(msg, raw.from_uid)
 		else:
-			await chatroom.GetServer(ctrl.msg).QueueSend(raw)
+			await chatroom.GetServer(ctrl.msg).DirectSend(raw)
 
 	async def OnCtrlQueryClients(self, raw: data.Transport):
 		output = chatroom.GetServerInfos()
