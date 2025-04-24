@@ -676,7 +676,9 @@ class HttpUpgradedWebSocketClient(TunnelClient):
 					self.handler = ws
 					await self.OnConnected()
 					curTries = 0 # reset tries
-					await self.preMainLoop()
+					shoudContinue = await self.preMainLoop()
+					if shoudContinue == False:
+						continue
 					self.isConnected = True
 					print(f"Start mainloop...")
 					async for msg in self.handler:

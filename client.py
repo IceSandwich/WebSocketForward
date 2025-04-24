@@ -441,6 +441,8 @@ class Client(tunnel.HttpUpgradedWebSocketClient):
 			await self.DirectSend(ctrlRaw)
 
 			pkg = await self.waitForOnePackage()
+			if pkg == None:
+				return False
 			if pkg.data_type != data.TransportDataType.CONTROL:
 				self.GetLogger().error(f"The first server message must be control, but got {data.TransportDataType.ToString(pkg.data_type)}")
 				raise RuntimeError()
@@ -461,6 +463,7 @@ class Client(tunnel.HttpUpgradedWebSocketClient):
 					self.GetLogger().info(f"Resend to server {item.seq_id}")
 
 			self.isConnected = True
+		return True
 
 async def main(config: Configuration):
 	client = Client(config)
