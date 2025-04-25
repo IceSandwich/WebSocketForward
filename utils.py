@@ -191,7 +191,8 @@ class Timer:
 	
 	async def Stop(self):
 		self.runningSignal = False
-		self.condition.notify_all()
+		async with self.condition:
+			self.condition.notify_all()
 		await self.instance
 
 	async def AddTask(self, task: TimerTask):

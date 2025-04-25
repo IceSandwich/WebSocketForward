@@ -162,6 +162,7 @@ class Server:
 		async with self.sendQueueLock:
 			if hello.info.id != self.clientId:
 				log.info(f"{self.name}] New client instance. Clear histories.")
+				self.clientId = hello.info.id
 				self.sendQueue.Clear()
 				ret = protocol.Control()
 				ret.SetForResponseTransport(pkg)
@@ -169,6 +170,7 @@ class Server:
 				await ws.send_bytes(ret.Pack())
 			elif hello.info.type == protocol.ClientInfo.REMOTE:
 				# Remote will send all send package infos to us, we need to filter out items he didn't receive and resend again.
+				log.info(f"{self.name}] Old client instance. Exchange packages...")
 				now = time_utils.GetTimestamp()
 				for pkg in self.sendQueue:
 					found = False

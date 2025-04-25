@@ -102,6 +102,11 @@ class Client:
 		self.ws: aiohttp.ClientWebSocketResponse = None
 		self.timer = utils.Timer()
 
+		self.exitFunc: typing.Coroutine[typing.Any, typing.Any, typing.Any] = None
+
+	def DefineExitFunc(self, exitFunc: typing.Coroutine[typing.Any, typing.Any, typing.Any]):
+		self.exitFunc = exitFunc
+
 	async def DirectSend(self, raw: protocol.Transport):
 		await self.ws.send_bytes(raw.Pack())
 
@@ -400,6 +405,7 @@ class Client:
 					if initRet is  None:
 						self.ws = ws
 						self.status = self.STATUS_CONNECTED
+						curTries = 0
 						log.info(f"Start mainloop...")
 
 						async for msg in self.ws:
@@ -418,10 +424,12 @@ class Client:
 				curTries += 1
 			else:
 				break
-		bakHandler = self.ws
 		self.ws = None
 		await self.timer.Stop()
-		return bakHandler
+		log.info("Exit client mainloop.")
+		if self.exitFunc is not None:
+			log.info("Invoke exitFunc")
+			await self.exitFunc()
 
 	async def ControlQuery(self):
 		"""
@@ -531,6 +539,14 @@ class HttpServer:
 		self.config = conf
 		self.client = client
 
+		self.client.DefineExitFunc(self.exitFunc)
+		self.site: web.TCPSite = None
+		self.runner: web.AppRunner = None
+
+	async def exitFunc(self):
+		await self.site.stop()
+		await self.runner.shutdown()
+
 	async def processSSE(self, resp: protocol.Response):
 		yield resp.body
 		async for package in self.client.Stream(resp.seq_id):
@@ -578,10 +594,10 @@ class HttpServer:
 		app.router.add_post("/wsf-control/exit", self.handlerControlExit)
 		app.router.add_route('*', '/{tail:.*}', self.MainLoopOnRequest)  # HTTP服务
 		
-		runner = web.AppRunner(app)
-		await runner.setup()
-		site = web.TCPSite(runner, "127.0.0.1", port=self.config.port)
-		await site.start()
+		self.runner = web.AppRunner(app)
+		await self.runner.setup()
+		self.site = web.TCPSite(self.runner, "127.0.0.1", port=self.config.port)
+		await self.site.start()
 		
 		log.info(f"Server started on 127.0.0.1:{self.config.port}")
 		await asyncio.Future()
