@@ -74,26 +74,27 @@ class Chunk:
 		self.total_cnt = total_cnt
 		self.data: typing.List[bytes] = [None] * self.count
 		self.cur_idx = 0
-		self.template: protocol.Transport = None
+		self.template: typing.Union[protocol.Request, protocol.Response] = None
 		self.lock = asyncio.Lock()
 
 	def IsFinish(self):
 		return self.cur_idx >= self.count
 
-	async def Put(self, raw: protocol.Transport):
+	async def Put(self, raw: typing.Union[protocol.Request, protocol.Response, protocol.Subpackage]):
 		if self.IsFinish():
 			raise Exception(f"Chunk] {raw.seq_id} already full(total_cnt={self.total_cnt}, cur_idx={self.cur_idx}).")
 		
 		async with self.lock:
-			self.data[raw.cur_idx - self.start_idx] = raw.data
-			if raw.data_type != data.TransportDataType.SUBPACKAGE:
+			assert raw.body is not None, f"{protocol.Transport.Mappings.ValueToString(raw.transportType)} Package {raw.seq_id}:{raw.cur_idx}/{raw.total_cnt} the body is None which should not happend."
+			self.data[raw.cur_idx - self.start_idx] = raw.body
+			if raw.transportType != protocol.Transport.SUBPACKAGE:
 				self.template = raw
 			
 			self.cur_idx = self.cur_idx + 1
 	
 	def Combine(self):
 		raw = b''.join(self.data)
-		self.template.data = raw
+		self.template.body = raw
 		self.template.cur_idx = 0
 		self.template.total_cnt = 1
 		return self.template

@@ -10,7 +10,7 @@ import argparse as argp
 import heapq
 
 log = logging.getLogger(__name__)
-utils.SetupLogging(log, "remote", terminalLevel=logging.DEBUG)
+utils.SetupLogging(log, "remote", terminalLevel=logging.DEBUG, saveInFile=True)
 
 class Configuration:
 	def __init__(self, args):
@@ -78,6 +78,9 @@ class Client:
 		self.status = self.STATUS_INIT
 		self.instance_id = utils.NewId()
 
+		# 管理分包传输，key为seq_id
+		self.chunks: typing.Dict[str, utils.Chunk] = {}
+
 		# 只记录非control包
 		self.historyRecvQueue: utils.BoundedQueue[protocol.PackageId] = utils.BoundedQueue(self.config.cacheQueueSize)
 		self.historyRecvQueueLock = asyncio.Lock()
@@ -124,14 +127,13 @@ class Client:
 		多个Subpackage，先发送Subpackage，然后最后一个发送源data_type。
 		分包不支持流包的分包，因为分包需要用到序号，而流包的序号有特殊含义和发包顺序。如果你希望序号不变，请使用QueueSend()。
 		"""
-		await self.QueueSend(raw)
-		return
-	
-		raw.Prepack()
-		splitDatas: typing.List[bytes] = [ raw.data[i: i + self.config.safeSegmentSize] for i in range(0, len(raw.data), self.config.safeSegmentSize) ]
+		if raw.body is None:
+			return await self.QueueSend(raw)
+		
+		splitDatas: typing.List[bytes] = [ raw.body[i: i + self.config.safeSegmentSize] for i in range(0, len(raw.body), self.config.safeSegmentSize) ]
 		if len(splitDatas) == 1: #包比较小，单独发送即可
 			return await self.QueueSend(raw)
-		log.debug(f"Transport {raw.seq_id} is too large({len(raw.data)}), will be split into {len(splitDatas)} packages to send.")
+		log.debug(f"Transport {raw.seq_id} is too large({len(raw.body)}), will be split into {len(splitDatas)} packages to send.")
 
 		for i, item in enumerate(splitDatas[:-1]):
 			sp = protocol.Subpackage(self.config.cipher)
@@ -140,16 +142,15 @@ class Client:
 			sp.SetIndex(i, len(splitDatas))
 			sp.SetBody(item)
 
-			log.debug(f"Send subpackage({sp.cur_idx}/{sp.total_cnt}) {sp.seq_id} {len(sp.data)} bytes <<< {repr(sp.body[:50])} ...>>>")
+			log.debug(f"Send subpackage({sp.seq_id}:{sp.cur_idx}/{sp.total_cnt}) - {len(sp.body)} bytes <<< {repr(sp.body[:50])} ...>>>")
 			await self.QueueSend(sp)
 		
 		# 最后一个包，虽然是Resp/Req类型，但是data其实是传输数据的一部分，不是resp、req包。要全部合成一个才能解析成resp、req包。
 		raw.SetBody(splitDatas[-1])
 		raw.SetIndex(len(splitDatas) - 1, -1)
 
-		log.debug(f"Send end subpackage({raw.cur_idx}/{raw.total_cnt}) {raw.seq_id} {len(raw.data)} bytes <<< {repr(raw.body[:50])} ...>>>")
+		log.debug(f"Send end subpackage({raw.seq_id}:{raw.cur_idx}/{raw.total_cnt}) {len(raw.body)} bytes <<< {repr(raw.body[:50])} ...>>>")
 		await self.QueueSend(raw)
-
 
 	async def Session(self, req: protocol.Request) -> protocol.Response:
 		"""
@@ -321,6 +322,30 @@ class Client:
 		
 		return None
 	
+	async def processSubpackage(self, raw: typing.Union[protocol.Request, protocol.Response, protocol.Subpackage]) -> typing.Optional[protocol.Transport]:
+		# 分包规则；前n-1个包为subpackage，最后一个包为resp、req。
+		# 返回None表示Segments还没收全。若收全了返回合并的data.Transport对象。
+		# 单包或者流包直接返回。
+
+		# seq_id not in chunks and total_cnt = 32     =>     new chunk container
+		# seq_id in chunks and total_cnt = 32         =>     save to existed chunk container
+		# seq_id in chunks and total_cnt = -1         =>     end subpackage
+		# seq_id not in chunks and total_cnt = -1     =>     error, should not happend
+		if raw.seq_id not in self.chunks and raw.total_cnt <= 0:
+			log.error(f"Invalid end subpackage {raw.seq_id} not in chunk but has total_cnt {raw.total_cnt}")
+			return None
+		
+		if raw.seq_id not in self.chunks:
+			self.chunks[raw.seq_id] = utils.Chunk(raw.total_cnt, 0)
+		log.debug(f"Receive {raw.seq_id} subpackage({raw.cur_idx}/{raw.total_cnt}) - {len(raw.body)} bytes <<< {repr(raw.body[:50])} ...>>>")
+		await self.chunks[raw.seq_id].Put(raw)
+		if not self.chunks[raw.seq_id].IsFinish():
+			# current package is a subpackage. we should not invoke internal callbacks until all package has received.
+			return None
+		ret = self.chunks[raw.seq_id].Combine()
+		del self.chunks[raw.seq_id]
+		return ret
+	
 	async def OnPackage(self, pkg: typing.Union[protocol.Request, protocol.Response, protocol.Subpackage, protocol.StreamData, protocol.Control]) -> bool:
 		if type(pkg) == protocol.Control:
 			if pkg.controlType == protocol.Control.PRINT:
@@ -343,7 +368,7 @@ class Client:
 					if pkg.total_cnt == -1:
 						log.debug(f"Stream <<<End {pkg.seq_id} {len(pkg.body)} bytes")
 					else:
-						log.debug(f"Stream {pkg.seq_id} - {pkg.cur_idx}-ith - {len(pkg.body)} bytes <<< {repr(pkg.body[:50])} ... >>>")
+						log.debug(f"Stream {pkg.seq_id}:{pkg.cur_idx} - {len(pkg.body)} bytes <<< {repr(pkg.body[:50])} ... >>>")
 
 					heapq.heappush(self.streamHeap[pkg.seq_id], pkg)
 
@@ -353,7 +378,11 @@ class Client:
 					
 					self.streamCondition.notify_all()
 			elif type(pkg) == protocol.Subpackage or pkg.total_cnt == -1:
-				log.error(f"{self.name}] Receive subpackage {pkg.seq_id} but not implement. Help wanted.")
+				combine = await self.processSubpackage(pkg)
+				if combine is not None:
+					async with self.sessionCondition:
+						self.sessionMap[pkg.seq_id] = pkg
+						self.sessionCondition.notify_all()
 			else:
 				async with self.sessionCondition:
 					self.sessionMap[pkg.seq_id] = pkg
@@ -559,6 +588,7 @@ class HttpServer:
 
 async def main(config: Configuration):
 	client = StableDiffusionCachingClient(config)
+	# client = Client(config)
 	httpserver = HttpServer(config, client)
 	await asyncio.gather(client.MainLoop(), httpserver.MainLoop())
 

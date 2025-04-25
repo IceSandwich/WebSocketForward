@@ -10,7 +10,7 @@ import logging
 import argparse as argp
 
 log = logging.getLogger(__name__)
-utils.SetupLogging(log, "server", logging.DEBUG, False)
+utils.SetupLogging(log, "server", logging.INFO, True)
 
 class Configuration:
 	def __init__(self, args):

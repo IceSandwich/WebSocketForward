@@ -9,7 +9,7 @@ import aiohttp.web as web
 import argparse as argp
 
 log = logging.getLogger(__name__)
-utils.SetupLogging(log, "client", terminalLevel=logging.DEBUG)
+utils.SetupLogging(log, "client", terminalLevel=logging.DEBUG, saveInFile=True)
 
 class Configuration:
 	def __init__(self, args):
@@ -138,14 +138,13 @@ class Client:
 		多个Subpackage，先发送Subpackage，然后最后一个发送源data_type。
 		分包不支持流包的分包，因为分包需要用到序号，而流包的序号有特殊含义和发包顺序。如果你希望序号不变，请使用QueueSend()。
 		"""
-		await self.QueueSend(raw)
-		return
-	
-		raw.Prepack()
-		splitDatas: typing.List[bytes] = [ raw.data[i: i + self.config.safeSegmentSize] for i in range(0, len(raw.data), self.config.safeSegmentSize) ]
+		if raw.body is None or len(raw.body) == 0:
+			return await self.QueueSend(raw)
+		
+		splitDatas: typing.List[bytes] = [ raw.body[i: i + self.config.safeSegmentSize] for i in range(0, len(raw.body), self.config.safeSegmentSize) ]
 		if len(splitDatas) == 1: #包比较小，单独发送即可
 			return await self.QueueSend(raw)
-		log.debug(f"Transport {raw.seq_id} is too large({len(raw.data)}), will be split into {len(splitDatas)} packages to send.")
+		log.debug(f"Transport {raw.seq_id} is too large({len(raw.body)}), will be split into {len(splitDatas)} packages to send.")
 
 		for i, item in enumerate(splitDatas[:-1]):
 			sp = protocol.Subpackage(self.config.cipher)
@@ -154,14 +153,14 @@ class Client:
 			sp.SetIndex(i, len(splitDatas))
 			sp.SetBody(item)
 
-			log.debug(f"Send subpackage({sp.cur_idx}/{sp.total_cnt}) {sp.seq_id} {len(sp.data)} bytes <<< {repr(sp.body[:50])} ...>>>")
+			log.debug(f"Send subpackage({sp.seq_id}:{sp.cur_idx}/{sp.total_cnt}) - {len(sp.body)} bytes <<< {repr(sp.body[:50])} ...>>>")
 			await self.QueueSend(sp)
 		
 		# 最后一个包，虽然是Resp/Req类型，但是data其实是传输数据的一部分，不是resp、req包。要全部合成一个才能解析成resp、req包。
 		raw.SetBody(splitDatas[-1])
 		raw.SetIndex(len(splitDatas) - 1, -1)
 
-		log.debug(f"Send end subpackage({raw.cur_idx}/{raw.total_cnt}) {raw.seq_id} {len(raw.data)} bytes <<< {repr(raw.body[:50])} ...>>>")
+		log.debug(f"Send end subpackage({raw.seq_id}:{raw.cur_idx}/{raw.total_cnt}) {len(raw.body)} bytes <<< {repr(raw.body[:50])} ...>>>")
 		await self.QueueSend(raw)
 
 	async def processSSESession(self, req: protocol.Request, resp: aiohttp.ClientResponse):

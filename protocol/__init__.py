@@ -267,7 +267,7 @@ class Subpackage(Transport):
 
 		return super().Pack()
 	
-	EXPECT_TYPE = Transport.CONTROL
+	EXPECT_TYPE = Transport.SUBPACKAGE
 	def Unpack(self, transport: Transport):
 		super().CopyFrom(transport)
 		assert self.transportType == self.EXPECT_TYPE, f"protocol.Subpackage got package {transport.seq_id} indicated as {Transport.Mappings.ValueToString(self.transportType)} which should be {Transport.Mappings.ValueToString(self.EXPECT_TYPE)}."
