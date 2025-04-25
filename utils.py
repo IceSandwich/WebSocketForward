@@ -16,7 +16,7 @@ CONTENTTYPE_UTF8HTML = 'text/html; charset=utf-8'
 # logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 def SetupLogging(log: logging.Logger, id: str, terminalLevel: int = logging.INFO, saveInFile: bool = True):
-	formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+	formatter = logging.Formatter('%(asctime)s - %(filename)s:%(lineno)d - %(levelname)s - %(message)s')
 	log.setLevel(logging.DEBUG)
 
 	chandler = logging.StreamHandler(sys.stdout)
@@ -74,7 +74,7 @@ class Chunk:
 		self.total_cnt = total_cnt
 		self.data: typing.List[bytes] = [None] * self.count
 		self.cur_idx = 0
-		self.template: data.Transport = None
+		self.template: protocol.Transport = None
 		self.lock = asyncio.Lock()
 
 	def IsFinish(self):
@@ -130,23 +130,23 @@ def CompressImage(raw: bytes, target_mimetype: str, quality: int = 75):
 def ComputeCompressRatio(source: int, target: int):
 	return 1.0 - (target / source)
 
-def NewSeqId():
+def NewId():
 	return str(uuid.uuid4())
 
-def SetWSFCompress(req: typing.Union[data.Request, typing.Dict[str, str]],image_type: str = "image/webp", quality: int = 75):
+def SetWSFCompress(req: typing.Union[protocol.Request, typing.Dict[str, str]],image_type: str = "image/webp", quality: int = 75):
 	"""
 	quality设置-1表示这是一个通知信息
 	"""
 	value = f'{image_type}' if quality == -1 else f'{image_type},{quality}'
-	if type(req) == data.Request:
+	if type(req) == protocol.Request:
 		req.headers['WSF-Compress'] = value
 	else:
 		req['WSF-Compress'] = value
 
-def HasWSFCompress(req: data.Request):
+def HasWSFCompress(req: protocol.Request):
 	return 'WSF-Compress' in req.headers
 
-def GetWSFCompress(req: data.Request):
+def GetWSFCompress(req: protocol.Request):
 	"""
 	解析Compress头，返回MIMETYPE和图片质量。
 	注意，调用前请使用HasWSFCompress()确保包含Compress头。
@@ -173,7 +173,7 @@ class TimerTask(abc.ABC):
 	
 class Timer:
 	"""
-	Not a accurate timer.
+	Not an accurate timer.
 	"""
 	def __init__(self):
 		self.tasks: typing.List[TimerTask] = []

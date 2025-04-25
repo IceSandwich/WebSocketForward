@@ -1,6 +1,7 @@
 import encryptor
+import time_utils
 
-import protocol_pb2 as pb
+from . import protocol_pb2 as pb
 import uuid
 import abc
 import typing
@@ -41,11 +42,11 @@ class Transport:
 	UNKNOWN = -1
 
 	Mappings = TypeMapping([
-		[CONTROL, 'CONTROL', pb.TransportDataType.CONTROL],
-		[REQUEST, 'REQUEST', pb.TransportDataType.REQUEST],
-		[RESPONSE, 'RESPONSE', pb.TransportDataType.RESPONSE],
-		[SUBPACKAGE, 'SUBPACKAGE', pb.TransportDataType.SUBPACKAGE],
-		[STREAM_DATA, 'STREAM_DATA', pb.TransportDataType.STREAM_DATA],
+		[CONTROL, 'CONTROL', pb.TransportType.CONTROL],
+		[REQUEST, 'REQUEST', pb.TransportType.REQUEST],
+		[RESPONSE, 'RESPONSE', pb.TransportType.RESPONSE],
+		[SUBPACKAGE, 'SUBPACKAGE', pb.TransportType.SUBPACKAGE],
+		[STREAM_DATA, 'STREAM_DATA', pb.TransportType.STREAM_DATA],
 	])
 
 	def __init__(self, transportType: int):
@@ -55,33 +56,36 @@ class Transport:
 
 		self.seq_id = GenerateSequenceId()
 		self.cur_idx = 0
-		self.total_idx = 1
+		self.total_cnt = 1
 
 		self.data = b''
+
+		self.timestamp = time_utils.GetTimestamp()
 
 	def SetSenderReceiver(self, senderId: str, receiverId: str):
 		self.sender = senderId
 		self.receiver = receiverId
 
-	def SetForResponseTransport(self, transport: Transport):
+	def SetForResponseTransport(self, transport):
 		self.sender = transport.receiver
 		self.receiver = transport.sender
 		self.seq_id = transport.seq_id
 
 	def SetIndex(self, curIdx: int, totalIdx: int):
 		self.cur_idx = curIdx
-		self.total_idx = totalIdx
+		self.total_cnt = totalIdx
 
 	def Pack(self) -> bytes:
 		pid = pb.PackageId()
 		pid.cur_idx = self.cur_idx
-		pid.total_idx = self.total_idx
+		pid.total_cnt = self.total_cnt
+		pid.seq_id = self.seq_id
 
 		ret = pb.Transport()
-		ret.type = TypeMapping.ValueToPB(self.transportType)
+		ret.type = self.Mappings.ValueToPB(self.transportType)
 		ret.sender = self.sender
 		ret.receiver = self.receiver
-		ret.id = pid
+		ret.id.MergeFrom(pid)
 		ret.data = self.data
 		
 		return ret.SerializeToString()
@@ -96,68 +100,79 @@ class Transport:
 		ret.sender = pbt.sender
 		ret.seq_id = pbt.id.seq_id
 		ret.cur_idx = pbt.id.cur_idx
-		ret.total_idx = pbt.id.total_idx
+		ret.total_cnt = pbt.id.total_cnt
 		ret.data = pbt.data
 		return ret
 
-	def CopyFrom(self, transport: Transport):
-		self.transportType = transport.transportType
-		self.sender = transport.sender
-		self.receiver = transport.receiver
-		self.seq_id = transport.seq_id
-		self.cur_idx = transport.cur_idx
-		self.total_idx = transport.total_idx
-		self.data = transport.data
+	def CopyFrom(self, transport):
+		self.transportType: int = transport.transportType
+		self.sender: str = transport.sender
+		self.receiver: str = transport.receiver
+		self.seq_id: str = transport.seq_id
+		self.cur_idx: int = transport.cur_idx
+		self.total_cnt: int = transport.total_cnt
+		self.data: bytes = transport.data
 
 class PackageId:
-	def __init__(self, cur_idx: int = 0, total_idx = 1, seq_id = None):
+	def __init__(self, cur_idx: int = 0, total_cnt = 1, seq_id = None):
 		self.seq_id = GenerateSequenceId() if seq_id is None else seq_id
 		self.cur_idx = cur_idx
-		self.total_idx = total_idx
+		self.total_cnt = total_cnt
 
 	def Pack(self):
+		"""
+		Pack to pb format
+		"""
 		ret = pb.PackageId()
 		ret.seq_id = self.seq_id
 		ret.cur_idx = self.cur_idx
-		ret.total_idx = self.total_idx
+		ret.total_cnt= self.total_cnt
 		return ret
 	
 	@classmethod
 	def Unpack(cls, pkg):
+		"""
+		Unpack from pb format
+		"""
 		ret = PackageId()
 		ret.seq_id = pkg.seq_id
 		ret.cur_idx = pkg.cur_idx
-		ret.total_idx = pkg.total_idx
+		ret.total_cnt = pkg.total_cnt
 		return ret
 	
 	def IsSamePackage(self, raw: Transport):
 		return raw.seq_id == self.seq_id and raw.cur_idx == self.cur_idx and raw.total_cnt == self.total_cnt
+	
+	@classmethod
+	def FromPackage(cls, raw: Transport):
+		ret = PackageId()
+		ret.seq_id = raw.seq_id
+		ret.cur_idx = raw.cur_idx
+		ret.total_cnt = raw.total_cnt
+		return ret
 
 class Request(Transport):
 	def __init__(self, encrypt: typing.Optional[encryptor.Cipher] = None):
 		super().__init__(Transport.REQUEST)
 		self.url = ""
 		self.method = ""
-		self.headers = ""
+		self.headers: typing.Dict[str, str] = {}
 		self.body = None
 		self.encrypt = encrypt
 
-	def Init(self, url: str, method: str, headers: typing.Union[str, typing.Dict[str, str]]):
+	def Init(self, url: str, method: str, headers: typing.Dict[str, str]):
 		self.url = url
 		self.method = method
-		if isinstance(headers, str):
-			self.headers = headers
-		else:
-			self.headers = json.dumps(headers)
+		self.headers = headers
 
 	def SetBody(self, body: typing.Optional[bytes]):
 		self.body = body
 
-	def Pack(self) -> bytes:
+	def Prepack(self):
 		req = pb.Request()
 		req.url = self.url
 		req.method = self.method
-		req.headers = self.headers
+		req.headers = json.dumps(self.headers)
 		if self.body is not None:
 			req.body = self.body
 		
@@ -166,6 +181,9 @@ class Request(Transport):
 			reqBytes = self.encrypt.Encrypt(reqBytes)
 		
 		self.data = reqBytes
+
+	def Pack(self) -> bytes:
+		self.Prepack()
 		return super().Pack()
 	
 	def Unpack(self, transport: Transport):
@@ -180,7 +198,7 @@ class Request(Transport):
 		pbt.ParseFromString(data)
 		self.url = pbt.url
 		self.method = pbt.method
-		self.headers = pbt.headers
+		self.headers = json.loads(pbt.headers)
 		self.body = pbt.body
 
 class Response(Transport):
@@ -188,24 +206,24 @@ class Response(Transport):
 		super().__init__(Transport.RESPONSE)
 		self.url = ""
 		self.status = -1
-		self.headers = ""
+		self.headers: typing.Dict[str, str] = {}
 		self.body = b''
 		self.encrypt = encrypt
 
-	def Init(self, url: str, status: int, headers: typing.Union[str, typing.Dict[str, str]], body: bytes = b''):
+	def Init(self, url: str, status: int, headers: typing.Dict[str, str], body: bytes = b''):
 		self.url = url
 		self.status = status
-		if isinstance(headers, str):
-			self.headers = headers
-		else:
-			self.headers = json.dumps(headers)
+		self.headers = headers
 		self.body = body
 
-	def Pack(self) -> bytes:
+	def SetBody(self, body: typing.Optional[bytes]):
+		self.body = body
+
+	def Prepack(self):
 		res = pb.Response()
 		res.url = self.url
 		res.status = self.status
-		res.headers = self.headers
+		res.headers = json.dumps(self.headers)
 		res.body = self.body
 
 		resBytes: bytes = res.SerializeToString()
@@ -213,6 +231,9 @@ class Response(Transport):
 			resBytes = self.encrypt.Encrypt(resBytes)
 
 		self.data = resBytes
+
+	def Pack(self) -> bytes:
+		self.Prepack()
 		return super().Pack()
 	
 	def Unpack(self, transport: Transport):
@@ -227,7 +248,7 @@ class Response(Transport):
 		pbt.ParseFromString(data)
 		self.url = pbt.url
 		self.status = pbt.status
-		self.headers = pbt.headers
+		self.headers = json.loads(pbt.headers)
 		self.body = pbt.body
 
 class Subpackage(Transport):
@@ -246,22 +267,28 @@ class Subpackage(Transport):
 
 		return super().Pack()
 	
+	EXPECT_TYPE = Transport.CONTROL
 	def Unpack(self, transport: Transport):
 		super().CopyFrom(transport)
-		assert self.transportType == Transport.SUBPACKAGE, f"protocol.Subpackage got package indicated as {Transport.Mappings.ValueToString(self.transportType)} which should be {Transport.Mappings.ValueToString(Transport.SUBPACKAGE)}."
+		assert self.transportType == self.EXPECT_TYPE, f"protocol.Subpackage got package {transport.seq_id} indicated as {Transport.Mappings.ValueToString(self.transportType)} which should be {Transport.Mappings.ValueToString(self.EXPECT_TYPE)}."
 
 		self.body = self.data
 		if self.encrypt is not None:
 			self.body = self.encrypt.Decrypt(self.body)
 
 class StreamData(Subpackage):
+	EXPECT_TYPE = Transport.STREAM_DATA
 	def __init__(self, encrypt: typing.Optional[encryptor.Cipher] = None):
 		super().__init__(encrypt)
 		self.transportType = Transport.STREAM_DATA
 
+	def __lt__(self, other):
+		return self.cur_idx < other.cur_idx
+
 class ClientInfo:
 	CLIENT = 0
 	REMOTE = 1
+	UNKNOWN = -1
 
 	def __init__(self, clientId: str, clientType: int):
 		self.id = clientId
@@ -294,8 +321,9 @@ class HelloClientControl:
 
 	def Pack(self):
 		pbt = pb.HelloClientControl()
-		pbt.info = self.info
-		pbt.pkgs = [ x.Pack() for x in self.pkgs ]
+		pbt.info.id = self.info.id
+		pbt.info.type = self.info.type
+		pbt.pkgs.extend([ x.Pack() for x in self.pkgs ])
 		return pbt
 	
 	@classmethod
@@ -304,7 +332,7 @@ class HelloClientControl:
 		pbt.ParseFromString(data)
 		
 		ret = HelloClientControl(ClientInfo(pbt.info.id, pbt.info.type))
-		ret.pkgs = [ PackageId.Unpack(x) for x in pbt.pkgs ]
+		ret.pkgs.extend([ PackageId.Unpack(x) for x in pbt.pkgs ])
 		return ret
 
 class HelloServerControl:
@@ -322,10 +350,13 @@ class HelloServerControl:
 	def AppendPkg(self, pkg: PackageId):
 		self.pkgs.append(pkg)
 
+	def IsEmpty(self):
+		return len(self.clients) == 0 and len(self.pkgs) == 0
+
 	def Pack(self):
 		pbt = pb.HelloServerControl()
-		pbt.clients = [ x.Pack() for x in self.clients ]
-		pbt.pkgs = [ x.Pack() for x in self.pkgs ]
+		pbt.clients.extend([ x.Pack() for x in self.clients ])
+		pbt.pkgs.extend([ x.Pack() for x in self.pkgs ])
 		return pbt
 	
 	@classmethod
@@ -345,10 +376,16 @@ class QueryClientsControl:
 	def Append(self, client: ClientInfo):
 		self.connected.append(client)
 
+	def __len__(self):
+		return len(self.connected)
+
 	def Pack(self):
 		pbt = pb.QueryClientsControl()
-		pbt.connected = [ x.Pack() for x in self.connected ]
+		pbt.connected.extend([ x.Pack() for x in self.connected ])
 		return pbt
+	
+	def __iter__(self):
+		return iter(self.connected)
 	
 	@classmethod
 	def Unpack(cls, data: bytes):
@@ -358,12 +395,13 @@ class QueryClientsControl:
 		ret = QueryClientsControl()
 		ret.connected = [ ClientInfo.Unpack(x) for x in pbt.connected   ]
 		return ret
-
+	
 class Control(Transport):
 	HELLO = 0
 	QUERY_CLIENTS = 1
 	QUIT_SIGNAL = 2
 	PRINT = 3
+	RETRIEVE_PKG = 4
 	UNKNOWN = -1
 
 	Mapping = TypeMapping([
@@ -409,11 +447,29 @@ class Control(Transport):
 		self.controlType = Control.PRINT
 		self.body = msg.encode('utf-8')
 
-	def ToPrintControl(self):
-		assert self.controlType == Control.PRINT, f'ToPrintControl() require controlType  == {Control.PRINT} but got {self.controlType}'
+	def DecodePrintMsg(self):
+		assert self.controlType == Control.PRINT, f'DecodePrintMsg() require controlType == {Control.PRINT} but got {self.controlType}'
 		return self.body.decode('utf-8')
+	
+	def InitRetrievePkg(self, pkg: PackageId):
+		self.controlType = Control.RETRIEVE_PKG
+		self.body = pkg.Pack().SerializeToString()
 
+	def DecodeRetrievePkg(self):
+		assert self.controlType == Control.RETRIEVE_PKG, f'DecodeRetrievePkg() require controlType == {Control.RETRIEVE_PKG} but got {self.controlType}'
+		ret = pb.PackageId()
+		ret.ParseFromString(self.body)
+		return PackageId.Unpack(ret)
+	
+	def InitQuitSignal(self):
+		self.controlType = Control.QUIT_SIGNAL
+		
 	def Pack(self) -> bytes:
+		pbt = pb.Control()
+		pbt.type = self.Mapping.ValueToPB(self.controlType)
+		pbt.data = self.body
+
+		self.data = pbt.SerializeToString()
 		return super().Pack()
 	
 	def Unpack(self, transport: Transport):

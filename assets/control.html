@@ -1,0 +1,83 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>远程控制面板</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            padding: 20px;
+        }
+        #status {
+            font-weight: bold;
+            margin-bottom: 20px;
+        }
+        #status.connected {
+            color: green;
+        }
+        #status.disconnected {
+            color: red;
+        }
+        button {
+            padding: 10px 20px;
+            font-size: 16px;
+            cursor: pointer;
+            background-color: #f44336;
+            color: white;
+            border: none;
+            border-radius: 5px;
+        }
+        button:disabled {
+            background-color: #ccc;
+        }
+    </style>
+</head>
+<body>
+
+    <h1>WebSocketForward 控制面板</h1>
+    
+    <div id="status" class="disconnected">当前状态：未连接</div>
+    
+    <button id="quitButton" onclick="quitRemoteProgram()" disabled>关闭远程程序</button>
+
+    <script>
+        // 每3秒查询一次远程程序是否连接
+        function checkConnection() {
+            fetch('/wsf-control/query')
+                .then(response => response.json())
+                .then(data => {
+                    const statusElement = document.getElementById('status');
+                    const quitButton = document.getElementById('quitButton');
+                    
+                    if (data.connected) {
+                        statusElement.textContent = '当前状态：已连接';
+                        statusElement.classList.remove('disconnected');
+                        statusElement.classList.add('connected');
+                        quitButton.disabled = false; // 启用关闭按钮
+                    } else {
+                        statusElement.textContent = '当前状态：未连接';
+                        statusElement.classList.remove('connected');
+                        statusElement.classList.add('disconnected');
+                        quitButton.disabled = true; // 禁用关闭按钮
+                    }
+                })
+                .catch(error => {
+                    console.error('连接检查失败:', error);
+                });
+        }
+
+        // 关闭远端程序
+        function quitRemoteProgram() {
+            fetch('/wsf-control/exit', {
+                method: 'POST' // 假设远程关闭程序使用POST方法
+            })
+        }
+
+        // 启动连接检查
+        setInterval(checkConnection, 5000);
+        checkConnection(); // 初次检查
+    </script>
+
+</body>
+</html>
