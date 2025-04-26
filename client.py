@@ -290,6 +290,7 @@ class Client:
 					if initRet is  None:
 						self.ws = ws
 						self.status = self.STATUS_CONNECTED
+						curTries = 0
 						log.info(f"Start mainloop...")
 
 						async for msg in self.ws:

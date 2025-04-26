@@ -326,6 +326,9 @@ class HelloClientControl:
 		pbt.pkgs.extend([ x.Pack() for x in self.pkgs ])
 		return pbt
 	
+	def __len__(self):
+		return len(self.pkgs)
+	
 	@classmethod
 	def Unpack(cls, data: bytes):
 		pbt = pb.HelloClientControl()

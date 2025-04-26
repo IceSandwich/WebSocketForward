@@ -101,6 +101,7 @@ class Server:
 				transport = protocol.Parse(msg.data)
 				log.debug(f"{self.name}] Got one package: {transport.seq_id}:{protocol.Transport.Mappings.ValueToString(transport.transportType)} from {transport.sender}")
 				return transport
+		log.error(f"{self.name}] WS Broken.")
 		return None
 	
 	async def DirectSend(self, transport: protocol.Transport):
@@ -171,6 +172,14 @@ class Server:
 			elif hello.info.type == protocol.ClientInfo.REMOTE:
 				# Remote will send all send package infos to us, we need to filter out items he didn't receive and resend again.
 				log.info(f"{self.name}] Old client instance. Exchange packages...")
+
+				ret = protocol.Control()
+				ret.SetForResponseTransport(pkg)
+				ret.InitHelloServerControl(protocol.HelloServerControl())
+				await ws.send_bytes(ret.Pack())
+				await asyncio.sleep(time_utils.Seconds(1))
+
+				log.info(f"{self.name}] Resend process... Check {len(self.sendQueue)} packages.")
 				now = time_utils.GetTimestamp()
 				for pkg in self.sendQueue:
 					found = False
@@ -180,26 +189,30 @@ class Server:
 					if not found:
 						if time_utils.WithInDuration(pkg.timestamp, now, self.config.timeout):
 							log.debug(f"{self.name}] Resend package {pkg.seq_id}")
-							await self.ws.send_bytes(pkg.Pack())
+							await ws.send_bytes(pkg.Pack())
 						else:
 							log.warning(f"{self.name}] Package {pkg.seq_id} skip resend because it's out-dated({now} - {pkg.timestamp} = {now - pkg.timestamp} > {self.config.timeout}).")
 				
-				ret = protocol.Control()
-				ret.SetForResponseTransport(pkg)
-				ret.InitHelloServerControl(protocol.HelloServerControl())
-				await ws.send_bytes(ret.Pack())
 			elif hello.info.type == protocol.ClientInfo.CLIENT:
 				# Client will query all receive package infos from server, so we need to send the package infos to it.
+				log.info(f"{self.name}] Old client instance. Exchange packages...")
+
 				ret = protocol.Control()
 				ret.SetForResponseTransport(pkg)
 				hsc = protocol.HelloServerControl()
 				async with self.receiveQueueLock:
+					log.info(f"{self.name}] Resend process... Check {len(self.receiveQueue)} packages.")
 					for pkg in self.receiveQueue:
 						hsc.AppendPkg(pkg)
+				log.debug(f"{self.name}] Hello contains {len(hsc)} packages received by Server.")
 				ret.InitHelloServerControl(hsc)
 				await ws.send_bytes(ret.Pack())
+				await asyncio.sleep(time_utils.Seconds(1))
 			else:
-				raise Exception(f"Invalid hello type {hello.info.type}")
+				log.error(f"{self.name}] Invalid hello type {hello.info.type}")
+				self.status = self.STATUS_INIT
+				return ws
+				# raise Exception(f"Invalid hello type {hello.info.type}")
 			
 			self.ws = ws
 			self.status = self.STATUS_CONNECTED
@@ -253,21 +266,26 @@ class Server:
 			await self.router.Route(raw)
 
 	async def OnConnected(self):
+		log.info(f"{self.name}] Connected.")
 		await self.router.SendMsg("", f"{self.name}] Connected.", skip=[self.name])
 
 	async def OnDisconnected(self):
+		log.info(f"{self.name}] Disconnected.")
 		await self.router.SendMsg("", f"{self.name}] Disconnected.", skip=[self.name])
 
 	async def MainLoop(self, request: web.BaseRequest):
 		ws = web.WebSocketResponse(max_msg_size=self.WebSocketMaxReadingMessageSize, heartbeat=None if self.HttpUpgradeHearbeatDuration == 0 else self.HttpUpgradeHearbeatDuration, autoping=True)
 
 		self.status = self.STATUS_PREPARING
+		log.debug(f"{self.name}] Preparing...")
 		await ws.prepare(request)
 
 		self.status = self.STATUS_INITIALIZING
+		log.debug(f"{self.name}] Initializing...")
 		prepareRet = await self.initialize(ws)
 		if prepareRet is not None:
 			self.status = self.STATUS_INIT
+			log.debug(f"{self.name}] Failed to initialize. Return to init status.")
 			return prepareRet
 
 		self.ws = ws
@@ -289,6 +307,7 @@ class Server:
 			
 		self.status = self.STATUS_INIT
 		await self.OnDisconnected()
+		log.debug(f"{self.name}] Disconnected. Return to init status.")
 		self.ws = None
 		return ws
 
@@ -341,8 +360,10 @@ async def main(config: Configuration):
 				status=403
 			)
 		uid = request.query['uid']
+		log.debug(f"App] Connect request from {uid}")
 		server = await chatroom.GetOrNewServer(uid, config = config)
 		if server.GetStatus() != Server.STATUS_INIT:
+			log.error(f"{uid}] Already connected. current status: {server.GetStatus()}")
 			return web.Response(
 				body='Already connected.',
 				status=403

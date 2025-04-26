@@ -147,14 +147,14 @@ class Client:
 			sp.SetIndex(i, len(splitDatas))
 			sp.SetBody(item)
 
-			log.debug(f"Send subpackage({sp.seq_id}:{sp.cur_idx}/{sp.total_cnt}) - {len(sp.body)} bytes <<< {repr(sp.body[:50])} ...>>>")
+			log.debug(f"Subpackage {sp.seq_id}:{sp.cur_idx}/{sp.total_cnt} - {len(sp.body)} bytes <<< {repr(sp.body[:30])} ...>>> -> {sp.receiver}")
 			await self.QueueSend(sp)
 		
 		# 最后一个包，虽然是Resp/Req类型，但是data其实是传输数据的一部分，不是resp、req包。要全部合成一个才能解析成resp、req包。
 		raw.SetBody(splitDatas[-1])
 		raw.SetIndex(len(splitDatas) - 1, -1)
 
-		log.debug(f"Send end subpackage({raw.seq_id}:{raw.cur_idx}/{raw.total_cnt}) {len(raw.body)} bytes <<< {repr(raw.body[:50])} ...>>>")
+		log.debug(f"Subpackage {raw.seq_id}:{raw.cur_idx}/{raw.total_cnt} - {len(raw.body)} bytes <<< {repr(raw.body[-30:])} ...>>> -x> {sp.receiver}")
 		await self.QueueSend(raw)
 
 	async def Session(self, req: protocol.Request) -> protocol.Response:
@@ -162,6 +162,7 @@ class Client:
 		发送一个req，等待回应一个resp。适合于非流的数据传输。
 		"""
 		req.SetSenderReceiver(self.config.uid, self.config.target_uid)
+		log.debug(f"Request {req.url} {req.method} { 0 if req.body is None else len(req.body)} bytes -> {req.receiver}")
 		await self.QueueSendSmartSegments(req)
 
 		async with self.sessionCondition:
@@ -170,18 +171,22 @@ class Client:
 			del self.sessionMap[req.seq_id]
 
 			assert resp.transportType == protocol.Transport.RESPONSE, f"Session {req.seq_id} only accept Response package but got {protocol.Transport.Mappings.ValueToString(resp.transportType)}"
+			resp: protocol.Response
+			log.debug(f"Response {resp.url} {resp.status} {len(resp.body)} bytes <- {resp.sender}")
 			return resp
 		
 	async def SessionControl(self, raw: protocol.Control):
 		"""
 		SessionControl使用的是DirectSend而非QueueSend。
 		"""
+		log.debug(f"SessionControl {protocol.Control.Mapping.ValueToString(raw.controlType)} -> {raw.receiver}")
 		await self.DirectSend(raw)
 
 		async with self.controlSessionCondition:
 			await self.controlSessionCondition.wait_for(lambda: raw.seq_id in self.controlSessionMap)
 			resp = self.controlSessionMap[raw.seq_id]
 			del self.controlSessionMap[raw.seq_id]
+			log.debug(f"SessionControl {protocol.Control.Mapping.ValueToString(resp.controlType)} <- {resp.sender}")
 			return resp
 		
 	STREAM_STATE_NONE = 0
@@ -216,12 +221,12 @@ class Client:
 				if self.streamHeap[seq_id][0].cur_idx != expectIdx:
 					# 过旧的包
 					if self.streamHeap[seq_id][0].cur_idx < expectIdx:
-						log.warning(f"Receive older stream package {seq_id}, the expected one is {expectIdx}, and received is {self.streamHeap[seq_id][0].cur_idx}. Drop it.")
+						log.warning(f"Stream {seq_id}:{self.streamHeap[seq_id][0].cur_idx} < {expectIdx} - Drop this older package.")
 						heapq.heappop(self.streamHeap[seq_id]) # drop
 						continue
 
 					# 过新的包
-					log.warning(f"Stream {seq_id} expect {expectIdx} but heap: {[x.cur_idx for x in self.streamHeap[seq_id]]}. Wait for it or require resend after timeout.")
+					log.warning(f"Stream {seq_id}:{self.streamHeap[seq_id][0].cur_idx} > {expectIdx} - Receive this newer package, current heap: {[x.cur_idx for x in self.streamHeap[seq_id]]}.")
 					if state == self.STREAM_STATE_NONE:
 						async with stateLock:
 							state = self.STREAM_STATE_WAIT_TO_RETRIEVE
@@ -230,7 +235,7 @@ class Client:
 							cb = RetrieveTimerCallback()
 							stateTimestamp = cb.GetTimestamp()
 						await self.timer.AddTask(cb)
-						print(f"Stream {seq_id} change from none to wait to retrieve")
+						print(f"Stream {seq_id} - Start timer, wait for {expectIdx}")
 						continue
 					elif state == self.STREAM_STATE_WAIT_TO_RETRIEVE:
 						# 等待期间避免占用cpu
@@ -239,11 +244,11 @@ class Client:
 						self.streamCondition.release() # 在这等待的1s内依然可以往队列加内容
 						await asyncio.sleep(time_utils.Seconds(1))
 						await self.streamCondition.acquire()
-						print(f"Stream {seq_id} still waitting")
+						print(f"Stream {seq_id} - Still waitting {expectIdx}")
 						continue
 					elif state == self.STREAM_STATE_SHOULD_RETRIEVE:
 						if sendRetreveTimes <= self.config.streamRetrieveTimes:
-							print(f"Stream  {seq_id} send retrieve request, cur times: {sendRetreveTimes}")
+							print(f"Stream {seq_id} - Send retrieve request, cur times: {sendRetreveTimes}")
 							raw = protocol.Control()
 							raw.SetForResponseTransport(self.streamHeap[seq_id][0])
 							raw.InitRetrievePkg(protocol.PackageId(
@@ -255,10 +260,9 @@ class Client:
 							sendRetreveTimes = sendRetreveTimes + 1
 							continue
 						else:
-							log.error(f"Stream {seq_id} try to retrieve {expectIdx} in {sendRetreveTimes} times but still cannot get the sequence idx {expectIdx}, heap: {[x.cur_idx for x in self.streamHeap[seq_id]]}. Pop one anyway.")
+							log.error(f"Stream {seq_id} - Failed to retrieve {expectIdx} in {sendRetreveTimes} times, current heap: {[x.cur_idx for x in self.streamHeap[seq_id]]}. Pop one anyway.")
 
 				# 重置计数器
-				print(f"Stream {seq_id} reset every things, cur {expectIdx}")
 				sendRetreveTimes = 0
 				async with stateLock:
 					state = self.STREAM_STATE_NONE
@@ -266,9 +270,11 @@ class Client:
 
 				item = heapq.heappop(self.streamHeap[seq_id])
 				expectIdx = expectIdx + 1
-				# print(f"SSE pop stream {seq_id} - {item.cur_idx}")
 				if item.total_cnt == -1:
+					print(f"Stream {seq_id}:{item.cur_idx} <x- {item.sender}")
 					del self.streamHeap[seq_id]
+				else:
+					print(f"Stream {seq_id}:{item.cur_idx} <- {item.sender}")
 			yield item
 			if item.total_cnt == -1:
 				break
@@ -277,11 +283,12 @@ class Client:
 	async def waitForOnePackage(self, ws: web.WebSocketResponse):
 		async for msg in ws:
 			if msg.type == aiohttp.WSMsgType.ERROR:
-				log.error(f"{self.name}] Error on waiting 1 package: {ws.exception()}")
+				log.error(f"1Pkg] Error: {ws.exception()}")
 			elif msg.type == aiohttp.WSMsgType.TEXT or msg.type == aiohttp.WSMsgType.BINARY:
 				transport = protocol.Parse(msg.data)
-				log.debug(f"{self.name}] Got one package: {transport.seq_id}:{protocol.Transport.Mappings.ValueToString(transport.transportType)} from {transport.sender}")
+				log.debug(f"1Pkg] {protocol.Transport.Mappings.ValueToString(transport.transportType)} {transport.seq_id}:{transport.cur_idx}/{transport.total_cnt} <- {transport.sender}")
 				return transport
+		log.error(f"1Pkg] WS broken.")
 		return None
 
 	async def initialize(self, ws: web.WebSocketResponse):
@@ -289,39 +296,42 @@ class Client:
 			hcc = protocol.HelloClientControl(protocol.ClientInfo(self.instance_id, protocol.ClientInfo.REMOTE))
 			for pkg in self.historyRecvQueue:
 				hcc.Append(pkg)
+			log.debug(f"Initialize] Hello contains {len(hcc)} package descriptions.")
 			ctrl = protocol.Control()
 			ctrl.InitHelloClientControl(hcc)
 			await ws.send_bytes(ctrl.Pack())
 
 			pkg = await self.waitForOnePackage(ws)
 			if pkg is None:
-				log.error(f"{self.name}] Broken ws connection in initialize stage.")
+				log.error(f"Initialize] Broken ws connection in initialize stage.")
 				self.status = self.STATUS_INIT
 				return ws
 			if type(pkg) != protocol.Control:
-				log.error(f"{self.name}] First client package must be control package, but got {protocol.Transport.Mappings.ValueToString(pkg.transportType)}.")
+				log.error(f"Initialize] First package {pkg.seq_id}:{pkg.cur_idx}/{pkg.total_cnt} is {protocol.Transport.Mappings.ValueToString(pkg.transportType)} which should be {protocol.Transport.Mappings.ValueToString(protocol.Transport.CONTROL)}.")
 				self.status = self.STATUS_INIT
 				return ws
 			if pkg.controlType == protocol.Control.PRINT: # error msg from server
-				log.error(f"{self.name}] Error from server: {pkg.DecodePrintMsg()}")
+				log.error(f"Initialize] Error from server: {pkg.DecodePrintMsg()}")
 				self.status = self.STATUS_INIT
 				return ws
 			if pkg.controlType != protocol.Control.HELLO:
-				log.error(f"{self.name}] First client control package must be HELLO, but got {protocol.Control.Mappings.ValueToString(pkg.controlType)}.")
+				log.error(f"Initialize] First control package {pkg.seq_id}:{pkg.cur_idx}/{pkg.total_cnt} is {protocol.Control.Mappings.ValueToString(pkg.controlType)} which should be {protocol.Control.Mapping.ValueToString(protocol.Control.HELLO)}.")
 				self.status = self.STATUS_INIT
 				return ws
 			hello = pkg.ToHelloServerControl()
 
 			now = time_utils.GetTimestamp()
 			async with self.sendQueueLock:
+				log.debug(f"Initialize] Check {len(self.sendQueue)} packages to resend.")
 				for item in self.sendQueue:
 					if time_utils.WithInDuration(item.timestamp, now, self.config.timeout):
-						log.debug(f"{self.name}] Resend package {item.seq_id}")
+						log.debug(f"Initialize] Resend package {item.seq_id}")
 						await ws.send_bytes(item.Pack())
 					else:
-						log.warning(f"{self.name}] Package {item.seq_id} skip resend because it's out-dated({now} - {item.timestamp} = {now - item.timestamp} > {self.config.timeout}).")
+						log.warning(f"Initialize] Package {item.seq_id} skip resend because it's out-dated({now} - {item.timestamp} = {now - item.timestamp} > {self.config.timeout}).")
 				self.sendQueue.Clear()
 
+				log.debug(f"Initialize] Done.")
 				self.ws = ws
 				self.status = self.STATUS_CONNECTED
 		
@@ -352,6 +362,7 @@ class Client:
 		return ret
 	
 	async def OnPackage(self, pkg: typing.Union[protocol.Request, protocol.Response, protocol.Subpackage, protocol.StreamData, protocol.Control]) -> bool:
+		log.debug(f"Recv] {protocol.Transport.Mappings.ValueToString(pkg.transportType)} {pkg.seq_id}:{pkg.cur_idx}/{pkg.total_cnt} <- {pkg.sender}")
 		if type(pkg) == protocol.Control:
 			if pkg.controlType == protocol.Control.PRINT:
 				log.info(f"% {pkg.DecodePrintMsg()}")
@@ -360,7 +371,7 @@ class Client:
 					self.controlSessionMap[pkg.seq_id] = pkg
 					self.controlSessionCondition.notify_all()
 			else:
-				log.error(f"{self.name}] Unsupported control type({protocol.Control.Mapping.ValueToString(pkg.controlType)})")
+				log.error(f"Recv] Unsupported control type({protocol.Control.Mapping.ValueToString(pkg.controlType)})")
 		else:
 			async with self.historyRecvQueueLock:
 				self.historyRecvQueue.Add(protocol.PackageId.FromPackage(pkg))
@@ -370,15 +381,10 @@ class Client:
 					if pkg.seq_id not in self.streamHeap:
 						self.streamHeap[pkg.seq_id] = []
 
-					if pkg.total_cnt == -1:
-						log.debug(f"Stream <<<End {pkg.seq_id} {len(pkg.body)} bytes")
-					else:
-						log.debug(f"Stream {pkg.seq_id}:{pkg.cur_idx} - {len(pkg.body)} bytes <<< {repr(pkg.body[:50])} ... >>>")
-
 					heapq.heappush(self.streamHeap[pkg.seq_id], pkg)
 
 					if len(self.streamHeap[pkg.seq_id]) > self.config.maxHeapSSEBufferSize:
-						log.warning(f"Stream {pkg.seq_id} seems dead. Drop cache packages. headq: {[x.cur_idx for x in self.streamHeap[pkg.seq_id]]}")
+						log.warning(f"Recv] Stream {pkg.seq_id} seems dead. Drop cache packages. headq: {[x.cur_idx for x in self.streamHeap[pkg.seq_id]]}")
 						del self.streamHeap[pkg.seq_id]
 					
 					self.streamCondition.notify_all()
@@ -401,6 +407,7 @@ class Client:
 			async with aiohttp.ClientSession() as session:
 				async with session.ws_connect(self.url, headers=self.HttpUpgradedWebSocketHeaders, max_msg_size=self.WebSocketMaxReadingMessageSize) as ws:
 					self.status = self.STATUS_INITIALIZING
+					log.info(f"Initializing...")
 					initRet = await self.initialize(ws)
 					if initRet is  None:
 						self.ws = ws
@@ -410,7 +417,7 @@ class Client:
 
 						async for msg in self.ws:
 							if msg.type == aiohttp.WSMsgType.ERROR:
-								log.error(f"{self.name}] WSException: {self.ws.exception()}")
+								log.error(f"Tunnel] Exception: {self.ws.exception()}")
 							elif msg.type == aiohttp.WSMsgType.TEXT or msg.type == aiohttp.WSMsgType.BINARY:
 								parsed = protocol.Parse(msg.data, self.config.cipher)
 								shouldRuninng = await self.OnPackage(parsed)
@@ -420,7 +427,7 @@ class Client:
 			
 			self.status = self.STATUS_INIT
 			if exitSignal == False:
-				log.info(f"{self.name}] Reconnecting({curTries}/{self.config.maxRetries})...")
+				log.info(f"Tunnel] Reconnecting({curTries}/{self.config.maxRetries})...")
 				curTries += 1
 			else:
 				break
@@ -554,6 +561,7 @@ class HttpServer:
 
 	async def MainLoopOnRequest(self, request: web.BaseRequest):
 		# 提取请求的相关信息
+		log.info(f"Browser] Request {request.url.path_qs} {request.method}")
 		req = protocol.Request(self.config.cipher)
 		req.Init(self.config.prefix + str(request.url.path_qs), request.method, dict(request.headers))
 		req.SetBody(await request.read() if request.can_read_body else None)
