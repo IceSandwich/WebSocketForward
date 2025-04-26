@@ -83,6 +83,8 @@ class Server:
 		self.clientId = ""
 		self.clientType = protocol.ClientInfo.UNKNOWN
 
+		self.scheduleSendQueue: asyncio.Queue[protocol.Transport] = asyncio.Queue()
+
 	def GetStatus(self):
 		return self.status
 	
@@ -96,12 +98,12 @@ class Server:
 	async def waitForOnePackage(self, ws: web.WebSocketResponse):
 		async for msg in ws:
 			if msg.type == aiohttp.WSMsgType.ERROR:
-				log.error(f"{self.name}] Error on waiting 1 package: {ws.exception()}")
+				log.error(f"{self.name}]1Pkg] Error on waiting 1 package: {ws.exception()}")
 			elif msg.type == aiohttp.WSMsgType.TEXT or msg.type == aiohttp.WSMsgType.BINARY:
-				transport = protocol.Parse(msg.data)
-				log.debug(f"{self.name}] Got one package: {transport.seq_id}:{protocol.Transport.Mappings.ValueToString(transport.transportType)} from {transport.sender}")
+				transport = protocol.Transport.Parse(msg.data)
+				log.debug(f"{self.name}]1Pkg] Got one package: {transport.seq_id}:{protocol.Transport.Mappings.ValueToString(transport.transportType)} from {transport.sender}")
 				return transport
-		log.error(f"{self.name}] WS Broken.")
+		log.error(f"{self.name}]1Pkg] WS Broken.")
 		return None
 	
 	async def DirectSend(self, transport: protocol.Transport):
@@ -126,6 +128,9 @@ class Server:
 
 			if self.status == self.STATUS_CONNECTED:
 				await self.DirectSend(transport)
+			else:
+				await self.scheduleSendQueue.put(transport)
+				log.debug(f"Send] Caching {transport.seq_id} because the instance is disconnected.")
 
 	async def SendMsg(self, msg: str, ws: typing.Optional[web.WebSocketResponse] = None):
 		ctrl = protocol.Control()
@@ -150,9 +155,12 @@ class Server:
 		if pkg is None:
 			await errorMsg("Broken ws connection in initialize stage.", sendBack=False)
 			return ws
-		if type(pkg) != protocol.Control:
+		if pkg.transportType != protocol.Transport.CONTROL:
 			await errorMsg(f"First client package must be control package, but got {protocol.Transport.Mappings.ValueToString(pkg.transportType)}.")
 			return ws
+		tmp = protocol.Control()
+		tmp.Unpack(pkg)
+		pkg = tmp
 		if pkg.controlType != protocol.Control.HELLO:
 			await errorMsg(f"First client control package must be HELLO, but got {protocol.Control.Mappings.ValueToString(pkg.controlType)}.")
 			return ws
@@ -162,24 +170,24 @@ class Server:
 
 		async with self.sendQueueLock:
 			if hello.info.id != self.clientId:
-				log.info(f"{self.name}] New client instance. Clear histories.")
+				log.info(f"{self.name}] New client instance {hello.info.id}. Clear histories.")
 				self.clientId = hello.info.id
 				self.sendQueue.Clear()
-				ret = protocol.Control()
-				ret.SetForResponseTransport(pkg)
-				ret.InitHelloServerControl(protocol.HelloServerControl())
-				await ws.send_bytes(ret.Pack())
-			elif hello.info.type == protocol.ClientInfo.REMOTE:
-				# Remote will send all send package infos to us, we need to filter out items he didn't receive and resend again.
-				log.info(f"{self.name}] Old client instance. Exchange packages...")
-
+				self.scheduleSendQueue = asyncio.Queue()
 				ret = protocol.Control()
 				ret.SetForResponseTransport(pkg)
 				ret.InitHelloServerControl(protocol.HelloServerControl())
 				await ws.send_bytes(ret.Pack())
 				await asyncio.sleep(time_utils.Seconds(1))
+			elif hello.info.type == protocol.ClientInfo.REMOTE:
+				# Remote will send all send package infos to us, we need to filter out items he didn't receive and resend again.
+				log.info(f"{self.name}] Old remote instance {hello.info.id}. Remote reports {len(hello.pkgs)} packages received. Server had sent {len(self.sendQueue)} packages.")
 
-				log.info(f"{self.name}] Resend process... Check {len(self.sendQueue)} packages.")
+				ret = protocol.Control()
+				ret.SetForResponseTransport(pkg)
+				ret.InitHelloServerControl(protocol.HelloServerControl())
+				await ws.send_bytes(ret.Pack())
+
 				now = time_utils.GetTimestamp()
 				for pkg in self.sendQueue:
 					found = False
@@ -188,23 +196,20 @@ class Server:
 							found = True
 					if not found:
 						if time_utils.WithInDuration(pkg.timestamp, now, self.config.timeout):
-							log.debug(f"{self.name}] Resend package {pkg.seq_id}")
-							await ws.send_bytes(pkg.Pack())
+							await self.scheduleSendQueue.put(pkg)
 						else:
 							log.warning(f"{self.name}] Package {pkg.seq_id} skip resend because it's out-dated({now} - {pkg.timestamp} = {now - pkg.timestamp} > {self.config.timeout}).")
-				
+				await asyncio.sleep(time_utils.Seconds(1))
 			elif hello.info.type == protocol.ClientInfo.CLIENT:
 				# Client will query all receive package infos from server, so we need to send the package infos to it.
-				log.info(f"{self.name}] Old client instance. Exchange packages...")
+				log.info(f"{self.name}] Old client instance. Server is reporting {len(self.receiveQueue)} pacakges.")
 
 				ret = protocol.Control()
 				ret.SetForResponseTransport(pkg)
 				hsc = protocol.HelloServerControl()
 				async with self.receiveQueueLock:
-					log.info(f"{self.name}] Resend process... Check {len(self.receiveQueue)} packages.")
 					for pkg in self.receiveQueue:
 						hsc.AppendPkg(pkg)
-				log.debug(f"{self.name}] Hello contains {len(hsc)} packages received by Server.")
 				ret.InitHelloServerControl(hsc)
 				await ws.send_bytes(ret.Pack())
 				await asyncio.sleep(time_utils.Seconds(1))
@@ -273,6 +278,13 @@ class Server:
 		log.info(f"{self.name}] Disconnected.")
 		await self.router.SendMsg("", f"{self.name}] Disconnected.", skip=[self.name])
 
+	async def resendScheduledPackages(self):
+		log.debug(f"{self.name}] Schedule resend {self.scheduleSendQueue.qsize()} packages.")
+		while not self.scheduleSendQueue.empty():
+			item = await self.scheduleSendQueue.get()
+			log.debug(f"{self.name}] Schedule resend {item.seq_id}")
+			await self.DirectSend(item)
+
 	async def MainLoop(self, request: web.BaseRequest):
 		ws = web.WebSocketResponse(max_msg_size=self.WebSocketMaxReadingMessageSize, heartbeat=None if self.HttpUpgradeHearbeatDuration == 0 else self.HttpUpgradeHearbeatDuration, autoping=True)
 
@@ -282,28 +294,36 @@ class Server:
 
 		self.status = self.STATUS_INITIALIZING
 		log.debug(f"{self.name}] Initializing...")
-		prepareRet = await self.initialize(ws)
+		try:
+			prepareRet = await self.initialize(ws)
+		except Exception as e:
+			log.error(f"{self.name}] Error in initialize. {e}")
+			prepareRet = ws
 		if prepareRet is not None:
 			self.status = self.STATUS_INIT
-			log.debug(f"{self.name}] Failed to initialize. Return to init status.")
+			log.error(f"{self.name}] Failed to initialize. Return to init status.")
 			return prepareRet
 
 		self.ws = ws
 		self.status = self.STATUS_CONNECTED
 		await self.OnConnected()
-		async for msg in ws:
-			if msg.type == aiohttp.WSMsgType.ERROR:
-				log.error(f"{self.name}] {ws.exception()}")
-			elif msg.type == aiohttp.WSMsgType.TEXT or msg.type == aiohttp.WSMsgType.BINARY:
-				transport = protocol.Transport.Parse(msg.data)
-				log.debug(f"{self.name}] {transport.seq_id}:{protocol.Transport.Mappings.ValueToString(transport.transportType)}:{transport.cur_idx}/{transport.total_cnt} route {transport.sender} => {transport.receiver}")
+		asyncio.ensure_future(self.resendScheduledPackages())
+		try:
+			async for msg in ws:
+				if msg.type == aiohttp.WSMsgType.ERROR:
+					log.error(f"{self.name}] {ws.exception()}")
+				elif msg.type == aiohttp.WSMsgType.TEXT or msg.type == aiohttp.WSMsgType.BINARY:
+					transport = protocol.Transport.Parse(msg.data)
+					log.debug(f"{self.name}] {transport.seq_id}:{protocol.Transport.Mappings.ValueToString(transport.transportType)}:{transport.cur_idx}/{transport.total_cnt} route {transport.sender} => {transport.receiver}")
 
-				# check
-				if transport.sender != self.name:
-					log.error(f"{self.name}] Received a package {transport.seq_id} from {self.name} but it's sender is {transport.sender}, to {transport.receiver}. Online fix that.")
-					transport.sender = self.name
+					# check
+					if transport.sender != self.name:
+						log.error(f"{self.name}] Received a package {transport.seq_id} from {self.name} but it's sender is `{transport.sender}`, to `{transport.receiver}`. Online fix that.")
+						transport.sender = self.name
 
-				await self.OnPackage(transport)
+					await self.OnPackage(transport)
+		except Exception as e:
+			log.error(f"{self.name}] Mainloop error: {e}")
 			
 		self.status = self.STATUS_INIT
 		await self.OnDisconnected()

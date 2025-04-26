@@ -10,4 +10,6 @@ def Minutes(minutes: int):
 	return float(minutes * 60)
 
 def WithInDuration(oldTime: int, newTime: int, duration: int):
+	if duration == -1:
+		return True
 	return newTime - oldTime < duration

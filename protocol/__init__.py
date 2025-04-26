@@ -355,6 +355,9 @@ class HelloServerControl:
 
 	def IsEmpty(self):
 		return len(self.clients) == 0 and len(self.pkgs) == 0
+	
+	def __len__(self):
+		return len(self.pkgs)
 
 	def Pack(self):
 		pbt = pb.HelloServerControl()

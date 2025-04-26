@@ -27,6 +27,9 @@ class Configuration:
 		self.cacheQueueSize: int  = args.cache_queue_size
 		self.safeSegmentSize: int  = args.safe_segment_size
 
+		# debug only
+		self.force_id: str = args.force_id
+
 	@classmethod
 	def SetupParser(cls, parser: argp.ArgumentParser):
 		parser.add_argument("--server", type=str, default="http://127.0.0.1:8030/wsf/ws", help="Server address")
@@ -38,6 +41,8 @@ class Configuration:
 		parser.add_argument("--max_retries", type=int, default=3, help="Maximum number of retries")
 		parser.add_argument("--cache_queue_size", type=int, default=100, help="Maximum number of messages to cache")
 		parser.add_argument("--safe_segment_size", type=int, default=768*1024, help="Maximum size of messages to send, in Bytes")
+
+		parser.add_argument("--force_id", type=str, default="")
 		return parser
 	
 class Client:
@@ -59,23 +64,28 @@ class Client:
 		self.sendQueue: utils.BoundedQueue[protocol.Transport] = utils.BoundedQueue(config.cacheQueueSize)
 		self.sendQueueLock = asyncio.Lock()
 
+		# 管理分包传输，key为seq_id
+		self.chunks: typing.Dict[str, utils.Chunk] = {}
+
 		self.ws: aiohttp.ClientWebSocketResponse = None
 
 		self.forward_session: aiohttp.ClientSession = None
+
+		self.scheduleSendQueue: asyncio.Queue[protocol.Transport] = asyncio.Queue()
 
 	async def waitForOnePackage(self, ws: web.WebSocketResponse):
 		async for msg in ws:
 			if msg.type == aiohttp.WSMsgType.ERROR:
 				log.error(f"{self.name}] Error on waiting 1 package: {ws.exception()}")
 			elif msg.type == aiohttp.WSMsgType.TEXT or msg.type == aiohttp.WSMsgType.BINARY:
-				transport = protocol.Parse(msg.data)
+				transport = protocol.Transport.Parse(msg.data)
 				log.debug(f"{self.name}] Got one package: {transport.seq_id}:{protocol.Transport.Mappings.ValueToString(transport.transportType)} from {transport.sender}")
 				return transport
 		return None
 
 	async def initialize(self, ws: web.WebSocketResponse):
 		ctrl = protocol.Control()
-		ctrl.InitHelloClientControl(protocol.HelloClientControl(protocol.ClientInfo(self.instance_id, protocol.ClientInfo.CLIENT)))
+		ctrl.InitHelloClientControl(protocol.HelloClientControl(protocol.ClientInfo(self.instance_id if self.config.force_id == "" else self.config.force_id, protocol.ClientInfo.CLIENT)))
 		await ws.send_bytes(ctrl.Pack())
 
 		pkg = await self.waitForOnePackage(ws)
@@ -83,10 +93,13 @@ class Client:
 			log.error(f"{self.name}] Broken ws connection in initialize stage.")
 			self.status = self.STATUS_INIT
 			return ws
-		if type(pkg) != protocol.Control:
+		if pkg.transportType != protocol.Transport.CONTROL:
 			log.error(f"{self.name}] First client package must be control package, but got {protocol.Transport.Mappings.ValueToString(pkg.transportType)}.")
 			self.status = self.STATUS_INIT
 			return ws
+		tmp = protocol.Control()
+		tmp.Unpack(pkg)
+		pkg = tmp
 		if pkg.controlType == protocol.Control.PRINT: # error msg from server
 			log.error(f"{self.name}] Error from server: {pkg.DecodePrintMsg()}")
 			self.status = self.STATUS_INIT
@@ -109,9 +122,9 @@ class Client:
 						found = True
 						break
 				if found == False:
-					log.debug(f"{self.name}] Resend package {item.seq_id}")
-					await ws.send_bytes(item.Pack())
-
+					# 放入scheduleSendQueue而不是直接发送，是因为当前没有监听收包，万一对方发送大量的包，这里缓冲区就爆了
+					# 因此放入schedule里，进入connect状态后，边监听边发送这些包
+					await self.scheduleSendQueue.put(item)
 
 			self.ws = ws
 			self.status = self.STATUS_CONNECTED
@@ -126,6 +139,7 @@ class Client:
 			if raw.transportType != protocol.Transport.CONTROL:
 				self.sendQueue.Add(raw)
 
+			# client不用缓存非连接状态下的发送包，因为在连接开始时，server会报告它收到的包，client在非连接状态下发送的包肯定不会在报告内，因此会被重发
 			if self.status == self.STATUS_CONNECTED:
 				try:
 					await self.DirectSend(raw)
@@ -240,6 +254,31 @@ class Client:
 
 		await resp.release()
 	
+	async def processControlPackage(self, pkg: protocol.Control) -> bool:
+		"""
+		返回False退出MainLoop
+		"""
+		ctrlType = pkg.GetControlType()
+		if ctrlType == protocol.Control.QUIT_SIGNAL:
+			log.info(f"{self.name}] Receive quit signal from {pkg.sender}. Schedule exit mainloop.")
+			return False
+		elif ctrlType == protocol.Control.PRINT:
+			log.info(f"% {pkg.DecodePrintMsg()}")
+		elif ctrlType == protocol.Control.RETRIEVE_PKG:
+			pi = pkg.DecodeRetrievePkg()
+			found = False
+			async with self.sendQueueLock:
+				for item in self.sendQueue:
+					if pi.IsSamePackage(item):
+						found = True
+						await self.DirectSend(item)
+						break
+			if found == False:
+				await self.SendMsg(f"Cannot retreive package {pi.seq_id} because it doesn't exist in send queue.")
+		else:
+			log.error(f"{self.name}] Unsupported control type({protocol.Control.Mapping.ValueToString(ctrlType)})")
+		return True
+
 	async def SendMsg(self, msg: str):
 		ctrl = protocol.Control()
 		ctrl.SetSenderReceiver(self.config.uid, self.config.target_uid)
@@ -250,33 +289,55 @@ class Client:
 		"""
 		返回False退出MainLoop
 		"""
+		if type(pkg) == protocol.StreamData:
+			log.error(f"{self.name}] Client don't process StreamData. Ignore {pkg.seq_id}:{pkg.cur_idx}/{pkg.total_cnt} <<< {repr(pkg.body[:30])} ...>>> <- {pkg.sender}")
+			return
+		
 		if type(pkg) == protocol.Control:
-			ctrlType = pkg.GetControlType()
-			if ctrlType == protocol.Control.QUIT_SIGNAL:
-				log.info(f"{self.name}] Receive quit signal from {pkg.sender}. Schedule exit mainloop.")
-				return False
-			elif ctrlType == protocol.Control.PRINT:
-				log.info(f"% {pkg.DecodePrintMsg()}")
-			elif ctrlType == protocol.Control.RETRIEVE_PKG:
-				pi = pkg.DecodeRetrievePkg()
-				found = False
-				async with self.sendQueueLock:
-					for item in self.sendQueue:
-						if pi.IsSamePackage(item):
-							found = True
-							await self.DirectSend(item)
-							break
-				if found == False:
-					await self.SendMsg(f"Cannot retreive package {pi.seq_id} because it doesn't exist in send queue.")
-			else:
-				log.error(f"{self.name}] Unsupported control type({protocol.Control.Mapping.ValueToString(ctrlType)})")
-		elif type(pkg) == protocol.Request:
-			await self.processRequestPackage(pkg)
-		elif type(pkg) == protocol.Subpackage:
-			log.error(f"{self.name}] Receive subpackage {pkg.seq_id} but not implement. Help wanted.")
+			await self.processControlPackage(pkg)
 		else:
-			log.error(f"{self.name}] Unsupported package type({protocol.Transport.Mappings.ValueToString(pkg.transportType)})")
+			if type(pkg) == protocol.Subpackage or pkg.total_cnt == -1:
+				combine = await self.processSubpackage(pkg)
+				if combine is None:
+					return True
+				pkg = combine
+			if pkg.transportType == protocol.Transport.REQUEST:
+				await self.processRequestPackage(pkg)
+			else:
+				log.error(f"{self.name}] Unsupported package type({protocol.Transport.Mappings.ValueToString(pkg.transportType)})")
 		return True
+
+	async def resendScheduledPackages(self):
+		log.debug(f"Schedule] Resend {self.scheduleSendQueue.qsize()} packages.")
+		while not self.scheduleSendQueue.empty():
+			item = await self.scheduleSendQueue.get()
+			log.debug(f"Schedule] Resend {protocol.Transport.Mappings.ValueToString(item.transportType)} {item.seq_id}:{item.cur_idx}/{item.total_cnt} -> {item.receiver}")
+			await self.DirectSend(item)
+
+	async def processSubpackage(self, raw: typing.Union[protocol.Request, protocol.Response, protocol.Subpackage]) -> typing.Optional[protocol.Transport]:
+		# 分包规则；前n-1个包为subpackage，最后一个包为resp、req。
+		# 返回None表示Segments还没收全。若收全了返回合并的data.Transport对象。
+		# 单包或者流包直接返回。
+
+		# seq_id not in chunks and total_cnt = 32     =>     new chunk container
+		# seq_id in chunks and total_cnt = 32         =>     save to existed chunk container
+		# seq_id in chunks and total_cnt = -1         =>     end subpackage
+		# seq_id not in chunks and total_cnt = -1     =>     error, should not happend
+		if raw.seq_id not in self.chunks and raw.total_cnt <= 0:
+			log.error(f"Invalid end subpackage {raw.seq_id} not in chunk but has total_cnt {raw.total_cnt}")
+			return None
+		
+		if raw.seq_id not in self.chunks:
+			self.chunks[raw.seq_id] = utils.Chunk(raw.total_cnt, 0)
+		await self.chunks[raw.seq_id].Put(raw)
+		if not self.chunks[raw.seq_id].IsFinish():
+			log.debug(f"Subpackage {raw.seq_id}:{raw.cur_idx}/{raw.total_cnt} - {len(raw.body)} bytes <<< {repr(raw.body[:30])} ...>>> <- {raw.sender}")
+			# current package is a subpackage. we should not invoke internal callbacks until all package has received.
+			return None
+		log.debug(f"Subpackage {raw.seq_id}:{raw.cur_idx}/{raw.total_cnt} - {len(raw.body)} bytes <<< {repr(raw.body[-30:])} ...>>> <x- {raw.sender}")
+		ret = self.chunks[raw.seq_id].Combine()
+		del self.chunks[raw.seq_id]
+		return ret
 
 	async def MainLoop(self):
 		curTries = 0
@@ -293,6 +354,7 @@ class Client:
 						curTries = 0
 						log.info(f"Start mainloop...")
 
+						asyncio.ensure_future(self.resendScheduledPackages())
 						async for msg in self.ws:
 							if msg.type == aiohttp.WSMsgType.ERROR:
 								log.error(f"{self.name}] WSException: {self.ws.exception()}")

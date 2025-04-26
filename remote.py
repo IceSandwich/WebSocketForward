@@ -38,6 +38,9 @@ class Configuration:
 		self.streamRetrieveTimeout: int = args.stream_retrieve_timeout
 		self.streamRetrieveTimes: int = args.stream_retrieve_times
 
+		# debug only
+		self.force_id: str = args.force_id
+
 	@classmethod
 	def SetupParser(cls, parser: argp.ArgumentParser):
 		parser.add_argument("--server", type=str, default="http://127.0.0.1:8030/wsf/ws", help="The websocket server to connect to.")
@@ -60,6 +63,7 @@ class Configuration:
 		parser.add_argument("--stream_retrieve_timeout", type=int, default=time_utils.Seconds(3))
 		parser.add_argument("--stream_retrieve_times", type=int, default=3)
 
+		parser.add_argument("--force_id", type=str, default="")
 		return parser
 
 class Client:
@@ -88,6 +92,9 @@ class Client:
 		# 用于重发的队列，已经发出的包不要存在这里（事实上client无需保存发出的包）
 		self.sendQueue: utils.BoundedQueue[protocol.Transport] = utils.BoundedQueue(self.config.cacheQueueSize)
 		self.sendQueueLock = asyncio.Lock()
+		# init阶段会将sendQueue的包转移到scheduleSendQueue，在connect阶段开始的时候边监听边重发包。
+		# 如果在init直接发包，可能没到达connect阶段的时候就收到大量的包，但没有监听，导致缓冲区溢出。
+		self.scheduleSendQueue: asyncio.Queue[protocol.Transport] = asyncio.Queue()
 
 		self.sessionMap: typing.Dict[str, protocol.Transport] = {}
 		self.sessionCondition = asyncio.Condition()
@@ -235,7 +242,7 @@ class Client:
 							cb = RetrieveTimerCallback()
 							stateTimestamp = cb.GetTimestamp()
 						await self.timer.AddTask(cb)
-						print(f"Stream {seq_id} - Start timer, wait for {expectIdx}")
+						log.debug(f"Stream {seq_id} - Start timer, wait for {expectIdx}")
 						continue
 					elif state == self.STREAM_STATE_WAIT_TO_RETRIEVE:
 						# 等待期间避免占用cpu
@@ -244,11 +251,11 @@ class Client:
 						self.streamCondition.release() # 在这等待的1s内依然可以往队列加内容
 						await asyncio.sleep(time_utils.Seconds(1))
 						await self.streamCondition.acquire()
-						print(f"Stream {seq_id} - Still waitting {expectIdx}")
+						log.debug(f"Stream {seq_id} - Still waiting {expectIdx}")
 						continue
 					elif state == self.STREAM_STATE_SHOULD_RETRIEVE:
 						if sendRetreveTimes <= self.config.streamRetrieveTimes:
-							print(f"Stream {seq_id} - Send retrieve request, cur times: {sendRetreveTimes}")
+							log.debug(f"Stream {seq_id} - Send retrieve request, cur times: {sendRetreveTimes}")
 							raw = protocol.Control()
 							raw.SetForResponseTransport(self.streamHeap[seq_id][0])
 							raw.InitRetrievePkg(protocol.PackageId(
@@ -271,10 +278,10 @@ class Client:
 				item = heapq.heappop(self.streamHeap[seq_id])
 				expectIdx = expectIdx + 1
 				if item.total_cnt == -1:
-					print(f"Stream {seq_id}:{item.cur_idx} <x- {item.sender}")
+					log.debug(f"Stream {seq_id}:{item.cur_idx} <x- {item.sender}")
 					del self.streamHeap[seq_id]
 				else:
-					print(f"Stream {seq_id}:{item.cur_idx} <- {item.sender}")
+					log.debug(f"Stream {seq_id}:{item.cur_idx} <- {item.sender}")
 			yield item
 			if item.total_cnt == -1:
 				break
@@ -285,7 +292,7 @@ class Client:
 			if msg.type == aiohttp.WSMsgType.ERROR:
 				log.error(f"1Pkg] Error: {ws.exception()}")
 			elif msg.type == aiohttp.WSMsgType.TEXT or msg.type == aiohttp.WSMsgType.BINARY:
-				transport = protocol.Parse(msg.data)
+				transport = protocol.Transport.Parse(msg.data)
 				log.debug(f"1Pkg] {protocol.Transport.Mappings.ValueToString(transport.transportType)} {transport.seq_id}:{transport.cur_idx}/{transport.total_cnt} <- {transport.sender}")
 				return transport
 		log.error(f"1Pkg] WS broken.")
@@ -293,11 +300,12 @@ class Client:
 
 	async def initialize(self, ws: web.WebSocketResponse):
 		async with self.historyRecvQueueLock:
-			hcc = protocol.HelloClientControl(protocol.ClientInfo(self.instance_id, protocol.ClientInfo.REMOTE))
+			hcc = protocol.HelloClientControl(protocol.ClientInfo(self.instance_id if self.config.force_id == "" else self.config.force_id, protocol.ClientInfo.REMOTE))
 			for pkg in self.historyRecvQueue:
 				hcc.Append(pkg)
-			log.debug(f"Initialize] Hello contains {len(hcc)} package descriptions.")
+			log.debug(f"Initialize] Reporting {len(hcc)} packages received.")
 			ctrl = protocol.Control()
+			ctrl.SetSenderReceiver(self.name, "")
 			ctrl.InitHelloClientControl(hcc)
 			await ws.send_bytes(ctrl.Pack())
 
@@ -306,10 +314,13 @@ class Client:
 				log.error(f"Initialize] Broken ws connection in initialize stage.")
 				self.status = self.STATUS_INIT
 				return ws
-			if type(pkg) != protocol.Control:
+			if pkg.transportType != protocol.Transport.CONTROL:
 				log.error(f"Initialize] First package {pkg.seq_id}:{pkg.cur_idx}/{pkg.total_cnt} is {protocol.Transport.Mappings.ValueToString(pkg.transportType)} which should be {protocol.Transport.Mappings.ValueToString(protocol.Transport.CONTROL)}.")
 				self.status = self.STATUS_INIT
 				return ws
+			tmp = protocol.Control()
+			tmp.Unpack(pkg)
+			pkg = tmp
 			if pkg.controlType == protocol.Control.PRINT: # error msg from server
 				log.error(f"Initialize] Error from server: {pkg.DecodePrintMsg()}")
 				self.status = self.STATUS_INIT
@@ -322,11 +333,10 @@ class Client:
 
 			now = time_utils.GetTimestamp()
 			async with self.sendQueueLock:
-				log.debug(f"Initialize] Check {len(self.sendQueue)} packages to resend.")
+				log.debug(f"Initialize] Check {len(self.sendQueue)} packages and schedule to resend.")
 				for item in self.sendQueue:
 					if time_utils.WithInDuration(item.timestamp, now, self.config.timeout):
-						log.debug(f"Initialize] Resend package {item.seq_id}")
-						await ws.send_bytes(item.Pack())
+						await self.scheduleSendQueue.put(item)
 					else:
 						log.warning(f"Initialize] Package {item.seq_id} skip resend because it's out-dated({now} - {item.timestamp} = {now - item.timestamp} > {self.config.timeout}).")
 				self.sendQueue.Clear()
@@ -352,42 +362,49 @@ class Client:
 		
 		if raw.seq_id not in self.chunks:
 			self.chunks[raw.seq_id] = utils.Chunk(raw.total_cnt, 0)
-		log.debug(f"Receive {raw.seq_id} subpackage({raw.cur_idx}/{raw.total_cnt}) - {len(raw.body)} bytes <<< {repr(raw.body[:50])} ...>>>")
 		await self.chunks[raw.seq_id].Put(raw)
 		if not self.chunks[raw.seq_id].IsFinish():
+			log.debug(f"Subpackage {raw.seq_id}:{raw.cur_idx}/{raw.total_cnt} - {len(raw.body)} bytes <<< {repr(raw.body[:30])} ...>>> <- {raw.sender}")
 			# current package is a subpackage. we should not invoke internal callbacks until all package has received.
 			return None
+		log.debug(f"Subpackage {raw.seq_id}:{raw.cur_idx}/{raw.total_cnt} - {len(raw.body)} bytes <<< {repr(raw.body[-30:])} ...>>> <x- {raw.sender}")
 		ret = self.chunks[raw.seq_id].Combine()
 		del self.chunks[raw.seq_id]
 		return ret
 	
+	async def processControlPackage(self, pkg: protocol.Control):
+		log.debug(f"Control {protocol.Control.Mappings.ValueToString(pkg.controlType)} {pkg.seq_id}:{pkg.cur_idx}/{pkg.total_cnt} <- {pkg.sender}")
+		if pkg.controlType == protocol.Control.PRINT:
+			log.info(f"% {pkg.DecodePrintMsg()}")
+		elif pkg.controlType in [protocol.Control.QUERY_CLIENTS]:
+			async with self.controlSessionCondition:
+				self.controlSessionMap[pkg.seq_id] = pkg
+				self.controlSessionCondition.notify_all()
+		else:
+			log.error(f"OnPackage] Unsupported control type({protocol.Control.Mapping.ValueToString(pkg.controlType)})")
+
+	async def processStreamDataPackage(self, pkg: protocol.StreamData):
+		async with self.streamCondition:
+			if pkg.seq_id not in self.streamHeap:
+				self.streamHeap[pkg.seq_id] = []
+
+			heapq.heappush(self.streamHeap[pkg.seq_id], pkg)
+
+			if len(self.streamHeap[pkg.seq_id]) > self.config.maxHeapSSEBufferSize:
+				log.warning(f"Stream {pkg.seq_id} seems dead. Drop cache packages. headq: {[x.cur_idx for x in self.streamHeap[pkg.seq_id]]}")
+				del self.streamHeap[pkg.seq_id]
+			
+			self.streamCondition.notify_all()
+
 	async def OnPackage(self, pkg: typing.Union[protocol.Request, protocol.Response, protocol.Subpackage, protocol.StreamData, protocol.Control]) -> bool:
-		log.debug(f"Recv] {protocol.Transport.Mappings.ValueToString(pkg.transportType)} {pkg.seq_id}:{pkg.cur_idx}/{pkg.total_cnt} <- {pkg.sender}")
 		if type(pkg) == protocol.Control:
-			if pkg.controlType == protocol.Control.PRINT:
-				log.info(f"% {pkg.DecodePrintMsg()}")
-			elif pkg.controlType in [protocol.Control.QUERY_CLIENTS]:
-				async with self.controlSessionCondition:
-					self.controlSessionMap[pkg.seq_id] = pkg
-					self.controlSessionCondition.notify_all()
-			else:
-				log.error(f"Recv] Unsupported control type({protocol.Control.Mapping.ValueToString(pkg.controlType)})")
+			await self.processControlPackage(pkg)
 		else:
 			async with self.historyRecvQueueLock:
 				self.historyRecvQueue.Add(protocol.PackageId.FromPackage(pkg))
 
 			if type(pkg) == protocol.StreamData: # 流包的total_cnt=-1表示结束，为了区分Subpackage，先判断
-				async with self.streamCondition:
-					if pkg.seq_id not in self.streamHeap:
-						self.streamHeap[pkg.seq_id] = []
-
-					heapq.heappush(self.streamHeap[pkg.seq_id], pkg)
-
-					if len(self.streamHeap[pkg.seq_id]) > self.config.maxHeapSSEBufferSize:
-						log.warning(f"Recv] Stream {pkg.seq_id} seems dead. Drop cache packages. headq: {[x.cur_idx for x in self.streamHeap[pkg.seq_id]]}")
-						del self.streamHeap[pkg.seq_id]
-					
-					self.streamCondition.notify_all()
+				await self.processStreamDataPackage(pkg)
 			elif type(pkg) == protocol.Subpackage or pkg.total_cnt == -1:
 				combine = await self.processSubpackage(pkg)
 				if combine is not None:
@@ -398,6 +415,14 @@ class Client:
 				async with self.sessionCondition:
 					self.sessionMap[pkg.seq_id] = pkg
 					self.sessionCondition.notify_all()
+		return True
+
+	async def resendScheduledPackages(self):
+		log.debug(f"Schedule] Resend {self.scheduleSendQueue.qsize()} packages.")
+		while not self.scheduleSendQueue.empty():
+			item = await self.scheduleSendQueue.get()
+			log.debug(f"Schedule] Resend {protocol.Transport.Mappings.ValueToString(item.transportType)} {item.seq_id}:{item.cur_idx}/{item.total_cnt} -> {item.receiver}")
+			await self.DirectSend(item)
 
 	async def MainLoop(self):
 		curTries = 0
@@ -415,6 +440,7 @@ class Client:
 						curTries = 0
 						log.info(f"Start mainloop...")
 
+						asyncio.ensure_future(self.resendScheduledPackages())
 						async for msg in self.ws:
 							if msg.type == aiohttp.WSMsgType.ERROR:
 								log.error(f"Tunnel] Exception: {self.ws.exception()}")
@@ -561,7 +587,6 @@ class HttpServer:
 
 	async def MainLoopOnRequest(self, request: web.BaseRequest):
 		# 提取请求的相关信息
-		log.info(f"Browser] Request {request.url.path_qs} {request.method}")
 		req = protocol.Request(self.config.cipher)
 		req.Init(self.config.prefix + str(request.url.path_qs), request.method, dict(request.headers))
 		req.SetBody(await request.read() if request.can_read_body else None)
