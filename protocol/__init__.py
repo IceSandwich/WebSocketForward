@@ -7,6 +7,9 @@ import abc
 import typing
 import json
 
+import logging
+log: logging.Logger = None
+
 def GenerateSequenceId():
 	return str(uuid.uuid4())
 
@@ -152,6 +155,7 @@ class PackageId:
 		return ret
 
 class Request(Transport):
+	PRINT_ONCE_MSG = True
 	def __init__(self, encrypt: typing.Optional[encryptor.Cipher] = None):
 		super().__init__(Transport.REQUEST)
 		self.url = ""
@@ -159,6 +163,10 @@ class Request(Transport):
 		self.headers: typing.Dict[str, str] = {}
 		self.body = None
 		self.encrypt = encrypt
+
+		if self.encrypt is None and self.PRINT_ONCE_MSG and log is not None:
+			self.PRINT_ONCE_MSG = False
+			log.error(f"Protocol] Request's encrypt is None. If not on purpose, please check the code and fix that.", exc_info=True)
 
 	def Init(self, url: str, method: str, headers: typing.Dict[str, str]):
 		self.url = url
@@ -168,7 +176,7 @@ class Request(Transport):
 	def SetBody(self, body: typing.Optional[bytes]):
 		self.body = body
 
-	def Prepack(self):
+	def Pack(self) -> bytes:
 		req = pb.Request()
 		req.url = self.url
 		req.method = self.method
@@ -176,14 +184,10 @@ class Request(Transport):
 		if self.body is not None:
 			req.body = self.body
 		
-		reqBytes: bytes = req.SerializeToString()
+		self.data = req.SerializeToString()
 		if self.encrypt is not None:
-			reqBytes = self.encrypt.Encrypt(reqBytes)
-		
-		self.data = reqBytes
+			self.data = self.encrypt.Encrypt(self.data)
 
-	def Pack(self) -> bytes:
-		self.Prepack()
 		return super().Pack()
 	
 	def Unpack(self, transport: Transport):
@@ -202,6 +206,7 @@ class Request(Transport):
 		self.body = pbt.body
 
 class Response(Transport):
+	PRINT_ONCE_MSG = True
 	def __init__(self, encrypt: typing.Optional[encryptor.Cipher] = None):
 		super().__init__(Transport.RESPONSE)
 		self.url = ""
@@ -209,6 +214,10 @@ class Response(Transport):
 		self.headers: typing.Dict[str, str] = {}
 		self.body = b''
 		self.encrypt = encrypt
+
+		if self.encrypt is None and self.PRINT_ONCE_MSG and log is not None:
+			self.PRINT_ONCE_MSG = False
+			log.error(f"Protocol] Response's encrypt is None. If not on purpose, please check the code and fix that.", exc_info=True)
 
 	def Init(self, url: str, status: int, headers: typing.Dict[str, str], body: bytes = b''):
 		self.url = url
@@ -219,21 +228,17 @@ class Response(Transport):
 	def SetBody(self, body: typing.Optional[bytes]):
 		self.body = body
 
-	def Prepack(self):
+	def Pack(self) -> bytes:
 		res = pb.Response()
 		res.url = self.url
 		res.status = self.status
 		res.headers = json.dumps(self.headers)
 		res.body = self.body
 
-		resBytes: bytes = res.SerializeToString()
+		self.data = res.SerializeToString()
 		if self.encrypt is not None:
-			resBytes = self.encrypt.Encrypt(resBytes)
+			self.data = self.encrypt.Encrypt(self.data)
 
-		self.data = resBytes
-
-	def Pack(self) -> bytes:
-		self.Prepack()
 		return super().Pack()
 	
 	def Unpack(self, transport: Transport):
@@ -252,10 +257,15 @@ class Response(Transport):
 		self.body = pbt.body
 
 class Subpackage(Transport):
+	PRINT_ONCE_MSG = True
 	def __init__(self, encrypt: typing.Optional[encryptor.Cipher] = None):
 		super().__init__(Transport.SUBPACKAGE)
 		self.encrypt = encrypt
 		self.body = b''
+
+		if self.encrypt is None and self.PRINT_ONCE_MSG and log is not None:
+			self.PRINT_ONCE_MSG = False
+			log.error(f"Protocol] Subpackage's encrypt is None. If not on purpose, please check the code and fix that.", exc_info=True)
 
 	def SetBody(self, body: bytes):
 		self.body = body
@@ -410,11 +420,12 @@ class Control(Transport):
 	RETRIEVE_PKG = 4
 	UNKNOWN = -1
 
-	Mapping = TypeMapping([
+	Mappings = TypeMapping([
 		[HELLO, 'HELLO', pb.ControlType.HELLO],
 		[QUERY_CLIENTS, 'QUERY_CLIENTS', pb.ControlType.QUERY_CLIENTS],
 		[QUIT_SIGNAL, 'QUIT_SIGNAL', pb.ControlType.QUIT_SIGNAL],
 		[PRINT, 'PRINT', pb.ControlType.PRINT],
+		[RETRIEVE_PKG, 'RETRIEVE_PKG', pb.ControlType.RETRIEVE_PKG],
 	])
 
 	def __init__(self):
@@ -472,7 +483,7 @@ class Control(Transport):
 		
 	def Pack(self) -> bytes:
 		pbt = pb.Control()
-		pbt.type = self.Mapping.ValueToPB(self.controlType)
+		pbt.type = self.Mappings.ValueToPB(self.controlType)
 		pbt.data = self.body
 
 		self.data = pbt.SerializeToString()

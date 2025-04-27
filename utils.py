@@ -12,6 +12,11 @@ mimetypes.add_type("text/plain; charset=utf-8", ".woff2")
 MIMETYPE_WEBP = 'image/webp'
 CONTENTTYPE_UTF8HTML = 'text/html; charset=utf-8'
 
+# 在日志中打印数据内容，这里设置打印前n个字节
+LOG_BYTES_LEN = 20
+
+log: logging.Logger = None
+
 # 配置 logging
 # logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
@@ -213,6 +218,8 @@ class Timer:
 			if item.time <= 0:
 				continue
 			await asyncio.sleep(item.time)
+			if log is not None:
+				log.debug(f"Timer] After {item.time}, invoke run()")
 			await item.Run()
 			async with self.condition: # this will change the new packages added during sleep time. So utils.Timer is not a accurate timer.
 				for task in self.tasks:

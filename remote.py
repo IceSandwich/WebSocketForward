@@ -11,6 +11,8 @@ import heapq
 
 log = logging.getLogger(__name__)
 utils.SetupLogging(log, "remote", terminalLevel=logging.DEBUG, saveInFile=True)
+protocol.log = log
+utils.log = log
 
 class Configuration:
 	def __init__(self, args):
@@ -154,14 +156,14 @@ class Client:
 			sp.SetIndex(i, len(splitDatas))
 			sp.SetBody(item)
 
-			log.debug(f"Subpackage {sp.seq_id}:{sp.cur_idx}/{sp.total_cnt} - {len(sp.body)} bytes <<< {repr(sp.body[:30])} ...>>> -> {sp.receiver}")
+			log.debug(f"Subpackage {sp.seq_id}:{sp.cur_idx}/{sp.total_cnt} - {len(sp.body)} bytes <<< {repr(sp.body[:utils.LOG_BYTES_LEN])} ...>>> -> {sp.receiver}")
 			await self.QueueSend(sp)
 		
 		# 最后一个包，虽然是Resp/Req类型，但是data其实是传输数据的一部分，不是resp、req包。要全部合成一个才能解析成resp、req包。
 		raw.SetBody(splitDatas[-1])
 		raw.SetIndex(len(splitDatas) - 1, -1)
 
-		log.debug(f"Subpackage {raw.seq_id}:{raw.cur_idx}/{raw.total_cnt} - {len(raw.body)} bytes <<< {repr(raw.body[-30:])} ...>>> -x> {sp.receiver}")
+		log.debug(f"Subpackage {raw.seq_id}:{raw.cur_idx}/{raw.total_cnt} - {len(raw.body)} bytes <<< {repr(raw.body[-utils.LOG_BYTES_LEN:])} ...>>> -x> {sp.receiver}")
 		await self.QueueSend(raw)
 
 	async def Session(self, req: protocol.Request) -> protocol.Response:
@@ -186,14 +188,14 @@ class Client:
 		"""
 		SessionControl使用的是DirectSend而非QueueSend。
 		"""
-		log.debug(f"SessionControl {protocol.Control.Mapping.ValueToString(raw.controlType)} -> {raw.receiver}")
+		log.debug(f"SessionControl {protocol.Control.Mappings.ValueToString(raw.controlType)} -> {raw.receiver}")
 		await self.DirectSend(raw)
 
 		async with self.controlSessionCondition:
 			await self.controlSessionCondition.wait_for(lambda: raw.seq_id in self.controlSessionMap)
 			resp = self.controlSessionMap[raw.seq_id]
 			del self.controlSessionMap[raw.seq_id]
-			log.debug(f"SessionControl {protocol.Control.Mapping.ValueToString(resp.controlType)} <- {resp.sender}")
+			log.debug(f"SessionControl {protocol.Control.Mappings.ValueToString(resp.controlType)} <- {resp.sender}")
 			return resp
 		
 	STREAM_STATE_NONE = 0
@@ -213,6 +215,8 @@ class Client:
 			
 			async def Run(that):
 				nonlocal state
+				nonlocal stateTimestamp
+				nonlocal stateLock
 				with stateLock:
 					if stateTimestamp == that.timestamp:
 						print(f"Stream {seq_id} change from {state} to should retrieve")
@@ -278,10 +282,10 @@ class Client:
 				item = heapq.heappop(self.streamHeap[seq_id])
 				expectIdx = expectIdx + 1
 				if item.total_cnt == -1:
-					log.debug(f"Stream {seq_id}:{item.cur_idx} <x- {item.sender}")
+					log.debug(f"Stream {seq_id}:{item.cur_idx}/{item.total_cnt} - {len(item.body)} bytes <<< {repr(item.body[:utils.LOG_BYTES_LEN])} ...>>> <x- {item.sender}")
 					del self.streamHeap[seq_id]
 				else:
-					log.debug(f"Stream {seq_id}:{item.cur_idx} <- {item.sender}")
+					log.debug(f"Stream {seq_id}:{item.cur_idx}/{item.total_cnt} - {len(item.body)} bytes <<< {repr(item.body[:utils.LOG_BYTES_LEN])} ...>>> <- {item.sender}")
 			yield item
 			if item.total_cnt == -1:
 				break
@@ -326,10 +330,12 @@ class Client:
 				self.status = self.STATUS_INIT
 				return ws
 			if pkg.controlType != protocol.Control.HELLO:
-				log.error(f"Initialize] First control package {pkg.seq_id}:{pkg.cur_idx}/{pkg.total_cnt} is {protocol.Control.Mappings.ValueToString(pkg.controlType)} which should be {protocol.Control.Mapping.ValueToString(protocol.Control.HELLO)}.")
+				log.error(f"Initialize] First control package {pkg.seq_id}:{pkg.cur_idx}/{pkg.total_cnt} is {protocol.Control.Mappings.ValueToString(pkg.controlType)} which should be {protocol.Control.Mappings.ValueToString(protocol.Control.HELLO)}.")
 				self.status = self.STATUS_INIT
 				return ws
 			hello = pkg.ToHelloServerControl()
+
+			log.info(f"Initialize] Server will send {len(hello)} packages to us.")
 
 			now = time_utils.GetTimestamp()
 			async with self.sendQueueLock:
@@ -364,10 +370,10 @@ class Client:
 			self.chunks[raw.seq_id] = utils.Chunk(raw.total_cnt, 0)
 		await self.chunks[raw.seq_id].Put(raw)
 		if not self.chunks[raw.seq_id].IsFinish():
-			log.debug(f"Subpackage {raw.seq_id}:{raw.cur_idx}/{raw.total_cnt} - {len(raw.body)} bytes <<< {repr(raw.body[:30])} ...>>> <- {raw.sender}")
+			log.debug(f"Subpackage {raw.seq_id}:{raw.cur_idx}/{raw.total_cnt} - {len(raw.body)} bytes <<< {repr(raw.body[:utils.LOG_BYTES_LEN])} ...>>> <- {raw.sender}")
 			# current package is a subpackage. we should not invoke internal callbacks until all package has received.
 			return None
-		log.debug(f"Subpackage {raw.seq_id}:{raw.cur_idx}/{raw.total_cnt} - {len(raw.body)} bytes <<< {repr(raw.body[-30:])} ...>>> <x- {raw.sender}")
+		log.debug(f"Subpackage {raw.seq_id}:{raw.cur_idx}/{raw.total_cnt} - {len(raw.body)} bytes <<< {repr(raw.body[-utils.LOG_BYTES_LEN:])} ...>>> <x- {raw.sender}")
 		ret = self.chunks[raw.seq_id].Combine()
 		del self.chunks[raw.seq_id]
 		return ret
@@ -381,7 +387,7 @@ class Client:
 				self.controlSessionMap[pkg.seq_id] = pkg
 				self.controlSessionCondition.notify_all()
 		else:
-			log.error(f"OnPackage] Unsupported control type({protocol.Control.Mapping.ValueToString(pkg.controlType)})")
+			log.error(f"OnPackage] Unsupported control type({protocol.Control.Mappings.ValueToString(pkg.controlType)})")
 
 	async def processStreamDataPackage(self, pkg: protocol.StreamData):
 		async with self.streamCondition:
@@ -472,7 +478,7 @@ class Client:
 		raw.SetSenderReceiver(self.config.uid, "")
 		raw.InitQueryClientsControl(protocol.QueryClientsControl())
 		resp = await self.SessionControl(raw)
-		assert resp.controlType == protocol.Control.QUERY_CLIENTS, f"ControlQuery {raw.seq_id} require to receive a QueryClients package but got {protocol.Control.Mapping.ValueToString(resp.controlType)}"
+		assert resp.controlType == protocol.Control.QUERY_CLIENTS, f"ControlQuery {raw.seq_id} require to receive a QueryClients package but got {protocol.Control.Mappings.ValueToString(resp.controlType)}"
 
 		return [ x.id for x in resp.ToQueryClientsControl() ]
 
@@ -509,7 +515,7 @@ class StableDiffusionCachingClient(Client):
 		log.debug(f'Using cache: {url} => {filename}')
 		with open(filename, 'rb') as f:
 			body = f.read()
-		resp = protocol.Response(None)
+		resp = protocol.Response(None) # this line will report encrypt is None, it doesn't matter
 		resp.SetSenderReceiver(self.config.target_uid, self.config.uid)
 		resp.Init(url, 200, {
 			'Content-Type': utils.GuessMimetype(filename),

@@ -11,6 +11,8 @@ import argparse as argp
 
 log = logging.getLogger(__name__)
 utils.SetupLogging(log, "server", logging.INFO, True)
+protocol.log = log
+utils.log = log
 
 class Configuration:
 	def __init__(self, args):
@@ -185,8 +187,7 @@ class Server:
 
 				ret = protocol.Control()
 				ret.SetForResponseTransport(pkg)
-				ret.InitHelloServerControl(protocol.HelloServerControl())
-				await ws.send_bytes(ret.Pack())
+				hsc = protocol.HelloServerControl()
 
 				now = time_utils.GetTimestamp()
 				for pkg in self.sendQueue:
@@ -197,8 +198,12 @@ class Server:
 					if not found:
 						if time_utils.WithInDuration(pkg.timestamp, now, self.config.timeout):
 							await self.scheduleSendQueue.put(pkg)
+							hsc.AppendPkg(protocol.PackageId.FromPackage(pkg))
 						else:
 							log.warning(f"{self.name}] Package {pkg.seq_id} skip resend because it's out-dated({now} - {pkg.timestamp} = {now - pkg.timestamp} > {self.config.timeout}).")
+
+				ret.InitHelloServerControl(hsc)
+				await ws.send_bytes(ret.Pack())
 				await asyncio.sleep(time_utils.Seconds(1))
 			elif hello.info.type == protocol.ClientInfo.CLIENT:
 				# Client will query all receive package infos from server, so we need to send the package infos to it.
@@ -261,7 +266,7 @@ class Server:
 				else:
 					await self.router.Route(pkg)
 			elif pkg.receiver == "":
-				await self.router.SendMsg(pkg.sender, f"Server] Unsupported control type({protocol.Control.Mapping.valueToString(ctrlType)}) to server. Drop control package {pkg.seq_id}.")
+				await self.router.SendMsg(pkg.sender, f"Server] Unsupported control type({protocol.Control.Mappings.valueToString(ctrlType)}) to server. Drop control package {pkg.seq_id}.")
 			else:
 				await self.router.Route(pkg)
 		else:

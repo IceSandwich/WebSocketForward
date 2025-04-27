@@ -10,6 +10,8 @@ import argparse as argp
 
 log = logging.getLogger(__name__)
 utils.SetupLogging(log, "client", terminalLevel=logging.DEBUG, saveInFile=True)
+protocol.log = log
+utils.log = log
 
 class Configuration:
 	def __init__(self, args):
@@ -76,11 +78,12 @@ class Client:
 	async def waitForOnePackage(self, ws: web.WebSocketResponse):
 		async for msg in ws:
 			if msg.type == aiohttp.WSMsgType.ERROR:
-				log.error(f"{self.name}] Error on waiting 1 package: {ws.exception()}")
+				log.error(f"1Pkg] Error: {ws.exception()}")
 			elif msg.type == aiohttp.WSMsgType.TEXT or msg.type == aiohttp.WSMsgType.BINARY:
 				transport = protocol.Transport.Parse(msg.data)
-				log.debug(f"{self.name}] Got one package: {transport.seq_id}:{protocol.Transport.Mappings.ValueToString(transport.transportType)} from {transport.sender}")
+				log.debug(f"1Pkg] {protocol.Transport.Mappings.ValueToString(transport.transportType)} {transport.seq_id}:{transport.cur_idx}/{transport.total_cnt} <- {transport.sender}")
 				return transport
+		log.error(f"1Pkg] WS broken.")
 		return None
 
 	async def initialize(self, ws: web.WebSocketResponse):
@@ -114,6 +117,7 @@ class Client:
 		# 	return
 
 		# server will send all package he received. we need to decide which package to resend.
+		log.debug(f"Server reported {len(hello.pkgs)} packages received.")
 		async with self.sendQueueLock:
 			for item in self.sendQueue:
 				found = False
@@ -144,7 +148,7 @@ class Client:
 				try:
 					await self.DirectSend(raw)
 				except Exception as e:
-					log.error(f"{self.name}] Cannot Queuesend package {raw.seq_id} of type {protocol.Transport.Mappings.ValueToString(raw.transportType)}, err: {e}")
+					log.error(f"Failed Cannot Queuesend package {raw.seq_id}:{raw.cur_idx}/{raw.total_cnt} of type {protocol.Transport.Mappings.ValueToString(raw.transportType)}, err: {e}")
 	
 	async def QueueSendSmartSegments(self, raw: typing.Union[protocol.Request, protocol.Response]):
 		"""
@@ -167,14 +171,14 @@ class Client:
 			sp.SetIndex(i, len(splitDatas))
 			sp.SetBody(item)
 
-			log.debug(f"Send subpackage({sp.seq_id}:{sp.cur_idx}/{sp.total_cnt}) - {len(sp.body)} bytes <<< {repr(sp.body[:50])} ...>>>")
+			log.debug(f"Subpackage {sp.seq_id}:{sp.cur_idx}/{sp.total_cnt} - {len(sp.body)} bytes <<< {repr(sp.body[:utils.LOG_BYTES_LEN])} ...>>> -> {sp.receiver}")
 			await self.QueueSend(sp)
 		
 		# 最后一个包，虽然是Resp/Req类型，但是data其实是传输数据的一部分，不是resp、req包。要全部合成一个才能解析成resp、req包。
 		raw.SetBody(splitDatas[-1])
 		raw.SetIndex(len(splitDatas) - 1, -1)
 
-		log.debug(f"Send end subpackage({raw.seq_id}:{raw.cur_idx}/{raw.total_cnt}) {len(raw.body)} bytes <<< {repr(raw.body[:50])} ...>>>")
+		log.debug(f"Subpackage {raw.seq_id}:{raw.cur_idx}/{raw.total_cnt} - {len(raw.body)} bytes <<< {repr(raw.body[-utils.LOG_BYTES_LEN:])} ...>>> -> {raw.receiver}")
 		await self.QueueSend(raw)
 
 	async def processSSESession(self, req: protocol.Request, resp: aiohttp.ClientResponse):
@@ -193,7 +197,7 @@ class Client:
 					raw.SetForResponseTransport(req)
 					raw.Init(req.url, resp.status, dict(resp.headers), chunk)
 
-					log.debug(f"SSE >>>Begin {raw.seq_id} - {resp.url} {len(raw.body)} bytes <<< {repr(raw.body[:50])} ...>>>")
+					log.debug(f"Stream {raw.seq_id}:{raw.cur_idx}/{raw.total_cnt} - {resp.url} {len(raw.body)} bytes <<< {repr(raw.body[:utils.LOG_BYTES_LEN])} ...>>> -> {raw.receiver}")
 					await self.QueueSend(raw)
 				else:
 					raw = protocol.StreamData(self.config.cipher)
@@ -201,17 +205,17 @@ class Client:
 					raw.SetBody(chunk)
 					raw.SetIndex(cur_idx, 0)
 					
-					log.debug(f"SSE {raw.seq_id} - {cur_idx}-ith - {len(raw.body)} bytes <<< {repr(raw.body[:50])} ...>>>")
+					log.debug(f"Stream {raw.seq_id}:{raw.cur_idx}/{raw.total_cnt} - {len(raw.body)} bytes <<< {repr(raw.body[:utils.LOG_BYTES_LEN])} ...>>> -> {raw.receiver}")
 					await self.QueueSend(raw)
 				# 第一个response的idx为0，第一个sse_subpackage的idx为1
 				cur_idx = cur_idx + 1
 		except Exception as e:
-			log.error(f'SSE {raw.seq_id} end iter unexpectally. err: {e}')
+			log.error(f'Stream {req.seq_id} end iter unexpectally. err: {e}')
 		finally:
 			raw = protocol.StreamData(self.config.cipher)
 			raw.SetForResponseTransport(req)
 			raw.SetIndex(cur_idx, -1)
-			log.debug(f"SSE <<<End {raw.seq_id} - {resp.url} {len(raw.body)} bytes")
+			log.debug(f"Stream {raw.seq_id}:{raw.cur_idx}/{raw.total_cnt} - {resp.url} {len(raw.body)} bytes -x> {raw.receiver}")
 			await self.QueueSend(raw)
 			await resp.release()
 		
@@ -228,7 +232,7 @@ class Client:
 			return await self.QueueSendSmartSegments(rep)
 
 		if 'text/event-stream' in resp.headers['Content-Type']:
-			log.debug(f"SSE Response {req.seq_id} - {req.method} {resp.url} {resp.status}")
+			# log.debug(f"SSE Response {req.seq_id} - {req.method} {resp.url} {resp.status}")
 			asyncio.ensure_future(self.processSSESession(req, resp))
 			return
 		
@@ -276,7 +280,7 @@ class Client:
 			if found == False:
 				await self.SendMsg(f"Cannot retreive package {pi.seq_id} because it doesn't exist in send queue.")
 		else:
-			log.error(f"{self.name}] Unsupported control type({protocol.Control.Mapping.ValueToString(ctrlType)})")
+			log.error(f"{self.name}] Unsupported control type({protocol.Control.Mappings.ValueToString(ctrlType)})")
 		return True
 
 	async def SendMsg(self, msg: str):
@@ -290,11 +294,11 @@ class Client:
 		返回False退出MainLoop
 		"""
 		if type(pkg) == protocol.StreamData:
-			log.error(f"{self.name}] Client don't process StreamData. Ignore {pkg.seq_id}:{pkg.cur_idx}/{pkg.total_cnt} <<< {repr(pkg.body[:30])} ...>>> <- {pkg.sender}")
+			log.error(f"{self.name}] Client don't process StreamData. Ignore {pkg.seq_id}:{pkg.cur_idx}/{pkg.total_cnt} <<< {repr(pkg.body[:utils.LOG_BYTES_LEN * 2])} ...>>> <- {pkg.sender}")
 			return
 		
 		if type(pkg) == protocol.Control:
-			await self.processControlPackage(pkg)
+			return await self.processControlPackage(pkg)
 		else:
 			if type(pkg) == protocol.Subpackage or pkg.total_cnt == -1:
 				combine = await self.processSubpackage(pkg)
@@ -331,10 +335,10 @@ class Client:
 			self.chunks[raw.seq_id] = utils.Chunk(raw.total_cnt, 0)
 		await self.chunks[raw.seq_id].Put(raw)
 		if not self.chunks[raw.seq_id].IsFinish():
-			log.debug(f"Subpackage {raw.seq_id}:{raw.cur_idx}/{raw.total_cnt} - {len(raw.body)} bytes <<< {repr(raw.body[:30])} ...>>> <- {raw.sender}")
+			log.debug(f"Subpackage {raw.seq_id}:{raw.cur_idx}/{raw.total_cnt} - {len(raw.body)} bytes <<< {repr(raw.body[:utils.LOG_BYTES_LEN])} ...>>> <- {raw.sender}")
 			# current package is a subpackage. we should not invoke internal callbacks until all package has received.
 			return None
-		log.debug(f"Subpackage {raw.seq_id}:{raw.cur_idx}/{raw.total_cnt} - {len(raw.body)} bytes <<< {repr(raw.body[-30:])} ...>>> <x- {raw.sender}")
+		log.debug(f"Subpackage {raw.seq_id}:{raw.cur_idx}/{raw.total_cnt} - {len(raw.body)} bytes <<< {repr(raw.body[-utils.LOG_BYTES_LEN:])} ...>>> <x- {raw.sender}")
 		ret = self.chunks[raw.seq_id].Combine()
 		del self.chunks[raw.seq_id]
 		return ret
@@ -346,6 +350,7 @@ class Client:
 		while curTries < self.config.maxRetries:
 			async with aiohttp.ClientSession() as session:
 				async with session.ws_connect(self.url, headers=self.HttpUpgradedWebSocketHeaders, max_msg_size=self.WebSocketMaxReadingMessageSize) as ws:
+					log.info(f"Initializing...")
 					self.status = self.STATUS_INITIALIZING
 					initRet = await self.initialize(ws)
 					if initRet is  None:
@@ -372,8 +377,8 @@ class Client:
 			else:
 				break
 		bakHandler = self.ws
-		self.ws = None
 		await self.forward_session.close()
+		self.ws = None
 		return bakHandler
 	
 async def main(config: Configuration):
