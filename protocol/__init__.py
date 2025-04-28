@@ -155,18 +155,13 @@ class PackageId:
 		return ret
 
 class Request(Transport):
-	PRINT_ONCE_MSG = True
-	def __init__(self, encrypt: typing.Optional[encryptor.Cipher] = None):
+	def __init__(self, encrypt: encryptor.Cipher):
 		super().__init__(Transport.REQUEST)
 		self.url = ""
 		self.method = ""
 		self.headers: typing.Dict[str, str] = {}
 		self.body = None
 		self.encrypt = encrypt
-
-		if self.encrypt is None and self.PRINT_ONCE_MSG and log is not None:
-			self.PRINT_ONCE_MSG = False
-			log.error(f"Protocol] Request's encrypt is None. If not on purpose, please check the code and fix that.", exc_info=True)
 
 	def Init(self, url: str, method: str, headers: typing.Dict[str, str]):
 		self.url = url
@@ -185,8 +180,7 @@ class Request(Transport):
 			req.body = self.body
 		
 		self.data = req.SerializeToString()
-		if self.encrypt is not None:
-			self.data = self.encrypt.Encrypt(self.data)
+		self.data = self.encrypt.Encrypt(self.data)
 
 		return super().Pack()
 	
@@ -195,8 +189,7 @@ class Request(Transport):
 		assert self.transportType == Transport.REQUEST, f"protocol.Request got package indicated as {Transport.Mappings.ValueToString(self.transportType)} which should be {Transport.Mappings.ValueToString(Transport.REQUEST)}."
 
 		data = self.data
-		if self.encrypt is not None:
-			data = self.encrypt.Decrypt(data)
+		data = self.encrypt.Decrypt(data)
 
 		pbt = pb.Request()
 		pbt.ParseFromString(data)
@@ -206,18 +199,13 @@ class Request(Transport):
 		self.body = pbt.body
 
 class Response(Transport):
-	PRINT_ONCE_MSG = True
-	def __init__(self, encrypt: typing.Optional[encryptor.Cipher] = None):
+	def __init__(self, encrypt: encryptor.Cipher):
 		super().__init__(Transport.RESPONSE)
 		self.url = ""
 		self.status = -1
 		self.headers: typing.Dict[str, str] = {}
 		self.body = b''
 		self.encrypt = encrypt
-
-		if self.encrypt is None and self.PRINT_ONCE_MSG and log is not None:
-			self.PRINT_ONCE_MSG = False
-			log.error(f"Protocol] Response's encrypt is None. If not on purpose, please check the code and fix that.", exc_info=True)
 
 	def Init(self, url: str, status: int, headers: typing.Dict[str, str], body: bytes = b''):
 		self.url = url
@@ -236,8 +224,7 @@ class Response(Transport):
 		res.body = self.body
 
 		self.data = res.SerializeToString()
-		if self.encrypt is not None:
-			self.data = self.encrypt.Encrypt(self.data)
+		self.data = self.encrypt.Encrypt(self.data)
 
 		return super().Pack()
 	
@@ -246,8 +233,7 @@ class Response(Transport):
 		assert self.transportType == Transport.RESPONSE, f"protocol.Response got package indicated as {Transport.Mappings.ValueToString(self.transportType)} which should be {Transport.Mappings.ValueToString(Transport.RESPONSE)}."
 
 		data = self.data
-		if self.encrypt is not None:
-			data = self.encrypt.Decrypt(data)
+		data = self.encrypt.Decrypt(data)
 
 		pbt = pb.Response()
 		pbt.ParseFromString(data)
@@ -258,22 +244,17 @@ class Response(Transport):
 
 class Subpackage(Transport):
 	PRINT_ONCE_MSG = True
-	def __init__(self, encrypt: typing.Optional[encryptor.Cipher] = None):
+	def __init__(self, encrypt: encryptor.Cipher):
 		super().__init__(Transport.SUBPACKAGE)
 		self.encrypt = encrypt
 		self.body = b''
-
-		if self.encrypt is None and self.PRINT_ONCE_MSG and log is not None:
-			self.PRINT_ONCE_MSG = False
-			log.error(f"Protocol] Subpackage's encrypt is None. If not on purpose, please check the code and fix that.", exc_info=True)
 
 	def SetBody(self, body: bytes):
 		self.body = body
 	
 	def Pack(self) -> bytes:
 		self.data = self.body
-		if self.encrypt is not None:
-			self.data = self.encrypt.Encrypt(self.data)
+		self.data = self.encrypt.Encrypt(self.data)
 
 		return super().Pack()
 	
@@ -283,12 +264,11 @@ class Subpackage(Transport):
 		assert self.transportType == self.EXPECT_TYPE, f"protocol.Subpackage got package {transport.seq_id} indicated as {Transport.Mappings.ValueToString(self.transportType)} which should be {Transport.Mappings.ValueToString(self.EXPECT_TYPE)}."
 
 		self.body = self.data
-		if self.encrypt is not None:
-			self.body = self.encrypt.Decrypt(self.body)
+		self.body = self.encrypt.Decrypt(self.body)
 
 class StreamData(Subpackage):
 	EXPECT_TYPE = Transport.STREAM_DATA
-	def __init__(self, encrypt: typing.Optional[encryptor.Cipher] = None):
+	def __init__(self, encrypt: encryptor.Cipher):
 		super().__init__(encrypt)
 		self.transportType = Transport.STREAM_DATA
 
@@ -499,7 +479,7 @@ class Control(Transport):
 		self.body = pbt.data
 
 
-def Parse(data: bytes, encrypt: typing.Optional[encryptor.Cipher] = None) -> typing.Union[Request, Response, Subpackage, StreamData, Control]:
+def Parse(data: bytes, encrypt: encryptor.Cipher) -> typing.Union[Request, Response, Subpackage, StreamData, Control]:
 	raw = Transport.Parse(data)
 
 	if raw.transportType == Transport.REQUEST:

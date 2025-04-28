@@ -17,12 +17,8 @@ utils.log = log
 class Configuration:
 	def __init__(self, args):
 		self.server: str = args.server
-		if args.cipher != "":
-			self.cipher = encryptor.NewCipher(args.cipher, args.key)
-		else:
-			self.cipher = None
-		if self.cipher is not None:
-			log.info(f"Using cipher: {self.cipher.GetName()}")
+		self.cipher = encryptor.NewCipher(args.cipher, args.key)
+		log.info(f"Using cipher: {self.cipher.GetName()}")
 
 		self.prefix: str = args.prefix
 		self.port: int = args.port
@@ -39,6 +35,7 @@ class Configuration:
 		self.safeSegmentSize: int  = args.safe_segment_size
 		self.streamRetrieveTimeout: int = args.stream_retrieve_timeout
 		self.streamRetrieveTimes: int = args.stream_retrieve_times
+		self.allowOFOResend: bool  = args.allow_ofo_resend
 
 		# debug only
 		self.force_id: str = args.force_id
@@ -58,12 +55,13 @@ class Configuration:
 		parser.add_argument("--prefer_img_quality", type=int, default=75, help="Compress the image to transfer fasterly.")
 
 		parser.add_argument("--max_retries", type=int, default=3, help="Maximum number of retries")
-		parser.add_argument("--cache_queue_size", type=int, default=100, help="Maximum number of messages to cache")
+		parser.add_argument("--cache_queue_size", type=int, default=150, help="Maximum number of messages to cache. Must bigger than server's cache queue size.")
 		parser.add_argument("--timeout", type=int, default=60, help="The maximum seconds to resend packages.")
 		parser.add_argument("--max_heapsse_buffer_size", type=int, default=20)
 		parser.add_argument("--safe_segment_size", type=int, default=768*1024, help="Maximum size of messages to send, in Bytes")
 		parser.add_argument("--stream_retrieve_timeout", type=int, default=time_utils.Seconds(3))
 		parser.add_argument("--stream_retrieve_times", type=int, default=3)
+		parser.add_argument("--allow_ofo_resend", action="store_true", help="Allow out of order message to be resend. Disable this feature may results in buffer overflow issue. By default, this feature is disable.")
 
 		parser.add_argument("--force_id", type=str, default="")
 		return parser
@@ -294,7 +292,7 @@ class Client:
 	async def waitForOnePackage(self, ws: web.WebSocketResponse):
 		async for msg in ws:
 			if msg.type == aiohttp.WSMsgType.ERROR:
-				log.error(f"1Pkg] Error: {ws.exception()}")
+				log.error(f"1Pkg] Error: {ws.exception()}", exc_info=True, stack_info=True)
 			elif msg.type == aiohttp.WSMsgType.TEXT or msg.type == aiohttp.WSMsgType.BINARY:
 				transport = protocol.Transport.Parse(msg.data)
 				log.debug(f"1Pkg] {protocol.Transport.Mappings.ValueToString(transport.transportType)} {transport.seq_id}:{transport.cur_idx}/{transport.total_cnt} <- {transport.sender}")
@@ -446,10 +444,13 @@ class Client:
 						curTries = 0
 						log.info(f"Start mainloop...")
 
-						asyncio.ensure_future(self.resendScheduledPackages())
+						if self.config.allowOFOResend:
+							asyncio.ensure_future(self.resendScheduledPackages())
+						else:
+							await self.resendScheduledPackages()
 						async for msg in self.ws:
 							if msg.type == aiohttp.WSMsgType.ERROR:
-								log.error(f"Tunnel] Exception: {self.ws.exception()}")
+								log.error(f"Tunnel] Exception: {self.ws.exception()}", stack_info=True, exc_info=True)
 							elif msg.type == aiohttp.WSMsgType.TEXT or msg.type == aiohttp.WSMsgType.BINARY:
 								parsed = protocol.Parse(msg.data, self.config.cipher)
 								shouldRuninng = await self.OnPackage(parsed)
@@ -511,11 +512,13 @@ class StableDiffusionCachingClient(Client):
 		#http://127.0.0.1:7860/file=extensions/a1111-sd-webui-tagcomplete/javascript/ext_umi.js?1729071885.9683821=
 		#http://127.0.0.1:7860/file=C:/Users/xxx/AppData/Local/Temp/gradio/tmpey_xm_6q.png
 
+		self.nocipher = encryptor.NewCipher('plain', '')
+
 	def readCache(self, filename: str, url: str):
 		log.debug(f'Using cache: {url} => {filename}')
 		with open(filename, 'rb') as f:
 			body = f.read()
-		resp = protocol.Response(None) # this line will report encrypt is None, it doesn't matter
+		resp = protocol.Response(self.nocipher)
 		resp.SetSenderReceiver(self.config.target_uid, self.config.uid)
 		resp.Init(url, 200, {
 			'Content-Type': utils.GuessMimetype(filename),
@@ -567,7 +570,7 @@ class StableDiffusionCachingClient(Client):
 					dirname = os.path.dirname(targetfn)
 					os.makedirs(dirname, exist_ok=True)
 				except Exception as e:
-					log.error(f"Failed to create dir: {dirname} for request url: {request.url}, error: {e}")
+					log.error(f"Failed to create dir: {dirname} for request url: {request.url}, error: {e}", exc_info=True, stack_info=True)
 				with open(targetfn, 'wb') as f:
 					f.write(resp.body)
 					log.debug(f'Cache {parsed_url.path} to {targetfn}')

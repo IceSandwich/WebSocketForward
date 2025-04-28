@@ -31,13 +31,28 @@ class XorCipher(Cipher):
 	def Decrypt(self, data: bytes) -> bytes:
 		return self.Encrypt(data)
 	
-def NewCipher(method: str, key: str):
+class PlainCipher(Cipher):
+	def __init__(self, key: str):
+		super().__init__()
+
+	def GetName(self) -> str:
+		return "PlainCipher"
+	
+	def Encrypt(self, data: bytes) -> bytes:
+		return data
+	
+	def Decrypt(self, data: bytes) -> bytes:
+		return data
+	
+def NewCipher(method: str, key: str) -> Cipher:
 	method = method.lower()
 
 	if method == 'xor':
 		return XorCipher(key)
+	elif method == 'plain':
+		return PlainCipher(key)
 
 	raise ValueError(f'Invalid cipher method: {method}')
 
 def GetAvailableCipherMethods():
-	return ['xor']
+	return ['xor', 'plain']

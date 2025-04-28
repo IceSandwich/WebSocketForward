@@ -16,18 +16,16 @@ utils.log = log
 class Configuration:
 	def __init__(self, args):
 		self.server: str = args.server
-		if args.cipher != "":
-			self.cipher = encryptor.NewCipher(args.cipher, args.key)
-		else:
-			self.cipher = None
-		if self.cipher is not None:
-			log.info(f"Using cipher: {self.cipher.GetName()}")
+		self.cipher = encryptor.NewCipher(args.cipher, args.key)
+		log.info(f"Using cipher: {self.cipher.GetName()}")
+		
 		self.uid: str = args.uid
 		self.target_uid: str = args.target_uid
 
 		self.maxRetries:int = args.max_retries
 		self.cacheQueueSize: int  = args.cache_queue_size
 		self.safeSegmentSize: int  = args.safe_segment_size
+		self.allowOFOResend: bool  = args.allow_ofo_resend
 
 		# debug only
 		self.force_id: str = args.force_id
@@ -41,8 +39,9 @@ class Configuration:
 		parser.add_argument("--target_uid", type=str, default="Remote")
 
 		parser.add_argument("--max_retries", type=int, default=3, help="Maximum number of retries")
-		parser.add_argument("--cache_queue_size", type=int, default=100, help="Maximum number of messages to cache")
+		parser.add_argument("--cache_queue_size", type=int, default=128, help="Maximum number of messages to cache. Must smaller than server's cache queue size. Bigger is better since remote need retreive pkg.")
 		parser.add_argument("--safe_segment_size", type=int, default=768*1024, help="Maximum size of messages to send, in Bytes")
+		parser.add_argument("--allow_ofo_resend", action="store_true", help="Allow out of order message to be resend. Disable this feature may results in buffer overflow issue. By default, this feature is disable.")
 
 		parser.add_argument("--force_id", type=str, default="")
 		return parser
@@ -78,7 +77,7 @@ class Client:
 	async def waitForOnePackage(self, ws: web.WebSocketResponse):
 		async for msg in ws:
 			if msg.type == aiohttp.WSMsgType.ERROR:
-				log.error(f"1Pkg] Error: {ws.exception()}")
+				log.error(f"1Pkg] Error: {ws.exception()}", exc_info=True, stack_info=True)
 			elif msg.type == aiohttp.WSMsgType.TEXT or msg.type == aiohttp.WSMsgType.BINARY:
 				transport = protocol.Transport.Parse(msg.data)
 				log.debug(f"1Pkg] {protocol.Transport.Mappings.ValueToString(transport.transportType)} {transport.seq_id}:{transport.cur_idx}/{transport.total_cnt} <- {transport.sender}")
@@ -117,8 +116,8 @@ class Client:
 		# 	return
 
 		# server will send all package he received. we need to decide which package to resend.
-		log.debug(f"Server reported {len(hello.pkgs)} packages received.")
 		async with self.sendQueueLock:
+			log.debug(f"Server reported {len(hello.pkgs)} packages received, will be compared to {len(self.sendQueue)} packages.")
 			for item in self.sendQueue:
 				found = False
 				for pkg in hello.pkgs:
@@ -127,7 +126,7 @@ class Client:
 						break
 				if found == False:
 					# 放入scheduleSendQueue而不是直接发送，是因为当前没有监听收包，万一对方发送大量的包，这里缓冲区就爆了
-					# 因此放入schedule里，进入connect状态后，边监听边发送这些包
+					# 因此放入schedule里，进入connect状态后，边监听边发送这些包（当开启OFOResend时）。缺点是导致乱序。
 					await self.scheduleSendQueue.put(item)
 
 			self.ws = ws
@@ -140,6 +139,11 @@ class Client:
 
 	async def QueueSend(self, raw: protocol.Transport):
 		async with self.sendQueueLock:
+			# check
+			if raw.sender != self.name:
+				log.error(f"{self.name}] Send a package {raw.seq_id}:{protocol.Transport.Mappings.ValueToString(raw.transportType)} to {raw.receiver} but it's sender is {raw.sender}, which should be {self.name}. Online fix that.")
+				raw.sender = self.name
+
 			if raw.transportType != protocol.Transport.CONTROL:
 				self.sendQueue.Add(raw)
 
@@ -148,7 +152,7 @@ class Client:
 				try:
 					await self.DirectSend(raw)
 				except Exception as e:
-					log.error(f"Failed Cannot Queuesend package {raw.seq_id}:{raw.cur_idx}/{raw.total_cnt} of type {protocol.Transport.Mappings.ValueToString(raw.transportType)}, err: {e}")
+					log.error(f"Failed Cannot Queuesend package {raw.seq_id}:{raw.cur_idx}/{raw.total_cnt} of type {protocol.Transport.Mappings.ValueToString(raw.transportType)}, schedule to resend in next connection. err: {e}")
 	
 	async def QueueSendSmartSegments(self, raw: typing.Union[protocol.Request, protocol.Response]):
 		"""
@@ -210,7 +214,7 @@ class Client:
 				# 第一个response的idx为0，第一个sse_subpackage的idx为1
 				cur_idx = cur_idx + 1
 		except Exception as e:
-			log.error(f'Stream {req.seq_id} end iter unexpectally. err: {e}')
+			log.error(f'Stream {req.seq_id} end iter unexpectally. err: {e}', exc_info=True, stack_info=True)
 		finally:
 			raw = protocol.StreamData(self.config.cipher)
 			raw.SetForResponseTransport(req)
@@ -225,7 +229,7 @@ class Client:
 		try:
 			resp = await self.forward_session.request(req.method, req.url, headers=req.headers, data=req.body)
 		except aiohttp.ClientConnectorError as e:
-			log.error(f'Failed to forward request {req.url}: {e}')
+			log.error(f'Failed to forward request {req.url}: {e}', exc_info=True, stack_info=True)
 			rep = protocol.Response(self.config.cipher)
 			rep.SetForResponseTransport(req)
 			rep.Init(req.url, 502, { 'Content-Type': 'text/plain; charset=utf-8', }, f'=== Proxy server cannot request: {e}'.encode('utf8'))
@@ -279,6 +283,8 @@ class Client:
 						break
 			if found == False:
 				await self.SendMsg(f"Cannot retreive package {pi.seq_id} because it doesn't exist in send queue.")
+			else:
+				log.debug(f"{self.name}] Retrieve package {pi.seq_id}:{pi.cur_idx}/{pi.total_cnt}.")
 		else:
 			log.error(f"{self.name}] Unsupported control type({protocol.Control.Mappings.ValueToString(ctrlType)})")
 		return True
@@ -359,10 +365,13 @@ class Client:
 						curTries = 0
 						log.info(f"Start mainloop...")
 
-						asyncio.ensure_future(self.resendScheduledPackages())
+						if self.config.allowOFOResend:
+							asyncio.ensure_future(self.resendScheduledPackages())
+						else:
+							await self.resendScheduledPackages()
 						async for msg in self.ws:
 							if msg.type == aiohttp.WSMsgType.ERROR:
-								log.error(f"{self.name}] WSException: {self.ws.exception()}")
+								log.error(f"{self.name}] WSException: {self.ws.exception()}", exc_info=True, stack_info=True)
 							elif msg.type == aiohttp.WSMsgType.TEXT or msg.type == aiohttp.WSMsgType.BINARY:
 								parsed = protocol.Parse(msg.data, self.config.cipher)
 								shouldRuninng = await self.OnPackage(parsed)
@@ -379,11 +388,15 @@ class Client:
 		bakHandler = self.ws
 		await self.forward_session.close()
 		self.ws = None
+		log.info(f"Program exit normally.")
 		return bakHandler
 	
 async def main(config: Configuration):
 	client = Client(config)
-	await client.MainLoop()
+	try:
+		await client.MainLoop()
+	except Exception as e:
+		log.error(f"Exception in mainloop: {e}.", exc_info=True, stack_info=True)
 
 if __name__ == "__main__":
 	argparse = argp.ArgumentParser()

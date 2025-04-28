@@ -20,13 +20,15 @@ class Configuration:
 		self.timeout = time_utils.Seconds(args.timeout)
 		self.cacheSize: int = args.cache_size
 		self.listen_route: str = args.listen_route
+		self.allowOFOResend: bool  = args.allow_ofo_resend
 
 	@classmethod
 	def SetupParser(cls, parser: argp.ArgumentParser):
 		parser.add_argument("--server", type=str, default="127.0.0.1:8030", help="The address to listen on.")
-		parser.add_argument("--cache_size", type=int, default=128, help="The maximum number of packages to cache. Set 0 to disable cache.")
+		parser.add_argument("--cache_size", type=int, default=140, help="The maximum number of packages to cache. Set 0 to disable cache.")
 		parser.add_argument("--timeout", type=int, default=60, help="The maximum seconds to resend packages.")
 		parser.add_argument("--listen_route", type=str, default='/wsf/ws')
+		parser.add_argument("--allow_ofo_resend", action="store_true", help="Allow out of order message to be resend. Disable this feature may results in buffer overflow issue. By default, this feature is disable.")
 		return parser
 
 	def GetListenedAddress(self):
@@ -100,7 +102,7 @@ class Server:
 	async def waitForOnePackage(self, ws: web.WebSocketResponse):
 		async for msg in ws:
 			if msg.type == aiohttp.WSMsgType.ERROR:
-				log.error(f"{self.name}]1Pkg] Error on waiting 1 package: {ws.exception()}")
+				log.error(f"{self.name}]1Pkg] Error on waiting 1 package: {ws.exception()}", exc_info=True, stack_info=True)
 			elif msg.type == aiohttp.WSMsgType.TEXT or msg.type == aiohttp.WSMsgType.BINARY:
 				transport = protocol.Transport.Parse(msg.data)
 				log.debug(f"{self.name}]1Pkg] Got one package: {transport.seq_id}:{protocol.Transport.Mappings.ValueToString(transport.transportType)} from {transport.sender}")
@@ -118,21 +120,33 @@ class Server:
 		若发送Control包，仅当当前状态是连接时才发送，否则丢弃包。
 		"""
 		async with self.sendQueueLock:
-			# donot cache control package
-			if transport.transportType != protocol.Transport.CONTROL:
-				transport.timestamp = time_utils.GetTimestamp()
-				self.sendQueue.Add(transport)
-
 			# check
 			if transport.receiver != self.name:
 				log.error(f"{self.name}] Send a package {transport.seq_id}:{protocol.Transport.Mappings.ValueToString(transport.transportType)} to {self.name} but it's receiver is {transport.receiver}, sent by {transport.sender}. Online fix that.")
 				transport.receiver = self.name
 
+			# donot cache control package
+			if transport.transportType != protocol.Transport.CONTROL:
+				transport.timestamp = time_utils.GetTimestamp()
+				self.sendQueue.Add(transport)
+
 			if self.status == self.STATUS_CONNECTED:
-				await self.DirectSend(transport)
+				try:
+					await self.DirectSend(transport)
+				except Exception as e:
+					if self.clientType == protocol.ClientInfo.REMOTE:
+						pass
+					else:
+						log.error(f"{self.name}] Failed to send {protocol.Transport.Mappings.ValueToString(transport.transportType)} package {transport.seq_id}:{transport.cur_idx}/{transport.total_cnt}, schedule to resend in next connection(without control pkgs). err: {e}")
+						await self.scheduleSendQueue.put(transport)
 			else:
-				await self.scheduleSendQueue.put(transport)
-				log.debug(f"Send] Caching {transport.seq_id} because the instance is disconnected.")
+				if self.clientType == protocol.ClientInfo.REMOTE:
+					# Remote 在重连时可以从sendQueue里找它没收到的包，因此无需放入scheduleSendQueue。
+					# 而 Client 没有这个能力，需要服务端缓存这些包等到下次连接后发送。
+					pass
+				else:
+					await self.scheduleSendQueue.put(transport)
+					log.debug(f"Send] Caching {transport.seq_id} because the instance is disconnected.")
 
 	async def SendMsg(self, msg: str, ws: typing.Optional[web.WebSocketResponse] = None):
 		ctrl = protocol.Control()
@@ -176,6 +190,8 @@ class Server:
 				self.clientId = hello.info.id
 				self.sendQueue.Clear()
 				self.scheduleSendQueue = asyncio.Queue()
+				async with self.receiveQueueLock:
+					self.receiveQueue.Clear()
 				ret = protocol.Control()
 				ret.SetForResponseTransport(pkg)
 				ret.InitHelloServerControl(protocol.HelloServerControl())
@@ -228,47 +244,51 @@ class Server:
 			self.status = self.STATUS_CONNECTED
 
 		return None
+	
+	async def processControlPackage(self, raw: protocol.Transport):
+		pkg = protocol.Control()
+		pkg.Unpack(raw)
+
+		ctrlType = pkg.GetControlType()
+		if ctrlType == protocol.Control.QUERY_CLIENTS:
+			# check
+			if pkg.receiver != "":
+				log.error(f"{self.name}] Receive QueryClientsControl package {pkg.seq_id} but it's receiver is not server. Online fix it.")
+				pkg.receiver = ""
+
+			qcc = self.router.ReportConnectedClients()
+			ret = protocol.Control()
+			ret.SetForResponseTransport(pkg)
+			ret.InitQueryClientsControl(qcc)
+			log.debug(f"{self.name}] Query clients: {len(qcc)} clients[{', '.join([x.id for x in qcc.connected])}].")
+			await self.Send(ret)
+		elif ctrlType == protocol.Control.RETRIEVE_PKG:
+			pi = pkg.DecodeRetrievePkg()
+			found = False
+			async with self.sendQueueLock:
+				for item in self.sendQueue:
+					if pi.IsSamePackage(item):
+						found = True
+						log.debug(f"Hit cache for package {item.seq_id}.")
+						await self.DirectSend(item)
+						break
+			if found == False:
+				log.debug(f"Not hit cache and route to {pkg.receiver} for package {pi.seq_id}")
+				await self.router.Route(pkg)
+		elif ctrlType == protocol.Control.PRINT:
+			if pkg.receiver == "":
+				log.info(f"% {pkg.DecodePrintMsg()}")
+			else:
+				await self.router.Route(pkg)
+		elif pkg.receiver == "":
+			await self.router.SendMsg(pkg.sender, f"Server] Unsupported control type({protocol.Control.Mappings.valueToString(ctrlType)}) to server. Drop control package {pkg.seq_id}.")
+		else:
+			await self.router.Route(pkg)
+
 
 	async def OnPackage(self, raw: protocol.Transport):
 		if raw.transportType == protocol.Transport.CONTROL:
-			pkg = protocol.Control()
-			pkg.Unpack(raw)
-
-			ctrlType = pkg.GetControlType()
-			if ctrlType == protocol.Control.QUERY_CLIENTS:
-				# check
-				if pkg.receiver != "":
-					log.error(f"{self.name}] Receive QueryClientsControl package {pkg.seq_id} but it's receiver is not server. Online fix it.")
-					pkg.receiver = ""
-
-				qcc = self.router.ReportConnectedClients()
-				ret = protocol.Control()
-				ret.SetForResponseTransport(pkg)
-				ret.InitQueryClientsControl(qcc)
-				log.debug(f"{self.name}] Query clients: {len(qcc)} clients[{', '.join([x.id for x in qcc.connected])}].")
-				await self.Send(ret)
-			elif ctrlType == protocol.Control.RETRIEVE_PKG:
-				pi = pkg.DecodeRetrievePkg()
-				found = False
-				async with self.sendQueueLock:
-					for item in self.sendQueue:
-						if pi.IsSamePackage(item):
-							found = True
-							log.debug(f"Hit cache for package {item.seq_id}.")
-							await self.DirectSend(item)
-							break
-				if found == False:
-					log.debug(f"Not hit cache and route to {pkg.receiver} for package {pi.seq_id}")
-					await self.router.Route(pkg)
-			elif ctrlType == protocol.Control.PRINT:
-				if pkg.receiver == "":
-					log.info(f"% {pkg.DecodePrintMsg()}")
-				else:
-					await self.router.Route(pkg)
-			elif pkg.receiver == "":
-				await self.router.SendMsg(pkg.sender, f"Server] Unsupported control type({protocol.Control.Mappings.valueToString(ctrlType)}) to server. Drop control package {pkg.seq_id}.")
-			else:
-				await self.router.Route(pkg)
+			await self.processControlPackage(raw)
 		else:
 			async with self.receiveQueueLock:
 				self.receiveQueue.Add(protocol.PackageId.FromPackage(raw))
@@ -302,7 +322,7 @@ class Server:
 		try:
 			prepareRet = await self.initialize(ws)
 		except Exception as e:
-			log.error(f"{self.name}] Error in initialize. {e}")
+			log.error(f"{self.name}] Error in initialize. {e}", exc_info=True, stack_info=True)
 			prepareRet = ws
 		if prepareRet is not None:
 			self.status = self.STATUS_INIT
@@ -312,11 +332,14 @@ class Server:
 		self.ws = ws
 		self.status = self.STATUS_CONNECTED
 		await self.OnConnected()
-		asyncio.ensure_future(self.resendScheduledPackages())
+		if self.config.allowOFOResend:
+			asyncio.ensure_future(self.resendScheduledPackages())
+		else:
+			await self.resendScheduledPackages()
 		try:
 			async for msg in ws:
 				if msg.type == aiohttp.WSMsgType.ERROR:
-					log.error(f"{self.name}] {ws.exception()}")
+					log.error(f"{self.name}] {ws.exception()}", exc_info=True, stack_info=True)
 				elif msg.type == aiohttp.WSMsgType.TEXT or msg.type == aiohttp.WSMsgType.BINARY:
 					transport = protocol.Transport.Parse(msg.data)
 					log.debug(f"{self.name}] {transport.seq_id}:{protocol.Transport.Mappings.ValueToString(transport.transportType)}:{transport.cur_idx}/{transport.total_cnt} route {transport.sender} => {transport.receiver}")
@@ -328,7 +351,7 @@ class Server:
 
 					await self.OnPackage(transport)
 		except Exception as e:
-			log.error(f"{self.name}] Mainloop error: {e}")
+			log.error(f"{self.name}] Mainloop error: {e}", exc_info=True, stack_info=True)
 			
 		self.status = self.STATUS_INIT
 		await self.OnDisconnected()
