@@ -211,18 +211,24 @@ class Timer:
 			self.condition.notify_all()
 
 	async def mainloop(self):
+		log.debug(f"Timer] Start mainloop")
 		while True:
 			async with self.condition:
 				await self.condition.wait_for(lambda: len(self.tasks) > 0 or self.runningSignal == False)
 				if self.runningSignal == False:
 					return
 				item = heapq.heappop(self.tasks)
-			if item.time <= 0:
-				continue
-			await asyncio.sleep(item.time)
-			if log is not None:
-				log.debug(f"Timer] After {item.time}, invoke run()")
-			await item.Run()
+			
+			try:
+				if item.time <= 0:
+					continue
+				await asyncio.sleep(item.time)
+				if log is not None:
+					log.debug(f"Timer] After {item.time}, invoke run()")
+				await item.Run()
+			except Exception as e:
+				log.error(f"Timer] Exception: {e}", exc_info=True, stack_info=True)
+
 			async with self.condition: # this will change the new packages added during sleep time. So utils.Timer is not a accurate timer.
 				for task in self.tasks:
 					task.time -= item.time

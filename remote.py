@@ -217,7 +217,7 @@ class Client:
 				nonlocal state
 				nonlocal stateTimestamp
 				nonlocal stateLock
-				with stateLock:
+				async with stateLock:
 					if stateTimestamp == that.timestamp:
 						log.debug(f"Stream {seq_id} change from {state} to {that.target_state}")
 						state = that.target_state
