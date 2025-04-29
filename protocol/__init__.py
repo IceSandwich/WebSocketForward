@@ -70,6 +70,9 @@ class Transport:
 		self.receiver = receiverId
 
 	def SetForResponseTransport(self, transport):
+		"""
+		反转发送者和接收者，保持同一个seq_id
+		"""
 		self.sender = transport.receiver
 		self.receiver = transport.sender
 		self.seq_id = transport.seq_id

@@ -107,6 +107,7 @@ class Client:
 		self.streamCondition = asyncio.Condition()
 
 		self.ws: aiohttp.ClientWebSocketResponse = None
+		self.ws_timeout = aiohttp.ClientWSTimeout(ws_close=time_utils.Minutes(2))
 		self.timer = utils.Timer()
 
 		self.exitFunc: typing.Coroutine[typing.Any, typing.Any, typing.Any] = None
@@ -208,8 +209,9 @@ class Client:
 		stateTimestamp = time_utils.GetTimestamp()
 		stateLock = asyncio.Lock()
 		class RetrieveTimerCallback(utils.TimerTask):
-			def __init__(that):
+			def __init__(that, target_state: int):
 				super().__init__(self.config.streamRetrieveTimeout)
+				that.target_state = target_state
 			
 			async def Run(that):
 				nonlocal state
@@ -217,10 +219,10 @@ class Client:
 				nonlocal stateLock
 				with stateLock:
 					if stateTimestamp == that.timestamp:
-						print(f"Stream {seq_id} change from {state} to should retrieve")
-						state = self.STREAM_STATE_SHOULD_RETRIEVE
+						log.debug(f"Stream {seq_id} change from {state} to {that.target_state}")
+						state = that.target_state
 					else:
-						print(f"Stream {seq_id} timetask outdate. expect {that.timestamp} but got {stateTimestamp}")
+						log.debug(f"Stream {seq_id} timetask outdate. expect {that.timestamp} but got {stateTimestamp}, current state: {state}, want to change to {that.target_state}")
 
 		while True:
 			async with self.streamCondition:
@@ -235,13 +237,13 @@ class Client:
 						continue
 
 					# 过新的包
-					log.warning(f"Stream {seq_id}:{self.streamHeap[seq_id][0].cur_idx} > {expectIdx} - Receive this newer package, current heap: {[x.cur_idx for x in self.streamHeap[seq_id]]}.")
 					if state == self.STREAM_STATE_NONE:
+						log.warning(f"Stream {seq_id}:{self.streamHeap[seq_id][0].cur_idx} > {expectIdx} - Receive this newer package, current heap: {[x.cur_idx for x in self.streamHeap[seq_id]]}.")
 						async with stateLock:
 							state = self.STREAM_STATE_WAIT_TO_RETRIEVE
 
 							# 启动计时器
-							cb = RetrieveTimerCallback()
+							cb = RetrieveTimerCallback(self.STREAM_STATE_SHOULD_RETRIEVE)
 							stateTimestamp = cb.GetTimestamp()
 						await self.timer.AddTask(cb)
 						log.debug(f"Stream {seq_id} - Start timer, wait for {expectIdx}")
@@ -257,16 +259,20 @@ class Client:
 						continue
 					elif state == self.STREAM_STATE_SHOULD_RETRIEVE:
 						if sendRetreveTimes <= self.config.streamRetrieveTimes:
-							log.debug(f"Stream {seq_id} - Send retrieve request, cur times: {sendRetreveTimes}")
+							log.debug(f"Stream {seq_id} - Send retrieve request, cur times: {sendRetreveTimes}, waiting {expectIdx}")
 							raw = protocol.Control()
 							raw.SetForResponseTransport(self.streamHeap[seq_id][0])
-							raw.InitRetrievePkg(protocol.PackageId(
-								cur_idx=expectIdx,
-								total_cnt=0,
-								seq_id=seq_id
-							))
+							raw.InitRetrievePkg(protocol.PackageId(cur_idx=expectIdx, total_cnt=0, seq_id=seq_id))
 							await self.DirectSend(raw)
 							sendRetreveTimes = sendRetreveTimes + 1
+
+							async with stateLock:
+								state = self.STREAM_STATE_WAIT_TO_RETRIEVE
+
+								# 启动计时器
+								cb = RetrieveTimerCallback(self.STREAM_STATE_SHOULD_RETRIEVE)
+								stateTimestamp = cb.GetTimestamp()
+							await self.timer.AddTask(cb)
 							continue
 						else:
 							log.error(f"Stream {seq_id} - Failed to retrieve {expectIdx} in {sendRetreveTimes} times, current heap: {[x.cur_idx for x in self.streamHeap[seq_id]]}. Pop one anyway.")
@@ -434,7 +440,7 @@ class Client:
 		self.timer.Start()
 		while curTries < self.config.maxRetries:
 			async with aiohttp.ClientSession() as session:
-				async with session.ws_connect(self.url, headers=self.HttpUpgradedWebSocketHeaders, max_msg_size=self.WebSocketMaxReadingMessageSize) as ws:
+				async with session.ws_connect(self.url, headers=self.HttpUpgradedWebSocketHeaders, max_msg_size=self.WebSocketMaxReadingMessageSize, timeout=self.ws_timeout) as ws:
 					self.status = self.STATUS_INITIALIZING
 					log.info(f"Initializing...")
 					initRet = await self.initialize(ws)

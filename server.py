@@ -136,7 +136,7 @@ class Server:
 				except Exception as e:
 					if self.clientType == protocol.ClientInfo.REMOTE:
 						pass
-					else:
+					elif transport.transportType != protocol.Transport.CONTROL: # 不缓存Control包
 						log.error(f"{self.name}] Failed to send {protocol.Transport.Mappings.ValueToString(transport.transportType)} package {transport.seq_id}:{transport.cur_idx}/{transport.total_cnt}, schedule to resend in next connection(without control pkgs). err: {e}")
 						await self.scheduleSendQueue.put(transport)
 			else:
@@ -144,9 +144,9 @@ class Server:
 					# Remote 在重连时可以从sendQueue里找它没收到的包，因此无需放入scheduleSendQueue。
 					# 而 Client 没有这个能力，需要服务端缓存这些包等到下次连接后发送。
 					pass
-				else:
+				elif transport.transportType != protocol.Transport.CONTROL: # 不缓存Control包
+					log.debug(f"Send] Caching {protocol.Transport.Mappings.ValueToString(transport.transportType)} package {transport.seq_id}:{transport.cur_idx}/{transport.total_cnt}(without control pkgs) because the instance is disconnected.")
 					await self.scheduleSendQueue.put(transport)
-					log.debug(f"Send] Caching {transport.seq_id} because the instance is disconnected.")
 
 	async def SendMsg(self, msg: str, ws: typing.Optional[web.WebSocketResponse] = None):
 		ctrl = protocol.Control()
@@ -269,11 +269,11 @@ class Server:
 				for item in self.sendQueue:
 					if pi.IsSamePackage(item):
 						found = True
-						log.debug(f"Hit cache for package {item.seq_id}.")
+						log.debug(f"Hit cache for package {item.seq_id}:{item.cur_idx}/{item.total_cnt} for query {pi.seq_id}:{pi.cur_idx}/{pi.total_cnt}.")
 						await self.DirectSend(item)
 						break
 			if found == False:
-				log.debug(f"Not hit cache and route to {pkg.receiver} for package {pi.seq_id}")
+				log.debug(f"Not hit cache and route to {pkg.receiver} for package {pi.seq_id}:{pi.cur_idx}/{pi.total_cnt}")
 				await self.router.Route(pkg)
 		elif ctrlType == protocol.Control.PRINT:
 			if pkg.receiver == "":

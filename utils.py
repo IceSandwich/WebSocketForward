@@ -125,7 +125,8 @@ def CompressImage(raw: bytes, target_mimetype: str, quality: int = 75):
 		MIMETYPE_WEBP: 'WebP'
 	}
 	if target_mimetype not in mimetypeToFormat:
-		print(f"Cannot compress image, unknown target mimetype: {target_mimetype}. Use WebP as default.")
+		if log is not None:
+			log.error(f"Cannot compress image, unknown target mimetype: {target_mimetype}. Use WebP as default.")
 		target_mimetype = MIMETYPE_WEBP
 
 	image = DecodeImageFromBytes(raw)
@@ -202,7 +203,8 @@ class Timer:
 
 	async def AddTask(self, task: TimerTask):
 		if self.runningSignal == False:
-			print(f"Warning: Timer doesn't start at this moment but AddTask() has been called.")
+			if log is not None:
+				log.error(f"Warning: Timer doesn't start at this moment but AddTask() has been called.")
 
 		async with self.condition:
 			heapq.heappush(self.tasks, task)

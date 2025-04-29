@@ -1,4 +1,6 @@
 import typing
+
+import aiohttp.client_exceptions
 import utils
 import encryptor
 import time_utils
@@ -71,6 +73,9 @@ class Client:
 		self.ws: aiohttp.ClientWebSocketResponse = None
 
 		self.forward_session: aiohttp.ClientSession = None
+		self.forward_timeout = aiohttp.ClientTimeout(total=None, connect=None, sock_connect=None, sock_read=None)
+
+		self.ws_timeout = aiohttp.ClientWSTimeout(ws_close=time_utils.Minutes(2))
 
 		self.scheduleSendQueue: asyncio.Queue[protocol.Transport] = asyncio.Queue()
 
@@ -187,7 +192,7 @@ class Client:
 
 	async def processSSESession(self, req: protocol.Request, resp: aiohttp.ClientResponse):
 		"""
-		由processSSE()释放resp。raw是模板，函数里会填充数据再发送。
+		由本函数释放resp。
 		"""
 		cur_idx = 0
 		# send data.Response for the first time and send data.Subpackage for the remain sequences, set total_cnt = -1 to end
@@ -213,6 +218,8 @@ class Client:
 					await self.QueueSend(raw)
 				# 第一个response的idx为0，第一个sse_subpackage的idx为1
 				cur_idx = cur_idx + 1
+		except asyncio.exceptions.TimeoutError:
+			log.error(f"Stream {req.seq_id} timeout. by default, aiohttp use 300 seconds as timeout.")
 		except Exception as e:
 			log.error(f'Stream {req.seq_id} end iter unexpectally. err: {e}', exc_info=True, stack_info=True)
 		finally:
@@ -226,14 +233,22 @@ class Client:
 	async def processRequestPackage(self, req: protocol.Request):
 		log.debug(f"Request {req.seq_id} - {req.method} {req.url} {len(req.body)} bytes")
 
-		try:
-			resp = await self.forward_session.request(req.method, req.url, headers=req.headers, data=req.body)
-		except aiohttp.ClientConnectorError as e:
-			log.error(f'Failed to forward request {req.url}: {e}', exc_info=True, stack_info=True)
-			rep = protocol.Response(self.config.cipher)
-			rep.SetForResponseTransport(req)
-			rep.Init(req.url, 502, { 'Content-Type': 'text/plain; charset=utf-8', }, f'=== Proxy server cannot request: {e}'.encode('utf8'))
-			return await self.QueueSendSmartSegments(rep)
+		for retry in range(self.config.maxRetries):
+			try:
+				resp = await self.forward_session.request(req.method, req.url, headers=req.headers, data=req.body)
+				break
+			except aiohttp.ClientConnectorError as e:
+				log.error(f'Failed to forward request {req.url}, got ClientConnectorError: {e}')
+				rep = protocol.Response(self.config.cipher)
+				rep.SetForResponseTransport(req)
+				rep.Init(req.url, 502, { 'Content-Type': 'text/plain; charset=utf-8', }, f'=== Proxy server cannot request: {e}'.encode('utf8'))
+				return await self.QueueSendSmartSegments(rep)
+			except aiohttp.client_exceptions.ClientOSError as e:
+				log.error(f"Failed to forward request {req.url}, current times: {retry}, got ClientOSError: {e}")
+				retry += 1
+				if retry >= self.config.maxRetries:
+					await self.SendMsg(f"Tried {self.config.maxRetries} times but still cannot forward request {req.seq_id} for url: {req.url}. Got ClientOSError: {e}. Client abort.")
+					raise e
 
 		if 'text/event-stream' in resp.headers['Content-Type']:
 			# log.debug(f"SSE Response {req.seq_id} - {req.method} {resp.url} {resp.status}")
@@ -352,14 +367,14 @@ class Client:
 	async def MainLoop(self):
 		curTries = 0
 		exitSignal = False
-		self.forward_session = aiohttp.ClientSession()
+		self.forward_session = aiohttp.ClientSession(timeout=self.forward_timeout)
 		while curTries < self.config.maxRetries:
 			async with aiohttp.ClientSession() as session:
-				async with session.ws_connect(self.url, headers=self.HttpUpgradedWebSocketHeaders, max_msg_size=self.WebSocketMaxReadingMessageSize) as ws:
+				async with session.ws_connect(self.url, headers=self.HttpUpgradedWebSocketHeaders, max_msg_size=self.WebSocketMaxReadingMessageSize, timeout=self.ws_timeout) as ws:
 					log.info(f"Initializing...")
 					self.status = self.STATUS_INITIALIZING
 					initRet = await self.initialize(ws)
-					if initRet is  None:
+					if initRet is None:
 						self.ws = ws
 						self.status = self.STATUS_CONNECTED
 						curTries = 0
