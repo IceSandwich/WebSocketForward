@@ -65,9 +65,11 @@ class Transport:
 
 		self.timestamp = time_utils.GetTimestamp()
 
-	def SetSenderReceiver(self, senderId: str, receiverId: str):
+	def SetSenderReceiver(self, senderId: str, receiverId: str, seq_id: typing.Optional[str] = None):
 		self.sender = senderId
 		self.receiver = receiverId
+		if seq_id is not None:
+			self.seq_id = seq_id
 
 	def SetForResponseTransport(self, transport):
 		"""

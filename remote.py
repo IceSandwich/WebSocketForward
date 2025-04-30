@@ -1,3 +1,4 @@
+import aiohttp.client_exceptions
 import encryptor
 import protocol
 import utils
@@ -224,48 +225,22 @@ class Client:
 					else:
 						log.debug(f"Stream {seq_id} timetask outdate. expect {that.timestamp} but got {stateTimestamp}, current state: {state}, want to change to {that.target_state}")
 
-		while True:
-			async with self.streamCondition:
-				if seq_id not in self.streamHeap or len(self.streamHeap[seq_id]) <= 0:
-					await self.streamCondition.wait_for(lambda: seq_id in self.streamHeap and len(self.streamHeap[seq_id]) > 0)
+		try:
+			while True:
+				async with self.streamCondition:
+					if seq_id not in self.streamHeap or len(self.streamHeap[seq_id]) <= 0:
+						await self.streamCondition.wait_for(lambda: seq_id in self.streamHeap and len(self.streamHeap[seq_id]) > 0)
 
-				if self.streamHeap[seq_id][0].cur_idx != expectIdx:
-					# 过旧的包
-					if self.streamHeap[seq_id][0].cur_idx < expectIdx:
-						log.warning(f"Stream {seq_id}:{self.streamHeap[seq_id][0].cur_idx} < {expectIdx} - Drop this older package.")
-						heapq.heappop(self.streamHeap[seq_id]) # drop
-						continue
+					if self.streamHeap[seq_id][0].cur_idx != expectIdx:
+						# 过旧的包
+						if self.streamHeap[seq_id][0].cur_idx < expectIdx:
+							log.warning(f"Stream {seq_id}:{self.streamHeap[seq_id][0].cur_idx} < {expectIdx} - Drop this older package.")
+							heapq.heappop(self.streamHeap[seq_id]) # drop
+							continue
 
-					# 过新的包
-					if state == self.STREAM_STATE_NONE:
-						log.warning(f"Stream {seq_id}:{self.streamHeap[seq_id][0].cur_idx} > {expectIdx} - Receive this newer package, current heap: {[x.cur_idx for x in self.streamHeap[seq_id]]}.")
-						async with stateLock:
-							state = self.STREAM_STATE_WAIT_TO_RETRIEVE
-
-							# 启动计时器
-							cb = RetrieveTimerCallback(self.STREAM_STATE_SHOULD_RETRIEVE)
-							stateTimestamp = cb.GetTimestamp()
-						await self.timer.AddTask(cb)
-						log.debug(f"Stream {seq_id} - Start timer, wait for {expectIdx}")
-						continue
-					elif state == self.STREAM_STATE_WAIT_TO_RETRIEVE:
-						# 等待期间避免占用cpu
-						# 不直接在这里等3s而是开一个协程等待，是因为希望在这3s内依然能够检测是否有正确的包出现，一旦正确的包出现了，会重置stateTimestamp使得计时器失效。
-						# 这样不用完全耗掉3s也能顺利处理包。
-						self.streamCondition.release() # 在这等待的1s内依然可以往队列加内容
-						await asyncio.sleep(time_utils.Seconds(1))
-						await self.streamCondition.acquire()
-						log.debug(f"Stream {seq_id} - Still waiting {expectIdx}")
-						continue
-					elif state == self.STREAM_STATE_SHOULD_RETRIEVE:
-						if sendRetreveTimes <= self.config.streamRetrieveTimes:
-							log.debug(f"Stream {seq_id} - Send retrieve request, cur times: {sendRetreveTimes}, waiting {expectIdx}")
-							raw = protocol.Control()
-							raw.SetForResponseTransport(self.streamHeap[seq_id][0])
-							raw.InitRetrievePkg(protocol.PackageId(cur_idx=expectIdx, total_cnt=0, seq_id=seq_id))
-							await self.DirectSend(raw)
-							sendRetreveTimes = sendRetreveTimes + 1
-
+						# 过新的包
+						if state == self.STREAM_STATE_NONE:
+							log.warning(f"Stream {seq_id}:{self.streamHeap[seq_id][0].cur_idx} > {expectIdx} - Receive this newer package, current heap: {[x.cur_idx for x in self.streamHeap[seq_id]]}.")
 							async with stateLock:
 								state = self.STREAM_STATE_WAIT_TO_RETRIEVE
 
@@ -273,27 +248,59 @@ class Client:
 								cb = RetrieveTimerCallback(self.STREAM_STATE_SHOULD_RETRIEVE)
 								stateTimestamp = cb.GetTimestamp()
 							await self.timer.AddTask(cb)
+							log.debug(f"Stream {seq_id} - Start timer, wait for {expectIdx}")
 							continue
-						else:
-							log.error(f"Stream {seq_id} - Failed to retrieve {expectIdx} in {sendRetreveTimes} times, current heap: {[x.cur_idx for x in self.streamHeap[seq_id]]}. Pop one anyway.")
+						elif state == self.STREAM_STATE_WAIT_TO_RETRIEVE:
+							# 等待期间避免占用cpu
+							# 不直接在这里等3s而是开一个协程等待，是因为希望在这3s内依然能够检测是否有正确的包出现，一旦正确的包出现了，会重置stateTimestamp使得计时器失效。
+							# 这样不用完全耗掉3s也能顺利处理包。
+							self.streamCondition.release() # 在这等待的1s内依然可以往队列加内容
+							await asyncio.sleep(time_utils.Seconds(1))
+							await self.streamCondition.acquire()
+							log.debug(f"Stream {seq_id} - Still waiting {expectIdx}")
+							continue
+						elif state == self.STREAM_STATE_SHOULD_RETRIEVE:
+							if sendRetreveTimes <= self.config.streamRetrieveTimes:
+								log.debug(f"Stream {seq_id} - Send retrieve request, cur times: {sendRetreveTimes}, waiting {expectIdx}")
+								raw = protocol.Control()
+								raw.SetForResponseTransport(self.streamHeap[seq_id][0])
+								raw.InitRetrievePkg(protocol.PackageId(cur_idx=expectIdx, total_cnt=0, seq_id=seq_id))
+								await self.DirectSend(raw)
+								sendRetreveTimes = sendRetreveTimes + 1
 
-				# 重置计数器
-				sendRetreveTimes = 0
-				async with stateLock:
-					state = self.STREAM_STATE_NONE
-					stateTimestamp = -1
+								async with stateLock:
+									state = self.STREAM_STATE_WAIT_TO_RETRIEVE
 
-				item = heapq.heappop(self.streamHeap[seq_id])
-				expectIdx = expectIdx + 1
+									# 启动计时器
+									cb = RetrieveTimerCallback(self.STREAM_STATE_SHOULD_RETRIEVE)
+									stateTimestamp = cb.GetTimestamp()
+								await self.timer.AddTask(cb)
+								continue
+							else:
+								log.error(f"Stream {seq_id} - Failed to retrieve {expectIdx} in {sendRetreveTimes} times, current heap: {[x.cur_idx for x in self.streamHeap[seq_id]]}. Pop one anyway.")
+
+					# 重置计数器
+					sendRetreveTimes = 0
+					async with stateLock:
+						state = self.STREAM_STATE_NONE
+						stateTimestamp = -1
+
+					item = heapq.heappop(self.streamHeap[seq_id])
+					expectIdx = expectIdx + 1
+					if item.total_cnt == -1:
+						log.debug(f"Stream {seq_id}:{item.cur_idx}/{item.total_cnt} - {len(item.body)} bytes <<< {repr(item.body[:utils.LOG_BYTES_LEN])} ...>>> <x- {item.sender}")
+						del self.streamHeap[seq_id]
+					else:
+						log.debug(f"Stream {seq_id}:{item.cur_idx}/{item.total_cnt} - {len(item.body)} bytes <<< {repr(item.body[:utils.LOG_BYTES_LEN])} ...>>> <- {item.sender}")
+				yield item
 				if item.total_cnt == -1:
-					log.debug(f"Stream {seq_id}:{item.cur_idx}/{item.total_cnt} - {len(item.body)} bytes <<< {repr(item.body[:utils.LOG_BYTES_LEN])} ...>>> <x- {item.sender}")
-					del self.streamHeap[seq_id]
-				else:
-					log.debug(f"Stream {seq_id}:{item.cur_idx}/{item.total_cnt} - {len(item.body)} bytes <<< {repr(item.body[:utils.LOG_BYTES_LEN])} ...>>> <- {item.sender}")
-			yield item
-			if item.total_cnt == -1:
-				break
-		# print(f"End listening stream on {seq_id}...")
+					break
+		except GeneratorExit:
+			item = protocol.StreamData(self.config.cipher)
+			item.SetSenderReceiver(self.config.uid, self.config.target_uid, seq_id=seq_id)
+			item.SetIndex(expectIdx, -1)
+			log.debug(f"Stream {seq_id}:{item.cur_idx}/{item.total_cnt} -x> {item.receiver}")
+			await self.QueueSend(item)
 	
 	async def waitForOnePackage(self, ws: web.WebSocketResponse):
 		async for msg in ws:
@@ -595,10 +602,15 @@ class HttpServer:
 		await self.site.stop()
 		await self.runner.shutdown()
 
-	async def processSSE(self, resp: protocol.Response):
-		yield resp.body
-		async for package in self.client.Stream(resp.seq_id):
-			yield package.body
+	async def processSSE(self, resp: protocol.Response, ss: web.StreamResponse):
+		try:
+			await ss.write(resp.body)
+			async for package in self.client.Stream(resp.seq_id):
+				await ss.write(package.body)
+		except aiohttp.client_exceptions.ClientConnectionResetError:
+			pass # invoke GeneratorExit in client.Stream()
+		except Exception as e:
+			log.error(f"Unknown exception: {e}", exc_info=True, stack_info=True)
 
 	async def MainLoopOnRequest(self, request: web.BaseRequest):
 		# 提取请求的相关信息
@@ -609,11 +621,10 @@ class HttpServer:
 		resp = await self.client.Session(req)
 
 		if 'Content-Type' in resp.headers and 'text/event-stream' in resp.headers['Content-Type']:
-			return web.Response(
-				status=resp.status,
-				headers=resp.headers,
-				body=self.processSSE(resp)
-			)
+			ss = web.StreamResponse(status=resp.status, headers=resp.headers)
+			await ss.prepare(request)
+			await self.processSSE(resp, ss)
+			return ss
 		else:
 			return web.Response(
 				status=resp.status,

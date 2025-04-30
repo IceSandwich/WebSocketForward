@@ -79,6 +79,8 @@ class Client:
 
 		self.scheduleSendQueue: asyncio.Queue[protocol.Transport] = asyncio.Queue()
 
+		self.sseCloseSignal: typing.Dict[str, bool] = {}
+
 	async def waitForOnePackage(self, ws: web.WebSocketResponse):
 		async for msg in ws:
 			if msg.type == aiohttp.WSMsgType.ERROR:
@@ -116,9 +118,6 @@ class Client:
 			self.status = self.STATUS_INIT
 			return ws
 		hello = pkg.ToHelloServerControl()
-
-		# if hello.IsEmpty(): # it means this is the new instance?
-		# 	return
 
 		# server will send all package he received. we need to decide which package to resend.
 		async with self.sendQueueLock:
@@ -195,10 +194,16 @@ class Client:
 		由本函数释放resp。
 		"""
 		cur_idx = 0
-		# send data.Response for the first time and send data.Subpackage for the remain sequences, set total_cnt = -1 to end
+		shouldSendEndStreamData = True
+		# send Response for the first time and send StreamData for the remain sequences, set total_cnt = -1 to end
 		# 对于 SSE 流，持续读取并转发数据
+		self.sseCloseSignal[req.seq_id] = False
 		try:
 			async for chunk in resp.content.iter_any():
+				if self.sseCloseSignal[req.seq_id] == True: # remote requires to close sse
+					shouldSendEndStreamData = False # remote has already close the stream, we don't need to send end package
+					del self.sseCloseSignal[req.seq_id]
+					break
 				if not chunk: continue
 				# 将每一行事件发送给客户端
 				if cur_idx == 0:
@@ -223,11 +228,14 @@ class Client:
 		except Exception as e:
 			log.error(f'Stream {req.seq_id} end iter unexpectally. err: {e}', exc_info=True, stack_info=True)
 		finally:
-			raw = protocol.StreamData(self.config.cipher)
-			raw.SetForResponseTransport(req)
-			raw.SetIndex(cur_idx, -1)
-			log.debug(f"Stream {raw.seq_id}:{raw.cur_idx}/{raw.total_cnt} - {resp.url} {len(raw.body)} bytes -x> {raw.receiver}")
-			await self.QueueSend(raw)
+			if shouldSendEndStreamData:
+				raw = protocol.StreamData(self.config.cipher)
+				raw.SetForResponseTransport(req)
+				raw.SetIndex(cur_idx, -1)
+				log.debug(f"Stream {raw.seq_id}:{raw.cur_idx}/{raw.total_cnt} - {resp.url} {len(raw.body)} bytes -x> {raw.receiver}")
+				await self.QueueSend(raw)
+			else:
+				log.debug(f"Stream {raw.seq_id} end because {self.config.target_uid} requires to end.")
 			await resp.release()
 		
 	async def processRequestPackage(self, req: protocol.Request):
@@ -315,7 +323,13 @@ class Client:
 		返回False退出MainLoop
 		"""
 		if type(pkg) == protocol.StreamData:
-			log.error(f"{self.name}] Client don't process StreamData. Ignore {pkg.seq_id}:{pkg.cur_idx}/{pkg.total_cnt} <<< {repr(pkg.body[:utils.LOG_BYTES_LEN * 2])} ...>>> <- {pkg.sender}")
+			if pkg.total_cnt != -1:
+				log.error(f"{self.name}] Client don't process normal StreamData. Only receive end stream StreamData. Ignore {pkg.seq_id}:{pkg.cur_idx}/{pkg.total_cnt} <<< {repr(pkg.body[:utils.LOG_BYTES_LEN * 2])} ...>>> <- {pkg.sender}")
+			elif pkg.seq_id not in self.sseCloseSignal:
+				log.error(f"{self.name}] {pkg.sender} requires to close stream {pkg.seq_id} but we don't listen that stream. Ignore.")
+			else:
+				log.debug(f"Stream {pkg.seq_id}:{pkg.cur_idx}/{pkg.total_cnt} - {len(pkg.body)} bytes <x- {pkg.sender}")
+				self.sseCloseSignal[pkg.seq_id] = True
 			return
 		
 		if type(pkg) == protocol.Control:
