@@ -139,7 +139,7 @@ class Client:
 				log.debug(f"Server has received {len(hello.reports)} packages. We had sent {len(self.sendQueue)} packages.")
 				for item in self.sendQueue:
 					found = False
-					for pkg in hello.pkgs:
+					for pkg in hello.reports:
 						if pkg.IsSamePackage(item):
 							found = True
 							break
@@ -428,6 +428,8 @@ class Client:
 										break
 			except aiohttp.client_exceptions.ClientConnectorError as e:
 				log.error(f"{self.name}] ClientConnectorError: {e}", exc_info=True, stack_info=True)
+			except aiohttp.client_exceptions.WSServerHandshakeError as e:
+				log.error(f"{self.name}] WSServerHandshakeError: {e}", exc_info=True, stack_info=True)
 			
 			self.status = self.STATUS_INIT
 			if exitSignal == False:

@@ -344,12 +344,18 @@ class Server:
 		log.info(f"{self.name}] Disconnected.")
 		await self.router.SendMsg("", f"{self.name}] Disconnected.", skip=[self.name])
 
-	async def resendScheduledPackages(self):
+	async def resendScheduledPackages(self) -> bool:
 		log.debug(f"{self.name}] Schedule resend {self.scheduleSendQueue.qsize()} packages.")
-		while not self.scheduleSendQueue.empty():
-			item = await self.scheduleSendQueue.get()
-			log.debug(f"{self.name}] Schedule resend {item.seq_id}")
-			await self.DirectSend(item)
+		try:
+			while not self.scheduleSendQueue.empty():
+				item = await self.scheduleSendQueue.get()
+				log.debug(f"{self.name}] Schedule resend {item.seq_id}")
+				await self.DirectSend(item)
+			return True
+		except Exception as e:
+			self.scheduleSendQueue = asyncio.Queue()
+			log.error(f"{self.name}] Schedule resend error: {e}", exc_info=True, stack_info=True)
+			return False
 
 	async def MainLoop(self, request: web.BaseRequest):
 		ws = web.WebSocketResponse(max_msg_size=self.WebSocketMaxReadingMessageSize, heartbeat=None if self.HttpUpgradeHearbeatDuration == 0 else self.HttpUpgradeHearbeatDuration, autoping=True)
@@ -373,26 +379,28 @@ class Server:
 		self.ws = ws
 		self.status = self.STATUS_CONNECTED
 		await self.OnConnected()
+		shouldGoing = True
 		if self.config.allowOFOResend:
 			asyncio.ensure_future(self.resendScheduledPackages())
 		else:
-			await self.resendScheduledPackages()
-		try:
-			async for msg in ws:
-				if msg.type == aiohttp.WSMsgType.ERROR:
-					log.error(f"{self.name}] {ws.exception()}", exc_info=True, stack_info=True)
-				elif msg.type == aiohttp.WSMsgType.TEXT or msg.type == aiohttp.WSMsgType.BINARY:
-					transport = protocol.Transport.Parse(msg.data)
-					log.debug(f"{self.name}] {transport.seq_id}:{protocol.Transport.Mappings.ValueToString(transport.transportType)}:{transport.cur_idx}/{transport.total_cnt} route {transport.sender} => {transport.receiver}")
+			shouldGoing = await self.resendScheduledPackages()
+		if shouldGoing:
+			try:
+				async for msg in ws:
+					if msg.type == aiohttp.WSMsgType.ERROR:
+						log.error(f"{self.name}] {ws.exception()}", exc_info=True, stack_info=True)
+					elif msg.type == aiohttp.WSMsgType.TEXT or msg.type == aiohttp.WSMsgType.BINARY:
+						transport = protocol.Transport.Parse(msg.data)
+						log.debug(f"{self.name}] {transport.seq_id}:{protocol.Transport.Mappings.ValueToString(transport.transportType)}:{transport.cur_idx}/{transport.total_cnt} route {transport.sender} => {transport.receiver}")
 
-					# check
-					if transport.sender != self.name:
-						log.error(f"{self.name}] Received a package {transport.seq_id} from {self.name} but it's sender is `{transport.sender}`, to `{transport.receiver}`. Online fix that.")
-						transport.sender = self.name
+						# check
+						if transport.sender != self.name:
+							log.error(f"{self.name}] Received a package {transport.seq_id} from {self.name} but it's sender is `{transport.sender}`, to `{transport.receiver}`. Online fix that.")
+							transport.sender = self.name
 
-					await self.OnPackage(transport)
-		except Exception as e:
-			log.error(f"{self.name}] Mainloop error: {e}", exc_info=True, stack_info=True)
+						await self.OnPackage(transport)
+			except Exception as e:
+				log.error(f"{self.name}] Mainloop error: {e}", exc_info=True, stack_info=True)
 			
 		self.status = self.STATUS_INIT
 		await self.OnDisconnected()
