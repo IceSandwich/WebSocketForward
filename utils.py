@@ -164,11 +164,11 @@ def GetWSFCompress(req: protocol.Request):
 	return (sp[0], int(sp[1]))
 
 class TimerTask(abc.ABC):
-	def __init__(self, time: float):
+	def __init__(self, time: int):
 		self.timestamp = time_utils.GetTimestamp()
 		self.time = time
 
-	def __le__(self, other):
+	def __lt__(self, other):
 		return self.time < other.time
 	
 	def GetTimestamp(self):
@@ -176,6 +176,9 @@ class TimerTask(abc.ABC):
 	
 	@abc.abstractmethod
 	async def Run(self):
+		"""
+		到时执行该函数
+		"""
 		raise NotImplementedError()
 	
 class Timer:
@@ -186,6 +189,7 @@ class Timer:
 		self.tasks: typing.List[TimerTask] = []
 		self.condition = asyncio.Condition()
 		self.runningSignal = False
+		self.nextTimestamp = 0
 
 	def Start(self):
 		"""
@@ -207,6 +211,9 @@ class Timer:
 				log.error(f"Warning: Timer doesn't start at this moment but AddTask() has been called.")
 
 		async with self.condition:
+			if self.nextTimestamp != 0:
+				task.time = task.time - ( self.nextTimestamp - task.GetTimestamp() )
+
 			heapq.heappush(self.tasks, task)
 			self.condition.notify_all()
 
@@ -218,17 +225,18 @@ class Timer:
 				if self.runningSignal == False:
 					return
 				item = heapq.heappop(self.tasks)
+				self.nextTimestamp = time_utils.GetTimestamp()
+				if item.time > 0:
+					self.nextTimestamp = self.nextTimestamp + item.time
 			
 			try:
-				if item.time <= 0:
-					continue
-				await asyncio.sleep(item.time)
-				if log is not None:
-					log.debug(f"Timer] After {item.time}, invoke run()")
-				await item.Run()
+				if item.time > 0:
+					await asyncio.sleep(item.time)
+					await item.Run()
+					async with self.condition: # this will change the new packages added during sleep time. So utils.Timer is not a accurate timer.
+						for task in self.tasks:
+							task.time -= item.time
+				else:
+					await item.Run()
 			except Exception as e:
 				log.error(f"Timer] Exception: {e}", exc_info=True, stack_info=True)
-
-			async with self.condition: # this will change the new packages added during sleep time. So utils.Timer is not a accurate timer.
-				for task in self.tasks:
-					task.time -= item.time

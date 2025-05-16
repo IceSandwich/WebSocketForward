@@ -56,13 +56,15 @@ message ClientInfo {
 }
 
 message HelloClientControl {
-	ClientInfo info = 2;
-	repeated PackageId pkgs = 1; // received of remote
+	ClientInfo info = 3;
+	repeated PackageId sent_pkgs = 1; // client reports sent packages
+	repeated PackageId received_pkgs = 2; // remote reports received packages and sent packages
 }
 
 message HelloServerControl {
-	repeated ClientInfo clients = 2;
-	repeated PackageId pkgs = 1; // send of client
+	repeated ClientInfo clients = 3;
+	repeated PackageId reports = 1; // report received packages to client, report sent packages to remote
+	repeated PackageId requires = 2; // require client/remote to resend packages
 }
 
 message QueryClientsControl {

@@ -8,11 +8,15 @@ import abc
 import typing
 import logging
 import argparse as argp
+import os
+import random
 
 log = logging.getLogger(__name__)
-utils.SetupLogging(log, "server", logging.INFO, True)
+utils.SetupLogging(log, "server", logging.INFO if os.name != "nt" else logging.DEBUG, True)
 protocol.log = log
 utils.log = log
+
+DROP_RANDOM_RATE = 0.08
 
 class Configuration:
 	def __init__(self, args):
@@ -21,6 +25,10 @@ class Configuration:
 		self.cacheSize: int = args.cache_size
 		self.listen_route: str = args.listen_route
 		self.allowOFOResend: bool  = args.allow_ofo_resend
+		self.dropRandom: bool = args.drop_random
+
+		if self.dropRandom:
+			log.warning("Server is running on drop random mode. Pay attention that this option is only for debug use.")
 
 	@classmethod
 	def SetupParser(cls, parser: argp.ArgumentParser):
@@ -29,6 +37,8 @@ class Configuration:
 		parser.add_argument("--timeout", type=int, default=60, help="The maximum seconds to resend packages.")
 		parser.add_argument("--listen_route", type=str, default='/wsf/ws')
 		parser.add_argument("--allow_ofo_resend", action="store_true", help="Allow out of order message to be resend. Disable this feature may results in buffer overflow issue. By default, this feature is disable.")
+
+		parser.add_argument("--drop_random", action='store_true', help='Drop package at random rate. Use in debug only.')
 		return parser
 
 	def GetListenedAddress(self):
@@ -119,6 +129,10 @@ class Server:
 		自动缓存非Control包，若当前连接是断开时计划下次连接再发送。
 		若发送Control包，仅当当前状态是连接时才发送，否则丢弃包。
 		"""
+		if self.config.dropRandom and random.random() < DROP_RANDOM_RATE:
+			log.warning(f"{self.name}] Drop send package {transport.seq_id}:{protocol.Transport.Mappings.ValueToString(transport.transportType)} -> {transport.receiver}")
+			return
+
 		async with self.sendQueueLock:
 			# check
 			if transport.receiver != self.name:
@@ -198,39 +212,62 @@ class Server:
 				await ws.send_bytes(ret.Pack())
 				await asyncio.sleep(time_utils.Seconds(1))
 			elif hello.info.type == protocol.ClientInfo.REMOTE:
-				# Remote will send all send package infos to us, we need to filter out items he didn't receive and resend again.
-				log.info(f"{self.name}] Old remote instance {hello.info.id}. Remote reports {len(hello.pkgs)} packages received. Server had sent {len(self.sendQueue)} packages.")
+				async with self.receiveQueueLock:
+					# Remote will send all send package infos to us, we need to filter out items he didn't receive and resend again.
+					log.info(f"{self.name}] Old remote instance {hello.info.id}. Remote reports {len(hello.received_pkgs)} received packages and {len(hello.sent_pkgs)} sent packages. Server had sent {len(self.sendQueue)} packages and received {len(self.receiveQueue)} packages.")
 
-				ret = protocol.Control()
-				ret.SetForResponseTransport(pkg)
-				hsc = protocol.HelloServerControl()
+					ret = protocol.Control()
+					ret.SetForResponseTransport(pkg)
+					hsc = protocol.HelloServerControl()
 
-				now = time_utils.GetTimestamp()
-				for pkg in self.sendQueue:
-					found = False
-					for pkg in hello.pkgs:
-						if pkg.IsSamePackage(pkg):
-							found = True
-					if not found:
-						if time_utils.WithInDuration(pkg.timestamp, now, self.config.timeout):
-							await self.scheduleSendQueue.put(pkg)
-							hsc.AppendPkg(protocol.PackageId.FromPackage(pkg))
-						else:
-							log.warning(f"{self.name}] Package {pkg.seq_id} skip resend because it's out-dated({now} - {pkg.timestamp} = {now - pkg.timestamp} > {self.config.timeout}).")
+					now = time_utils.GetTimestamp()
+					# size: sendQueue << hello.received_pkgs
+					for item in self.sendQueue:
+						found = False
+						for pkg in hello.received_pkgs:
+							if pkg.IsSamePackage(item):
+								found = True
+								break
+						if not found:
+							if time_utils.WithInDuration(item.timestamp, now, self.config.timeout):
+								await self.scheduleSendQueue.put(item)
+								hsc.AppendReportPkg(protocol.PackageId.FromPackage(pkg))
+							else:
+								log.warning(f"{self.name}] Package {pkg.seq_id} skip resend because it's out-dated({now} - {item.timestamp} = {now - item.timestamp} > {self.config.timeout}).")
+
+					# size: hello.sent_pkgs << receiveQueue
+					for item in hello.sent_pkgs:
+						found = False
+						for pkg in self.receiveQueue:
+							if pkg.IsSamePackage(item):
+								found = True
+								break
+						if not found:
+							hsc.AppendRequirePkg(item)
 
 				ret.InitHelloServerControl(hsc)
 				await ws.send_bytes(ret.Pack())
 				await asyncio.sleep(time_utils.Seconds(1))
 			elif hello.info.type == protocol.ClientInfo.CLIENT:
 				# Client will query all receive package infos from server, so we need to send the package infos to it.
-				log.info(f"{self.name}] Old client instance. Server is reporting {len(self.receiveQueue)} pacakges.")
+				log.info(f"{self.name}] Old client instance {hello.info.id}. Client reports {len(hello.received_pkgs)} received packages. Server had received {len(self.receiveQueue)} pacakges and sent {len(self.sendQueue)} packages.")
 
 				ret = protocol.Control()
 				ret.SetForResponseTransport(pkg)
 				hsc = protocol.HelloServerControl()
+				# size: sendQueue << hello.received_pkgs
+				for pkg in self.sendQueue:
+					found = False
+					for item in hello.received_pkgs:
+						if item.IsSamePackage(pkg):
+							found = True
+							break
+					if not found:
+						await self.scheduleSendQueue.put(item)
+				
 				async with self.receiveQueueLock:
 					for pkg in self.receiveQueue:
-						hsc.AppendPkg(pkg)
+						hsc.AppendReportPkg(pkg)
 				ret.InitHelloServerControl(hsc)
 				await ws.send_bytes(ret.Pack())
 				await asyncio.sleep(time_utils.Seconds(1))
@@ -287,6 +324,10 @@ class Server:
 
 
 	async def OnPackage(self, raw: protocol.Transport):
+		if self.config.dropRandom and random.random() < DROP_RANDOM_RATE:
+			log.warning(f"{self.name}] Drop received package {raw.seq_id}:{protocol.Transport.Mappings.ValueToString(raw.transportType)} <- {raw.sender}")
+			return
+
 		if raw.transportType == protocol.Transport.CONTROL:
 			await self.processControlPackage(raw)
 		else:

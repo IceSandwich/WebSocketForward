@@ -31,6 +31,7 @@ class Configuration:
 
 		self.maxRetries:int = args.max_retries
 		self.cacheQueueSize: int  = args.cache_queue_size
+		self.cachePkgQueueSize: int = args.cache_pkg_queue_size
 		self.timeout = time_utils.Seconds(args.timeout)
 		self.maxHeapSSEBufferSize: int = args.max_heapsse_buffer_size
 		self.safeSegmentSize: int  = args.safe_segment_size
@@ -45,7 +46,7 @@ class Configuration:
 	def SetupParser(cls, parser: argp.ArgumentParser):
 		parser.add_argument("--server", type=str, default="http://127.0.0.1:8030/wsf/ws", help="The websocket server to connect to.")
 		parser.add_argument("--cipher", type=str, default="xor", help=f"The cipher to use. Available: [{', '.join(encryptor.GetAvailableCipherMethods())}]")
-		parser.add_argument("--key", type=str, default="WebSocket@Forward通讯密钥，必须跟另一端保持一致。", help="The key to use for the cipher. Must be the same with client.")
+		parser.add_argument("--key", type=str, default="通讯密钥，必须跟另一端保持一致；否则传输出错。", help="The key to use for the cipher. Must be the same with client.")
 
 		parser.add_argument("--prefix", type=str, default="http://127.0.0.1:7860", help="The prefix of your requests.")
 		parser.add_argument("--port", type=int, default=8130, help="The port to listen on.")
@@ -57,6 +58,7 @@ class Configuration:
 
 		parser.add_argument("--max_retries", type=int, default=3, help="Maximum number of retries")
 		parser.add_argument("--cache_queue_size", type=int, default=150, help="Maximum number of messages to cache. Must bigger than server's cache queue size.")
+		parser.add_argument("--cache_pkg_queue_size", type=int, default=128, help="Cache send history packages. Must be small or equal to client's cache queue size.")
 		parser.add_argument("--timeout", type=int, default=60, help="The maximum seconds to resend packages.")
 		parser.add_argument("--max_heapsse_buffer_size", type=int, default=20)
 		parser.add_argument("--safe_segment_size", type=int, default=768*1024, help="Maximum size of messages to send, in Bytes")
@@ -90,9 +92,12 @@ class Client:
 		self.historyRecvQueue: utils.BoundedQueue[protocol.PackageId] = utils.BoundedQueue(self.config.cacheQueueSize)
 		self.historyRecvQueueLock = asyncio.Lock()
 
-		# 用于重发的队列，已经发出的包不要存在这里（事实上client无需保存发出的包）
-		self.sendQueue: utils.BoundedQueue[protocol.Transport] = utils.BoundedQueue(self.config.cacheQueueSize)
+		self.sendQueue: utils.BoundedQueue[protocol.Transport] = utils.BoundedQueue(self.config.cachePkgQueueSize)
 		self.sendQueueLock = asyncio.Lock()
+
+		# 用于重发的队列，已经发出的包不要存在这里（事实上client无需保存发出的包）
+		# self.sendQueue: utils.BoundedQueue[protocol.Transport] = utils.BoundedQueue(self.config.cacheQueueSize)
+		# self.sendQueueLock = asyncio.Lock()
 		# init阶段会将sendQueue的包转移到scheduleSendQueue，在connect阶段开始的时候边监听边重发包。
 		# 如果在init直接发包，可能没到达connect阶段的时候就收到大量的包，但没有监听，导致缓冲区溢出。
 		self.scheduleSendQueue: asyncio.Queue[protocol.Transport] = asyncio.Queue()
@@ -113,6 +118,8 @@ class Client:
 
 		self.exitFunc: typing.Coroutine[typing.Any, typing.Any, typing.Any] = None
 
+		self.nocipher = encryptor.NewCipher('plain', '')
+
 	def DefineExitFunc(self, exitFunc: typing.Coroutine[typing.Any, typing.Any, typing.Any]):
 		self.exitFunc = exitFunc
 
@@ -121,7 +128,15 @@ class Client:
 
 	async def QueueSend(self, raw: protocol.Transport):
 		async with self.sendQueueLock:
-			raw.timestamp = time_utils.GetTimestamp()
+			# check
+			if raw.sender != self.name:
+				log.error(f"{self.name}] Send a package {raw.seq_id}:{protocol.Transport.Mappings.ValueToString(raw.transportType)} to {raw.receiver} but it's sender is {raw.sender}, which should be {self.name}. Online fix that.")
+				raw.sender = self.name
+				
+			if raw.transportType != protocol.Transport.CONTROL:
+				raw.timestamp = time_utils.GetTimestamp()
+				self.sendQueue.Add(raw)
+
 			if self.status == self.STATUS_CONNECTED:
 				try:
 					await self.DirectSend(raw)
@@ -132,8 +147,6 @@ class Client:
 				except Exception as e:
 					# skip package for unknown reason
 					log.error(f"{self.name}] Unknown exception on QueueSend(): {e}")
-			else:
-				self.sendQueue.Add(raw)
 
 	async def QueueSendSmartSegments(self, raw: typing.Union[protocol.Request, protocol.Response]):
 		"""
@@ -314,50 +327,59 @@ class Client:
 		return None
 
 	async def initialize(self, ws: web.WebSocketResponse):
+		# 不能收也不能发
 		async with self.historyRecvQueueLock:
-			hcc = protocol.HelloClientControl(protocol.ClientInfo(self.instance_id if self.config.force_id == "" else self.config.force_id, protocol.ClientInfo.REMOTE))
-			for pkg in self.historyRecvQueue:
-				hcc.Append(pkg)
-			log.debug(f"Initialize] Reporting {len(hcc)} packages received.")
-			ctrl = protocol.Control()
-			ctrl.SetSenderReceiver(self.name, "")
-			ctrl.InitHelloClientControl(hcc)
-			await ws.send_bytes(ctrl.Pack())
-
-			pkg = await self.waitForOnePackage(ws)
-			if pkg is None:
-				log.error(f"Initialize] Broken ws connection in initialize stage.")
-				self.status = self.STATUS_INIT
-				return ws
-			if pkg.transportType != protocol.Transport.CONTROL:
-				log.error(f"Initialize] First package {pkg.seq_id}:{pkg.cur_idx}/{pkg.total_cnt} is {protocol.Transport.Mappings.ValueToString(pkg.transportType)} which should be {protocol.Transport.Mappings.ValueToString(protocol.Transport.CONTROL)}.")
-				self.status = self.STATUS_INIT
-				return ws
-			tmp = protocol.Control()
-			tmp.Unpack(pkg)
-			pkg = tmp
-			if pkg.controlType == protocol.Control.PRINT: # error msg from server
-				log.error(f"Initialize] Error from server: {pkg.DecodePrintMsg()}")
-				self.status = self.STATUS_INIT
-				return ws
-			if pkg.controlType != protocol.Control.HELLO:
-				log.error(f"Initialize] First control package {pkg.seq_id}:{pkg.cur_idx}/{pkg.total_cnt} is {protocol.Control.Mappings.ValueToString(pkg.controlType)} which should be {protocol.Control.Mappings.ValueToString(protocol.Control.HELLO)}.")
-				self.status = self.STATUS_INIT
-				return ws
-			hello = pkg.ToHelloServerControl()
-
-			log.info(f"Initialize] Server will send {len(hello)} packages to us.")
-
-			now = time_utils.GetTimestamp()
 			async with self.sendQueueLock:
-				log.debug(f"Initialize] Check {len(self.sendQueue)} packages and schedule to resend.")
-				for item in self.sendQueue:
-					if time_utils.WithInDuration(item.timestamp, now, self.config.timeout):
-						await self.scheduleSendQueue.put(item)
-					else:
-						log.warning(f"Initialize] Package {item.seq_id} skip resend because it's out-dated({now} - {item.timestamp} = {now - item.timestamp} > {self.config.timeout}).")
-				self.sendQueue.Clear()
+				# 暴露自己收到的包和发出的包
+				hcc = protocol.HelloClientControl(protocol.ClientInfo(self.instance_id if self.config.force_id == "" else self.config.force_id, protocol.ClientInfo.REMOTE))
+				for pkg in self.historyRecvQueue:
+					hcc.AppendReceivedPkgs(pkg)
+				for pkg in self.sendQueue:
+					hcc.AppendSentPkgs(protocol.PackageId.FromPackage(pkg))
+				log.debug(f"Initialize] Reporting {len(hcc.received_pkgs)} received packages and {len(hcc.sent_pkgs)} sent packages to server.")
+				ctrl = protocol.Control()
+				ctrl.SetSenderReceiver(self.name, "")
+				ctrl.InitHelloClientControl(hcc)
+				await ws.send_bytes(ctrl.Pack())
 
+				pkg = await self.waitForOnePackage(ws)
+				if pkg is None:
+					log.error(f"Initialize] Broken ws connection in initialize stage.")
+					self.status = self.STATUS_INIT
+					return ws
+				if pkg.transportType != protocol.Transport.CONTROL:
+					log.error(f"Initialize] First package {pkg.seq_id}:{pkg.cur_idx}/{pkg.total_cnt} is {protocol.Transport.Mappings.ValueToString(pkg.transportType)} which should be {protocol.Transport.Mappings.ValueToString(protocol.Transport.CONTROL)}.")
+					self.status = self.STATUS_INIT
+					return ws
+				tmp = protocol.Control()
+				tmp.Unpack(pkg)
+				pkg = tmp
+				if pkg.controlType == protocol.Control.PRINT: # error msg from server
+					log.error(f"Initialize] Error from server: {pkg.DecodePrintMsg()}")
+					self.status = self.STATUS_INIT
+					return ws
+				if pkg.controlType != protocol.Control.HELLO:
+					log.error(f"Initialize] First control package {pkg.seq_id}:{pkg.cur_idx}/{pkg.total_cnt} is {protocol.Control.Mappings.ValueToString(pkg.controlType)} which should be {protocol.Control.Mappings.ValueToString(protocol.Control.HELLO)}.")
+					self.status = self.STATUS_INIT
+					return ws
+				hello = pkg.ToHelloServerControl()
+
+				log.info(f"Initialize] Server will send {len(hello.reports)} packages to us and require us to resend {len(hello.requires)} packages to server.")
+
+				now = time_utils.GetTimestamp()
+				for item in hello.requires:
+					found = False
+					for pkg in self.sendQueue:
+						if item.IsSamePackage(pkg):
+							found = True
+							if time_utils.WithInDuration(pkg.timestamp, now, self.config.timeout):
+								await self.scheduleSendQueue.put(pkg)
+							else:
+								log.warning(f"Initialize] Package {item.seq_id} skip resend because it's out-dated({now} - {pkg.timestamp} = {now - pkg.timestamp} > {self.config.timeout}).")
+							break
+					if not found:
+						log.error(f"Initialize] Sever require resend {item.seq_id} but not in sendQueue. Should not happend. The maybe the wrong configuration in server code.")
+				
 				log.debug(f"Initialize] Done.")
 				self.ws = ws
 				self.status = self.STATUS_CONNECTED
@@ -451,7 +473,7 @@ class Client:
 					self.status = self.STATUS_INITIALIZING
 					log.info(f"Initializing...")
 					initRet = await self.initialize(ws)
-					if initRet is  None:
+					if initRet is None:
 						self.ws = ws
 						self.status = self.STATUS_CONNECTED
 						curTries = 0
@@ -647,7 +669,7 @@ class HttpServer:
 		return web.Response(status=200)
 		
 	async def MainLoop(self):
-		app = web.Application(client_max_size=100 * 1024 * 1024)
+		app = web.Application(client_max_size=1024 * 1024 * 1024)
 		app.router.add_get("/wsf-control", self.handlerControlPage)
 		app.router.add_get("/wsf-control/query", self.handlerControlQuery)
 		app.router.add_post("/wsf-control/exit", self.handlerControlExit)

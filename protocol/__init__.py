@@ -309,20 +309,22 @@ class HelloClientControl:
 	"""
 	def __init__(self, info: ClientInfo):
 		self.info = info
-		self.pkgs: typing.List[PackageId] = []
+		self.sent_pkgs: typing.List[PackageId] = []
+		self.received_pkgs: typing.List[PackageId] = []
 
-	def Append(self, pkg: PackageId):
-		self.pkgs.append(pkg)
+	def AppendSentPkgs(self, pkg: PackageId):
+		self.sent_pkgs.append(pkg)
+
+	def AppendReceivedPkgs(self, pkg: PackageId):
+		self.received_pkgs.append(pkg)
 
 	def Pack(self):
 		pbt = pb.HelloClientControl()
 		pbt.info.id = self.info.id
 		pbt.info.type = self.info.type
-		pbt.pkgs.extend([ x.Pack() for x in self.pkgs ])
+		pbt.sent_pkgs.extend([ x.Pack() for x in self.sent_pkgs ])
+		pbt.received_pkgs.extend([ x.Pack() for x in self.received_pkgs ])
 		return pbt
-	
-	def __len__(self):
-		return len(self.pkgs)
 	
 	@classmethod
 	def Unpack(cls, data: bytes):
@@ -330,7 +332,8 @@ class HelloClientControl:
 		pbt.ParseFromString(data)
 		
 		ret = HelloClientControl(ClientInfo(pbt.info.id, pbt.info.type))
-		ret.pkgs.extend([ PackageId.Unpack(x) for x in pbt.pkgs ])
+		ret.sent_pkgs.extend([ PackageId.Unpack(x) for x in pbt.sent_pkgs ])
+		ret.received_pkgs.extend([ PackageId.Unpack(x) for x in pbt.received_pkgs ])
 		return ret
 
 class HelloServerControl:
@@ -340,24 +343,26 @@ class HelloServerControl:
 	"""
 	def __init__(self):
 		self.clients: typing.List[ClientInfo] = []
-		self.pkgs: typing.List[PackageId] = []
+		self.reports: typing.List[PackageId] = []
+		self.requires: typing.List[PackageId] = []
 
 	def AppendClient(self, client: ClientInfo):
 		self.clients.append(client)
 	
-	def AppendPkg(self, pkg: PackageId):
-		self.pkgs.append(pkg)
+	def AppendReportPkg(self, pkg: PackageId):
+		self.reports.append(pkg)
+
+	def AppendRequirePkg(self, pkg: PackageId):
+		self.requires.append(pkg)
 
 	def IsEmpty(self):
-		return len(self.clients) == 0 and len(self.pkgs) == 0
-	
-	def __len__(self):
-		return len(self.pkgs)
+		return len(self.clients) == 0 and len(self.reports) == 0 and len(self.requires) == 0
 
 	def Pack(self):
 		pbt = pb.HelloServerControl()
 		pbt.clients.extend([ x.Pack() for x in self.clients ])
-		pbt.pkgs.extend([ x.Pack() for x in self.pkgs ])
+		pbt.reports.extend([ x.Pack() for x in self.reports ])
+		pbt.requires.extend([ x.Pack() for x in self.requires ])
 		return pbt
 	
 	@classmethod
@@ -367,7 +372,8 @@ class HelloServerControl:
 
 		ret = HelloServerControl()
 		ret.clients = [ ClientInfo.Unpack(x) for x in pbt.clients ]
-		ret.pkgs = [ PackageId.Unpack(x) for x in pbt.pkgs  ]
+		ret.reports = [ PackageId.Unpack(x) for x in pbt.reports  ]
+		ret.requires = [ PackageId.Unpack(x) for x in pbt.requires ]
 		return ret
 	
 class QueryClientsControl:

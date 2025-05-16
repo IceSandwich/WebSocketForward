@@ -26,8 +26,11 @@ class Configuration:
 
 		self.maxRetries:int = args.max_retries
 		self.cacheQueueSize: int  = args.cache_queue_size
+		self.cacheRecvQueueSize: int = args.cache_recv_queue_size
 		self.safeSegmentSize: int  = args.safe_segment_size
 		self.allowOFOResend: bool  = args.allow_ofo_resend
+
+		self.waitToReconnect: int = args.wait_to_reconnect_time
 
 		# debug only
 		self.force_id: str = args.force_id
@@ -36,14 +39,17 @@ class Configuration:
 	def SetupParser(cls, parser: argp.ArgumentParser):
 		parser.add_argument("--server", type=str, default="http://127.0.0.1:8030/wsf/ws", help="Server address")
 		parser.add_argument("--cipher", type=str, default="xor", help="Cipher to use for encryption")
-		parser.add_argument("--key", type=str, default="WebSocket@Forward通讯密钥，必须跟另一端保持一致。", help="The key to use for the cipher. Must be the same with remote.")
+		parser.add_argument("--key", type=str, default="通讯密钥，必须跟另一端保持一致；否则传输出错。", help="The key to use for the cipher. Must be the same with remote.")
 		parser.add_argument("--uid", type=str, default="Client")
 		parser.add_argument("--target_uid", type=str, default="Remote")
 
 		parser.add_argument("--max_retries", type=int, default=3, help="Maximum number of retries")
 		parser.add_argument("--cache_queue_size", type=int, default=128, help="Maximum number of messages to cache. Must smaller than server's cache queue size. Bigger is better since remote need retreive pkg.")
+		parser.add_argument("--cache_recv_queue_size", type=int, default=150, help="Must bigger then server's cache queue size.")
 		parser.add_argument("--safe_segment_size", type=int, default=768*1024, help="Maximum size of messages to send, in Bytes")
 		parser.add_argument("--allow_ofo_resend", action="store_true", help="Allow out of order message to be resend. Disable this feature may results in buffer overflow issue. By default, this feature is disable.")
+
+		parser.add_argument("--wait_to_reconnect_time", type=int, default=time_utils.Seconds(2), help="Time to wait before reconnecting")
 
 		parser.add_argument("--force_id", type=str, default="")
 		return parser
@@ -66,6 +72,10 @@ class Client:
 
 		self.sendQueue: utils.BoundedQueue[protocol.Transport] = utils.BoundedQueue(config.cacheQueueSize)
 		self.sendQueueLock = asyncio.Lock()
+
+		# 只记录非control包
+		self.historyRecvQueue: utils.BoundedQueue[protocol.PackageId] = utils.BoundedQueue(self.config.cacheRecvQueueSize)
+		self.historyRecvQueueLock = asyncio.Lock()
 
 		# 管理分包传输，key为seq_id
 		self.chunks: typing.Dict[str, utils.Chunk] = {}
@@ -93,50 +103,53 @@ class Client:
 		return None
 
 	async def initialize(self, ws: web.WebSocketResponse):
-		ctrl = protocol.Control()
-		ctrl.InitHelloClientControl(protocol.HelloClientControl(protocol.ClientInfo(self.instance_id if self.config.force_id == "" else self.config.force_id, protocol.ClientInfo.CLIENT)))
-		await ws.send_bytes(ctrl.Pack())
+		async with self.historyRecvQueueLock:
+			hcc = protocol.HelloClientControl(protocol.ClientInfo(self.instance_id if self.config.force_id == "" else self.config.force_id, protocol.ClientInfo.CLIENT))
+			for pkg in self.historyRecvQueue:
+				hcc.AppendReceivedPkgs(protocol.PackageId.FromPackage(pkg))
+			# ignore sent packages, let remote retrieve it.
+			ctrl = protocol.Control()
+			ctrl.InitHelloClientControl(hcc)
+			await ws.send_bytes(ctrl.Pack())
 
-		pkg = await self.waitForOnePackage(ws)
-		if pkg is None:
-			log.error(f"{self.name}] Broken ws connection in initialize stage.")
-			self.status = self.STATUS_INIT
-			return ws
-		if pkg.transportType != protocol.Transport.CONTROL:
-			log.error(f"{self.name}] First client package must be control package, but got {protocol.Transport.Mappings.ValueToString(pkg.transportType)}.")
-			self.status = self.STATUS_INIT
-			return ws
-		tmp = protocol.Control()
-		tmp.Unpack(pkg)
-		pkg = tmp
-		if pkg.controlType == protocol.Control.PRINT: # error msg from server
-			log.error(f"{self.name}] Error from server: {pkg.DecodePrintMsg()}")
-			self.status = self.STATUS_INIT
-			return ws
-		if pkg.controlType != protocol.Control.HELLO:
-			log.error(f"{self.name}] First client control package must be HELLO, but got {protocol.Control.Mappings.ValueToString(pkg.controlType)}.")
-			self.status = self.STATUS_INIT
-			return ws
-		hello = pkg.ToHelloServerControl()
+			pkg = await self.waitForOnePackage(ws)
+			if pkg is None:
+				log.error(f"{self.name}] Broken ws connection in initialize stage.")
+				self.status = self.STATUS_INIT
+				return ws
+			if pkg.transportType != protocol.Transport.CONTROL:
+				log.error(f"{self.name}] First client package must be control package, but got {protocol.Transport.Mappings.ValueToString(pkg.transportType)}.")
+				self.status = self.STATUS_INIT
+				return ws
+			tmp = protocol.Control()
+			tmp.Unpack(pkg)
+			pkg = tmp
+			if pkg.controlType == protocol.Control.PRINT: # error msg from server
+				log.error(f"{self.name}] Error from server: {pkg.DecodePrintMsg()}")
+				self.status = self.STATUS_INIT
+				return ws
+			if pkg.controlType != protocol.Control.HELLO:
+				log.error(f"{self.name}] First client control package must be HELLO, but got {protocol.Control.Mappings.ValueToString(pkg.controlType)}.")
+				self.status = self.STATUS_INIT
+				return ws
+			hello = pkg.ToHelloServerControl()
 
-		# server will send all package he received. we need to decide which package to resend.
-		async with self.sendQueueLock:
-			log.debug(f"Server reported {len(hello.pkgs)} packages received, will be compared to {len(self.sendQueue)} packages.")
-			for item in self.sendQueue:
-				found = False
-				for pkg in hello.pkgs:
-					if pkg.IsSamePackage(item):
-						found = True
-						break
-				if found == False:
-					# 放入scheduleSendQueue而不是直接发送，是因为当前没有监听收包，万一对方发送大量的包，这里缓冲区就爆了
-					# 因此放入schedule里，进入connect状态后，边监听边发送这些包（当开启OFOResend时）。缺点是导致乱序。
-					await self.scheduleSendQueue.put(item)
+			# server will send all package he received. we need to decide which package to resend.
+			async with self.sendQueueLock:
+				log.debug(f"Server has received {len(hello.reports)} packages. We had sent {len(self.sendQueue)} packages.")
+				for item in self.sendQueue:
+					found = False
+					for pkg in hello.pkgs:
+						if pkg.IsSamePackage(item):
+							found = True
+							break
+					if found == False:
+						# 放入scheduleSendQueue而不是直接发送，是因为当前没有监听收包，万一对方发送大量的包，这里缓冲区就爆了
+						# 因此放入schedule里，进入connect状态后，边监听边发送这些包（当开启OFOResend时）。缺点是导致乱序。
+						await self.scheduleSendQueue.put(item)
 
-			self.ws = ws
-			self.status = self.STATUS_CONNECTED
-		
-		return None
+				self.ws = ws
+				self.status = self.STATUS_CONNECTED
 	
 	async def DirectSend(self, raw: protocol.Transport):
 		await self.ws.send_bytes(raw.Pack())
@@ -316,12 +329,17 @@ class Client:
 		ctrl = protocol.Control()
 		ctrl.SetSenderReceiver(self.config.uid, self.config.target_uid)
 		ctrl.InitPrintControl(f"{self.name}] {msg}")
+		log.info(f"Send Msg] {msg} -> {self.config.target_uid}")
 		await self.DirectSend(ctrl)
 
 	async def OnPackage(self, pkg: typing.Union[protocol.Request, protocol.Response, protocol.Subpackage, protocol.StreamData, protocol.Control]) -> bool:
 		"""
 		返回False退出MainLoop
 		"""
+		if pkg.transportType != protocol.Transport.CONTROL:
+			async with self.historyRecvQueueLock:
+				self.historyRecvQueue.Add(protocol.PackageId.FromPackage(pkg))
+
 		if type(pkg) == protocol.StreamData:
 			if pkg.total_cnt != -1:
 				log.error(f"{self.name}] Client don't process normal StreamData. Only receive end stream StreamData. Ignore {pkg.seq_id}:{pkg.cur_idx}/{pkg.total_cnt} <<< {repr(pkg.body[:utils.LOG_BYTES_LEN * 2])} ...>>> <- {pkg.sender}")
@@ -383,35 +401,40 @@ class Client:
 		exitSignal = False
 		self.forward_session = aiohttp.ClientSession(timeout=self.forward_timeout)
 		while curTries < self.config.maxRetries:
-			async with aiohttp.ClientSession() as session:
-				async with session.ws_connect(self.url, headers=self.HttpUpgradedWebSocketHeaders, max_msg_size=self.WebSocketMaxReadingMessageSize, timeout=self.ws_timeout) as ws:
-					log.info(f"Initializing...")
-					self.status = self.STATUS_INITIALIZING
-					initRet = await self.initialize(ws)
-					if initRet is None:
-						self.ws = ws
-						self.status = self.STATUS_CONNECTED
-						curTries = 0
-						log.info(f"Start mainloop...")
+			try:
+				async with aiohttp.ClientSession() as session:
+					async with session.ws_connect(self.url, headers=self.HttpUpgradedWebSocketHeaders, max_msg_size=self.WebSocketMaxReadingMessageSize, timeout=self.ws_timeout) as ws:
+						log.info(f"Initializing...")
+						self.status = self.STATUS_INITIALIZING
+						initRet = await self.initialize(ws)
+						if initRet is None:
+							self.ws = ws
+							self.status = self.STATUS_CONNECTED
+							curTries = 0
+							log.info(f"Start mainloop...")
 
-						if self.config.allowOFOResend:
-							asyncio.ensure_future(self.resendScheduledPackages())
-						else:
-							await self.resendScheduledPackages()
-						async for msg in self.ws:
-							if msg.type == aiohttp.WSMsgType.ERROR:
-								log.error(f"{self.name}] WSException: {self.ws.exception()}", exc_info=True, stack_info=True)
-							elif msg.type == aiohttp.WSMsgType.TEXT or msg.type == aiohttp.WSMsgType.BINARY:
-								parsed = protocol.Parse(msg.data, self.config.cipher)
-								shouldRuninng = await self.OnPackage(parsed)
-								if shouldRuninng == False:
-									exitSignal = True
-									break
+							if self.config.allowOFOResend:
+								asyncio.ensure_future(self.resendScheduledPackages())
+							else:
+								await self.resendScheduledPackages()
+							async for msg in self.ws:
+								if msg.type == aiohttp.WSMsgType.ERROR:
+									log.error(f"{self.name}] WSException: {self.ws.exception()}", exc_info=True, stack_info=True)
+								elif msg.type == aiohttp.WSMsgType.TEXT or msg.type == aiohttp.WSMsgType.BINARY:
+									parsed = protocol.Parse(msg.data, self.config.cipher)
+									shouldRuninng = await self.OnPackage(parsed)
+									if shouldRuninng == False:
+										exitSignal = True
+										break
+			except aiohttp.client_exceptions.ClientConnectorError as e:
+				log.error(f"{self.name}] ClientConnectorError: {e}", exc_info=True, stack_info=True)
 			
 			self.status = self.STATUS_INIT
 			if exitSignal == False:
-				log.info(f"{self.name}] Reconnecting({curTries}/{self.config.maxRetries})...")
+				log.info(f"{self.name}] Disconnected. Attempt to reconnect.")
 				curTries += 1
+				await asyncio.sleep(self.config.waitToReconnect)
+				log.info(f"{self.name}] Reconnecting({curTries}/{self.config.maxRetries})...")
 			else:
 				break
 		bakHandler = self.ws
