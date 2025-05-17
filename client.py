@@ -29,6 +29,7 @@ class Configuration:
 		self.cacheRecvQueueSize: int = args.cache_recv_queue_size
 		self.safeSegmentSize: int  = args.safe_segment_size
 		self.allowOFOResend: bool  = args.allow_ofo_resend
+		self.resendScheduledTime: int  = args.resend_schedule_time
 
 		self.waitToReconnect: int = args.wait_to_reconnect_time
 
@@ -48,6 +49,7 @@ class Configuration:
 		parser.add_argument("--cache_recv_queue_size", type=int, default=150, help="Must bigger then server's cache queue size.")
 		parser.add_argument("--safe_segment_size", type=int, default=768*1024, help="Maximum size of messages to send, in Bytes")
 		parser.add_argument("--allow_ofo_resend", action="store_true", help="Allow out of order message to be resend. Disable this feature may results in buffer overflow issue. By default, this feature is disable.")
+		parser.add_argument("--resend_schedule_time", type=int, default=time_utils.Seconds(1), help="Interval to resend scheduled packages")
 
 		parser.add_argument("--wait_to_reconnect_time", type=int, default=time_utils.Seconds(2), help="Time to wait before reconnecting")
 
@@ -150,6 +152,7 @@ class Client:
 
 				self.ws = ws
 				self.status = self.STATUS_CONNECTED
+		return None
 	
 	async def DirectSend(self, raw: protocol.Transport):
 		await self.ws.send_bytes(raw.Pack())
@@ -370,6 +373,7 @@ class Client:
 			item = await self.scheduleSendQueue.get()
 			log.debug(f"Schedule] Resend {protocol.Transport.Mappings.ValueToString(item.transportType)} {item.seq_id}:{item.cur_idx}/{item.total_cnt} -> {item.receiver}")
 			await self.DirectSend(item)
+			await asyncio.sleep(self.config.resendScheduledTime)
 
 	async def processSubpackage(self, raw: typing.Union[protocol.Request, protocol.Response, protocol.Subpackage]) -> typing.Optional[protocol.Transport]:
 		# 分包规则；前n-1个包为subpackage，最后一个包为resp、req。

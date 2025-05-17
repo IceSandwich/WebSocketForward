@@ -210,7 +210,6 @@ class Server:
 				ret.SetForResponseTransport(pkg)
 				ret.InitHelloServerControl(protocol.HelloServerControl())
 				await ws.send_bytes(ret.Pack())
-				await asyncio.sleep(time_utils.Seconds(1))
 			elif hello.info.type == protocol.ClientInfo.REMOTE:
 				async with self.receiveQueueLock:
 					# Remote will send all send package infos to us, we need to filter out items he didn't receive and resend again.
@@ -247,7 +246,6 @@ class Server:
 
 				ret.InitHelloServerControl(hsc)
 				await ws.send_bytes(ret.Pack())
-				await asyncio.sleep(time_utils.Seconds(1))
 			elif hello.info.type == protocol.ClientInfo.CLIENT:
 				# Client will query all receive package infos from server, so we need to send the package infos to it.
 				log.info(f"{self.name}] Old client instance {hello.info.id}. Client reports {len(hello.received_pkgs)} received packages. Server had received {len(self.receiveQueue)} pacakges and sent {len(self.sendQueue)} packages.")
@@ -270,7 +268,6 @@ class Server:
 						hsc.AppendReportPkg(pkg)
 				ret.InitHelloServerControl(hsc)
 				await ws.send_bytes(ret.Pack())
-				await asyncio.sleep(time_utils.Seconds(1))
 			else:
 				log.error(f"{self.name}] Invalid hello type {hello.info.type}")
 				self.status = self.STATUS_INIT
