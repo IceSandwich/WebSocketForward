@@ -47,7 +47,7 @@ class XorCipher(Cipher):
 	def Encrypt(self, data: bytes) -> bytes:
 		raw = self.xor(data)
 		ret = self.compress(self.compress_method, raw)
-		print(f"Compress from {len(raw)} to {len(ret)}, ratio: {(len(raw) - len(ret)) / len(raw) * 100} %")
+		# print(f"Compress from {len(raw)} to {len(ret)}, ratio: {(len(raw) - len(ret)) / len(raw) * 100} %")
 		return ret
 		# return self.compress(self.compress_method, self.xor(data))
 	

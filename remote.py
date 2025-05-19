@@ -4,14 +4,18 @@ import protocol
 import utils
 import time_utils
 
-import asyncio, logging, os, typing, re, aiohttp
-from urllib.parse import urlparse
+import asyncio, logging, os, typing, re, json, aiohttp
+from urllib.parse import urlparse, parse_qs
+from pathlib import Path
 import aiohttp.web as web
 import argparse as argp
 import heapq
+import PIL.ImageFile
+import math
+import shutil
 
 log = logging.getLogger(__name__)
-utils.SetupLogging(log, "remote", terminalLevel=logging.DEBUG, saveInFile=True)
+utils.SetupLogging(log, "remote", terminalLevel=logging.INFO, saveInFile=True)
 protocol.log = log
 utils.log = log
 
@@ -528,17 +532,99 @@ class Client:
 		raw.InitQuitSignal()
 		await self.DirectSend(raw)
 
+class ImageInstance:
+	def __init__(self, img: PIL.ImageFile.ImageFile, prompt: str):
+		self.img = img
+		self.metadata = self.img.getexif()
+		self.metadata[270] = json.dumps({  # 270 corresponds to 'ImageDescription'
+			"prompt": prompt
+		})
+
+class StableDiffusionGridCacheInfo():
+	def __init__(self, width: int, height: int, gridUrl: str, imglist: typing.List[str], prompts: typing.List[str]):
+		self.width = width
+		self.height = height
+		self.gridUrl = gridUrl
+		self.imglist = imglist
+		self.prompts = prompts
+		self.take = 0
+		self.takeLock = asyncio.Lock()
+		self.trigger = asyncio.Event()
+		self.ns = int(math.ceil(math.sqrt(len(self.imglist))))
+		self.nh = int(math.ceil(len(self.imglist) / self.ns))
+		self.img: PIL.ImageFile.ImageFile = None
+
+	async def WaitAndGet(self, url: str):
+		if url not in self.imglist:
+			log.error(f"Attempt to wait {url} but not in list: {self.imglist}")
+			return None, False
+		loc = self.imglist.index(url)
+		
+		await self.trigger.wait()
+		isLastOneToTake = False
+		async with self.takeLock:
+			self.take += 1
+			if self.take == len(self.imglist):
+				isLastOneToTake = True
+
+		if self.img is None:
+			log.error(f"Not hit grid {self.gridUrl} for image {url}")
+			return None, isLastOneToTake
+		
+		x = loc % self.ns
+		y = int(math.floor(loc / self.ns))
+
+		img = self.img.crop(( x * self.width, y * self.height, (x + 1) * self.width, (y + 1) * self.height ))
+		return ImageInstance(img, self.prompts[loc]), isLastOneToTake
+
+	def Set(self, img: PIL.ImageFile.ImageFile):
+		if img.width == self.width * self.ns and img.height == self.height * self.nh:
+			self.img = img
+		self.trigger.set()
+
+class MessageStreamProcessor:
+	def __init__(self):
+		self.buffer = ""  # 用于存储流中的字符数据
+
+	def Process(self, new_data: str):
+		# 将新获取的字符数据追加到缓冲区
+		self.buffer += new_data
+
+		ret: typing.List[str] = []
+		# 尝试分割消息
+		while True:
+			if len(self.buffer) == 0:
+				break
+			if not self.buffer.startswith("data: "):
+				raise Exception("buffer should starts with data")
+			end_index = self.buffer.find("\n\n")  # 查找一条消息的结束
+			
+			# 如果找到了一个完整的消息
+			if end_index != -1:
+				# 提取完整的消息
+				message = self.buffer[len("data: "): end_index]
+				ret.append(message)  # 将消息加入到消息列表
+
+				# 将缓冲区更新为剩余的数据（去掉已处理的部分）
+				self.buffer = self.buffer[end_index + len("\n\n"):]
+
+			# 如果没有找到完整的消息，说明数据不完整，等待下一次流数据
+			else:
+				break
+		return ret
 class StableDiffusionCachingClient(Client):
 	def __init__(self, config: Configuration):
 		super().__init__(config)
 		
 		self.root_dir = 'cache_sdwebui'
-		self.assets_dir = ['assets', 'webui-assets']
-		self.sdprefix = 'D:/GITHUB/stable-diffusion-webui-forge/'
+		self.assets_dir = ['/assets', '/webui-assets']
+		self.sdDirPattern = 'D:/GITHUB/stable-diffusion-webui-forge/'
+		self.tmpDirPattern = r'^C:/Users/[a-zA-Z0-9._-]+/AppData/Local/Temp/'
+		self.keep_list = ["outputs", "index.html"]
 		
 		os.makedirs(self.root_dir,exist_ok=True)
 		for assets_fd in self.assets_dir:
-			os.makedirs(os.path.join(self.root_dir, assets_fd), exist_ok=True)
+			os.makedirs(self.root_dir + assets_fd, exist_ok=True)
 
 		#http://127.0.0.1:7860/assets/Index-_i8s1y64.js
 		#http://127.0.0.1:7860/webui-assets/fonts/sourcesanspro/6xKydSBYKcSV-LCoeQqfX1RYOo3i54rwlxdu.woff2
@@ -550,67 +636,185 @@ class StableDiffusionCachingClient(Client):
 
 		self.nocipher = encryptor.NewCipher('plain', '')
 
-	def readCache(self, filename: str, url: str):
-		log.debug(f'Using cache: {url} => {filename}')
+		# session_hash to event_id
+		self.requireSession: typing.Dict[str, str] = {}
+		# key is stream seq id, value is event id
+		self.listenEventIdInStreamSeqId: typing.Dict[str, str] = {}
+
+		# grid url to StableDiffusionGridCacheInfo
+		self.imageGridWaitList: typing.Dict[str, StableDiffusionGridCacheInfo] = {}
+		# image url to grid url
+		self.imageWaitList: typing.Dict[str, str] = {}
+
+		self.clean()
+
+	def clean(self):
+		for dname in os.listdir(self.root_dir):
+			if dname in self.keep_list:
+				continue
+			
+			fn = os.path.join(self.root_dir, dname)
+			if os.path.isdir(fn):
+				log.info(f"Delete cache folder: {fn}")
+				shutil.rmtree(fn)
+			else:
+				log.info(f"Delete cache file: {fn}")
+				os.remove(fn)
+	
+	async def Stream(self, seq_id: str):
+		isQueueDataSSE = False
+		event_id = ""
+		msgproc = MessageStreamProcessor()
+		if seq_id in self.listenEventIdInStreamSeqId:
+			isQueueDataSSE = True
+			event_id = self.listenEventIdInStreamSeqId[seq_id]
+			print("===Capture: ", seq_id, "event:", event_id)
+			del self.listenEventIdInStreamSeqId[seq_id]
+
+		async for package in super().Stream(seq_id):
+			if isQueueDataSSE:
+				body = package.body.decode('utf-8')
+				msgs = msgproc.Process(body)
+				for msg in msgs:
+					sdata = json.loads(msg)
+					if sdata['msg'] == 'process_completed' and sdata["success"] and len(sdata["output"]["data"]) == 4 and type(sdata["output"]["data"][0]) == list and len(sdata["output"]["data"][0]) > 0 and type(sdata["output"]["data"][1]) == str:
+						cur_event_id = sdata["event_id"]
+						imageInfos: typing.List[typing.Any] = sdata["output"]["data"][0]
+						gridUrls = [ x["image"]["url"] for x in imageInfos if '-grids' in x["image"]["url"] ]
+						if len(gridUrls) != 1:
+							log.error(f"{self.name}] grid url more than 1. unexpected case need to consider: {sdata}")
+						else:
+							# /file=D:\\GITHUB\\stable-diffusion-webui-forge\\outputs\\txt2img-grids\\2025-05-19\\grid-0057.png
+							task = json.loads(sdata["output"]["data"][1])
+							all_prompts: typing.List[str] = task["all_prompts"]
+							gridUrl: str =  urlparse(gridUrls[0].replace('\\', '/')).path
+							imgUrls = [ urlparse(x["image"]["url"].replace('\\', '/')).path for x in imageInfos if '-grids' not in x["image"]["url"] ]
+							for imgUrl in imgUrls:
+								self.imageWaitList[imgUrl] = gridUrl
+							self.imageGridWaitList[gridUrl] = StableDiffusionGridCacheInfo(task["width"], task["height"], gridUrl, imgUrls, all_prompts)
+							log.info(f"{self.name}] detected grid image: {gridUrl}")
+			yield package
+	
+	def useCache(self, request: protocol.Request, filename: str):
 		with open(filename, 'rb') as f:
 			body = f.read()
 		resp = protocol.Response(self.nocipher)
 		resp.SetSenderReceiver(self.config.target_uid, self.config.uid)
-		resp.Init(url, 200, {
+		resp.Init(request.url, 200, {
 			'Content-Type': utils.GuessMimetype(filename),
 			'Content-Length': str(len(body))
 		}, body)
 		return resp
-	
+
+	async def cacheOrRequest(self, request: protocol.Request, filename: str):
+		if os.path.exists(filename):
+			log.debug(f'Using cache: {request.url} => {filename}')
+			return self.useCache(request, filename)
+
+		resp = await super().Session(request)
+		if resp.status != 200:
+			return resp
+		try:
+			dirname = os.path.dirname(filename)
+			os.makedirs(dirname, exist_ok=True)
+		except Exception as e:
+			log.error(f"Failed to create dir: {dirname} for request url: {request.url}, error: {e}", exc_info=True, stack_info=True)
+		with open(filename, 'wb') as f:
+			f.write(resp.body)
+			log.debug(f'Cache {request.url} to {filename}')
+		return resp
+		
+	async def cacheImageOrRequest(self, request: protocol.Request, filename: str):
+		if os.path.exists(filename):
+			log.debug(f'Using cache: {request.url} => {filename}')
+			return self.useCache(request, filename)
+		
+		urlpath = urlparse(request.url)
+		if urlpath.path in self.imageWaitList:
+			gridUrl = self.imageWaitList[urlpath.path]
+			img, shouldDelete = await self.imageGridWaitList[gridUrl].WaitAndGet(urlpath.path)
+
+			if shouldDelete:
+				for imgUrl in self.imageGridWaitList[gridUrl].imglist:
+					del self.imageWaitList[imgUrl]
+				del self.imageGridWaitList[gridUrl]
+				log.info(f"Delete grid info: {gridUrl}")
+
+			if img is not None:
+				os.makedirs(os.path.dirname(filename), exist_ok=True)
+				img.img.save(filename, exif=img.metadata)
+				log.info(f'Save result from grid: {filename}')
+				return self.useCache(request, filename)
+			
+			log.error(f"Not hit grid, got ret None for img {request.url} but in waitlist")
+		
+		utils.SetWSFCompress(request, utils.MIMETYPE_WEBP, self.config.img_quality)
+		resp = await super().Session(request)
+		if resp.status != 200:
+			return resp
+		img = utils.DecodeImageFromBytes(resp.body)
+		os.makedirs(os.path.dirname(filename), exist_ok=True)
+		img.save(filename)
+		log.info(f'Save result: {filename}')
+		if urlpath.path in self.imageGridWaitList:
+			self.imageGridWaitList[urlpath.path].Set(img)
+		return self.useCache(request, filename)
+
 	async def Session(self, request: protocol.Request):
 		parsed_url = urlparse(request.url)
-		components = parsed_url.path.strip('/').split('/')
 
-		if components[0] in self.assets_dir:
-			relativefn = parsed_url.path[1:]
-		elif components[0].startswith('file='):
-			relativefn = parsed_url.path[len('/file='):]
-			if relativefn.startswith(self.sdprefix):
-				relativefn = relativefn[len(self.sdprefix):].strip('/')
-			pattern = r'^C:/Users/[a-zA-Z0-9._-]+/AppData/Local/Temp/'
-			if re.match(pattern, relativefn):
-				# 使用re.sub()去掉匹配的前缀部分
-				relativefn = re.sub(pattern, '', relativefn)
-		elif parsed_url.path == '/':
-			relativefn = 'index.html' # cache index.html
-		else:
-			return await super().Session(request)
-		targetfn = os.path.join(self.root_dir, relativefn)
+		if parsed_url.path.startswith(tuple(self.assets_dir)):
+			cachefn = os.path.join(self.root_dir, parsed_url.path[1:])
+			return await self.cacheOrRequest(request, cachefn)
+		
+		if parsed_url.path == '/queue/join':
+			querys = json.loads(request.body)
+			if querys["trigger_id"] != 16:
+				return await super().Session(request)
+			
+			session_hash: str = querys["session_hash"]
+			print("Infer session hash: ", session_hash)
+			resp = await super().Session(request)
+			ans = json.loads(resp.body)
+			eventId: str = ans["event_id"]
 
-		if os.path.exists(targetfn):
-			return self.readCache(targetfn, request.url)
-		else:
-			if relativefn.startswith('outputs/'):
-				utils.SetWSFCompress(request, utils.MIMETYPE_WEBP, self.config.img_quality)
-				resp = await super().Session(request)
-				if resp.status != 200:
-					return resp
-				img = utils.DecodeImageFromBytes(resp.body)
-				os.makedirs(os.path.dirname(targetfn), exist_ok=True)
-				img.save(targetfn)
-				log.info(f'Save result: {targetfn}')
-				with open(targetfn, 'rb') as f:
-					resp.body = f.read()
-					if 'Content-Length' in resp.headers:
-						resp.headers['Content-Length'] = str(len(resp.body))
-			else:
-				resp = await super().Session(request)
-				if resp.status != 200:
-					return resp
-				try:
-					dirname = os.path.dirname(targetfn)
-					os.makedirs(dirname, exist_ok=True)
-				except Exception as e:
-					log.error(f"Failed to create dir: {dirname} for request url: {request.url}, error: {e}", exc_info=True, stack_info=True)
-				with open(targetfn, 'wb') as f:
-					f.write(resp.body)
-					log.debug(f'Cache {parsed_url.path} to {targetfn}')
+			self.requireSession[session_hash] = eventId
 			return resp
+		
+		if parsed_url.path == "/queue/data":
+			querys = parse_qs(parsed_url.query)
+			session_hash = querys["session_hash"][0]
+			# print("Query session hash: ", session_hash)
+			if session_hash in self.requireSession:
+				self.listenEventIdInStreamSeqId[request.seq_id] = self.requireSession[session_hash]
+				del self.requireSession[session_hash]
+				print("== got /queue/data for session_hash: ", session_hash, "seq:", request.seq_id)
+			return await super().Session(request)
+		
+		if parsed_url.path.startswith("/file="):
+			filepath = parsed_url.path[len("/file="):]
+
+			if filepath.startswith(self.sdDirPattern):
+				relativefn = filepath[len(self.sdDirPattern):]
+				cachefn = os.path.join(self.root_dir, relativefn)
+				if relativefn.startswith("outputs"):
+					return await self.cacheImageOrRequest(request, cachefn)
+				else:
+					return await self.cacheOrRequest(request, cachefn)
+
+			if re.match(self.tmpDirPattern, filepath):
+				# 使用re.sub()去掉匹配的前缀部分
+				cachefn = os.path.join(self.root_dir, re.sub(self.tmpDirPattern, '', parsed_url.path[len("/file="):]))
+				return await self.cacheOrRequest(request, cachefn)
+			
+			cachefn = os.path.join(self.root_dir, filepath)
+			return await self.cacheOrRequest(request, cachefn)
+				
+		if parsed_url.path == "/":
+			cachefn = os.path.join(self.root_dir, "index.html")
+			return await self.cacheOrRequest(request, cachefn)
+		
+		return await super().Session(request)
 
 class HttpServer:
 	def __init__(self, conf: Configuration, client: Client) -> None:
