@@ -4,7 +4,7 @@ import protocol
 import utils
 import time_utils
 
-import asyncio, logging, os, typing, re, json, aiohttp
+import asyncio, logging, os, typing, re, aiohttp
 from urllib.parse import urlparse
 import aiohttp.web as web
 import argparse as argp
@@ -18,7 +18,7 @@ utils.log = log
 class Configuration:
 	def __init__(self, args):
 		self.server: str = args.server
-		self.cipher = encryptor.NewCipher(args.cipher, args.key)
+		self.cipher = encryptor.NewCipher(args.cipher, args.key, args.compress)
 		log.info(f"Using cipher: {self.cipher.GetName()}")
 
 		self.prefix: str = args.prefix
@@ -53,6 +53,7 @@ class Configuration:
 
 		parser.add_argument("--uid", type=str, default="Remote")
 		parser.add_argument("--target_uid", type=str, default="Client")
+		parser.add_argument("--compress", type=str, default="none", help=f"The compress method to use. Available: [{', '.join(encryptor.GetAvailableCompressMethods())}]")
 
 		parser.add_argument("--prefer_img_quality", type=int, default=75, help="Compress the image to transfer fasterly.")
 

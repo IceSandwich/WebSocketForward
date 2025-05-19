@@ -18,7 +18,7 @@ utils.log = log
 class Configuration:
 	def __init__(self, args):
 		self.server: str = args.server
-		self.cipher = encryptor.NewCipher(args.cipher, args.key)
+		self.cipher = encryptor.NewCipher(args.cipher, args.key, args.compress)
 		log.info(f"Using cipher: {self.cipher.GetName()}")
 		
 		self.uid: str = args.uid
@@ -43,6 +43,7 @@ class Configuration:
 		parser.add_argument("--key", type=str, default="通讯密钥，必须跟另一端保持一致；否则传输出错。", help="The key to use for the cipher. Must be the same with remote.")
 		parser.add_argument("--uid", type=str, default="Client")
 		parser.add_argument("--target_uid", type=str, default="Remote")
+		parser.add_argument("--compress", type=str, default="none")
 
 		parser.add_argument("--max_retries", type=int, default=3, help="Maximum number of retries")
 		parser.add_argument("--cache_queue_size", type=int, default=128, help="Maximum number of messages to cache. Must smaller than server's cache queue size. Bigger is better since remote need retreive pkg.")

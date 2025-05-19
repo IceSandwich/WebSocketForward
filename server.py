@@ -281,6 +281,7 @@ class Server:
 				
 				self.ws = ws
 				self.status = self.STATUS_CONNECTED
+				return True
 		except Exception as e:
 			log.error(f"initialize] Error: {e}", exc_info=True, stack_info=True)
 
@@ -373,7 +374,8 @@ class Server:
 			self.status = self.STATUS_INITIALIZING
 			log.debug(f"{self.name}] Initializing...")
 
-			if await self.initialize(ws) == False:
+			initState = await self.initialize(ws)
+			if initState == False:
 				log.error(f"{self.name}] Failed to initialize. Return to init status.")
 				return ws
 
