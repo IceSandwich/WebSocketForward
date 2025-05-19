@@ -26,6 +26,7 @@ class Configuration:
 		self.listen_route: str = args.listen_route
 		self.allowOFOResend: bool  = args.allow_ofo_resend
 		self.dropRandom: bool = args.drop_random
+		self.resendScheduledTime: int  = args.resend_schedule_time
 
 		if self.dropRandom:
 			log.warning("Server is running on drop random mode. Pay attention that this option is only for debug use.")
@@ -37,6 +38,7 @@ class Configuration:
 		parser.add_argument("--timeout", type=int, default=60, help="The maximum seconds to resend packages.")
 		parser.add_argument("--listen_route", type=str, default='/wsf/ws')
 		parser.add_argument("--allow_ofo_resend", action="store_true", help="Allow out of order message to be resend. Disable this feature may results in buffer overflow issue. By default, this feature is disable.")
+		parser.add_argument("--resend_schedule_time", type=int, default=time_utils.Seconds(1), help="Interval to resend scheduled packages")
 
 		parser.add_argument("--drop_random", action='store_true', help='Drop package at random rate. Use in debug only.')
 		return parser
@@ -110,13 +112,16 @@ class Server:
 		self.name = server_name
 
 	async def waitForOnePackage(self, ws: web.WebSocketResponse):
-		async for msg in ws:
-			if msg.type == aiohttp.WSMsgType.ERROR:
-				log.error(f"{self.name}]1Pkg] Error on waiting 1 package: {ws.exception()}", exc_info=True, stack_info=True)
-			elif msg.type == aiohttp.WSMsgType.TEXT or msg.type == aiohttp.WSMsgType.BINARY:
-				transport = protocol.Transport.Parse(msg.data)
-				log.debug(f"{self.name}]1Pkg] Got one package: {transport.seq_id}:{protocol.Transport.Mappings.ValueToString(transport.transportType)} from {transport.sender}")
-				return transport
+		try:
+			async for msg in ws:
+				if msg.type == aiohttp.WSMsgType.ERROR:
+					log.error(f"{self.name}]1Pkg] Error on waiting 1 package: {ws.exception()}", exc_info=True, stack_info=True)
+				elif msg.type == aiohttp.WSMsgType.TEXT or msg.type == aiohttp.WSMsgType.BINARY:
+					transport = protocol.Transport.Parse(msg.data)
+					log.debug(f"{self.name}]1Pkg] Got one package: {transport.seq_id}:{protocol.Transport.Mappings.ValueToString(transport.transportType)} from {transport.sender}")
+					return transport
+		except Exception as e:
+			log.error(f"{self.name}]1Pkg] Error on waiting 1 package: {e}", exc_info=True, stack_info=True)
 		log.error(f"{self.name}]1Pkg] WS Broken.")
 		return None
 	
@@ -184,100 +189,102 @@ class Server:
 		pkg = await self.waitForOnePackage(ws)
 		if pkg is None:
 			await errorMsg("Broken ws connection in initialize stage.", sendBack=False)
-			return ws
+			return False
 		if pkg.transportType != protocol.Transport.CONTROL:
 			await errorMsg(f"First client package must be control package, but got {protocol.Transport.Mappings.ValueToString(pkg.transportType)}.")
-			return ws
+			return False
 		tmp = protocol.Control()
 		tmp.Unpack(pkg)
 		pkg = tmp
 		if pkg.controlType != protocol.Control.HELLO:
 			await errorMsg(f"First client control package must be HELLO, but got {protocol.Control.Mappings.ValueToString(pkg.controlType)}.")
-			return ws
+			return False
 		hello = pkg.ToHelloClientControl()
 
 		self.clientType = hello.info.type
 
-		async with self.sendQueueLock:
-			if hello.info.id != self.clientId:
-				log.info(f"{self.name}] New client instance {hello.info.id}. Clear histories.")
-				self.clientId = hello.info.id
-				self.sendQueue.Clear()
-				self.scheduleSendQueue = asyncio.Queue()
-				async with self.receiveQueueLock:
-					self.receiveQueue.Clear()
-				ret = protocol.Control()
-				ret.SetForResponseTransport(pkg)
-				ret.InitHelloServerControl(protocol.HelloServerControl())
-				await ws.send_bytes(ret.Pack())
-			elif hello.info.type == protocol.ClientInfo.REMOTE:
-				async with self.receiveQueueLock:
-					# Remote will send all send package infos to us, we need to filter out items he didn't receive and resend again.
-					log.info(f"{self.name}] Old remote instance {hello.info.id}. Remote reports {len(hello.received_pkgs)} received packages and {len(hello.sent_pkgs)} sent packages. Server had sent {len(self.sendQueue)} packages and received {len(self.receiveQueue)} packages.")
+		try:
+			async with self.sendQueueLock:
+				if hello.info.id != self.clientId:
+					log.info(f"{self.name}] New client instance {hello.info.id}. Clear histories.")
+					self.clientId = hello.info.id
+					self.sendQueue.Clear()
+					self.scheduleSendQueue = asyncio.Queue()
+					async with self.receiveQueueLock:
+						self.receiveQueue.Clear()
+					ret = protocol.Control()
+					ret.SetForResponseTransport(pkg)
+					ret.InitHelloServerControl(protocol.HelloServerControl())
+					await ws.send_bytes(ret.Pack())
+				elif hello.info.type == protocol.ClientInfo.REMOTE:
+					async with self.receiveQueueLock:
+						# Remote will send all send package infos to us, we need to filter out items he didn't receive and resend again.
+						log.info(f"{self.name}] Old remote instance {hello.info.id}. Remote reports {len(hello.received_pkgs)} received packages and {len(hello.sent_pkgs)} sent packages. Server had sent {len(self.sendQueue)} packages and received {len(self.receiveQueue)} packages.")
+
+						ret = protocol.Control()
+						ret.SetForResponseTransport(pkg)
+						hsc = protocol.HelloServerControl()
+
+						now = time_utils.GetTimestamp()
+						# size: sendQueue << hello.received_pkgs
+						for item in self.sendQueue:
+							found = False
+							for pkg in hello.received_pkgs:
+								if pkg.IsSamePackage(item):
+									found = True
+									break
+							if not found:
+								if time_utils.WithInDuration(item.timestamp, now, self.config.timeout):
+									await self.scheduleSendQueue.put(item)
+									hsc.AppendReportPkg(protocol.PackageId.FromPackage(pkg))
+								else:
+									log.warning(f"{self.name}] Package {pkg.seq_id} skip resend because it's out-dated({now} - {item.timestamp} = {now - item.timestamp} > {self.config.timeout}).")
+
+						# size: hello.sent_pkgs << receiveQueue
+						for item in hello.sent_pkgs:
+							found = False
+							for pkg in self.receiveQueue:
+								if pkg.IsSamePackage(item):
+									found = True
+									break
+							if not found:
+								hsc.AppendRequirePkg(item)
+
+					ret.InitHelloServerControl(hsc)
+					await ws.send_bytes(ret.Pack())
+				elif hello.info.type == protocol.ClientInfo.CLIENT:
+					# Client will query all receive package infos from server, so we need to send the package infos to it.
+					log.info(f"{self.name}] Old client instance {hello.info.id}. Client reports {len(hello.received_pkgs)} received packages. Server had received {len(self.receiveQueue)} pacakges and sent {len(self.sendQueue)} packages.")
 
 					ret = protocol.Control()
 					ret.SetForResponseTransport(pkg)
 					hsc = protocol.HelloServerControl()
-
-					now = time_utils.GetTimestamp()
 					# size: sendQueue << hello.received_pkgs
-					for item in self.sendQueue:
+					for pkg in self.sendQueue:
 						found = False
-						for pkg in hello.received_pkgs:
-							if pkg.IsSamePackage(item):
+						for item in hello.received_pkgs:
+							if item.IsSamePackage(pkg):
 								found = True
 								break
 						if not found:
-							if time_utils.WithInDuration(item.timestamp, now, self.config.timeout):
-								await self.scheduleSendQueue.put(item)
-								hsc.AppendReportPkg(protocol.PackageId.FromPackage(pkg))
-							else:
-								log.warning(f"{self.name}] Package {pkg.seq_id} skip resend because it's out-dated({now} - {item.timestamp} = {now - item.timestamp} > {self.config.timeout}).")
-
-					# size: hello.sent_pkgs << receiveQueue
-					for item in hello.sent_pkgs:
-						found = False
+							await self.scheduleSendQueue.put(item)
+					
+					async with self.receiveQueueLock:
 						for pkg in self.receiveQueue:
-							if pkg.IsSamePackage(item):
-								found = True
-								break
-						if not found:
-							hsc.AppendRequirePkg(item)
-
-				ret.InitHelloServerControl(hsc)
-				await ws.send_bytes(ret.Pack())
-			elif hello.info.type == protocol.ClientInfo.CLIENT:
-				# Client will query all receive package infos from server, so we need to send the package infos to it.
-				log.info(f"{self.name}] Old client instance {hello.info.id}. Client reports {len(hello.received_pkgs)} received packages. Server had received {len(self.receiveQueue)} pacakges and sent {len(self.sendQueue)} packages.")
-
-				ret = protocol.Control()
-				ret.SetForResponseTransport(pkg)
-				hsc = protocol.HelloServerControl()
-				# size: sendQueue << hello.received_pkgs
-				for pkg in self.sendQueue:
-					found = False
-					for item in hello.received_pkgs:
-						if item.IsSamePackage(pkg):
-							found = True
-							break
-					if not found:
-						await self.scheduleSendQueue.put(item)
+							hsc.AppendReportPkg(pkg)
+					ret.InitHelloServerControl(hsc)
+					await ws.send_bytes(ret.Pack())
+				else:
+					log.error(f"{self.name}] Invalid hello type {hello.info.type}")
+					self.status = self.STATUS_INIT
+					return False
 				
-				async with self.receiveQueueLock:
-					for pkg in self.receiveQueue:
-						hsc.AppendReportPkg(pkg)
-				ret.InitHelloServerControl(hsc)
-				await ws.send_bytes(ret.Pack())
-			else:
-				log.error(f"{self.name}] Invalid hello type {hello.info.type}")
-				self.status = self.STATUS_INIT
-				return ws
-				# raise Exception(f"Invalid hello type {hello.info.type}")
-			
-			self.ws = ws
-			self.status = self.STATUS_CONNECTED
+				self.ws = ws
+				self.status = self.STATUS_CONNECTED
+		except Exception as e:
+			log.error(f"initialize] Error: {e}", exc_info=True, stack_info=True)
 
-		return None
+		return False
 	
 	async def processControlPackage(self, raw: protocol.Transport):
 		pkg = protocol.Control()
@@ -348,6 +355,7 @@ class Server:
 				item = await self.scheduleSendQueue.get()
 				log.debug(f"{self.name}] Schedule resend {item.seq_id}")
 				await self.DirectSend(item)
+				await asyncio.sleep(self.config.resendScheduledTime)
 			return True
 		except Exception as e:
 			self.scheduleSendQueue = asyncio.Queue()
@@ -357,32 +365,27 @@ class Server:
 	async def MainLoop(self, request: web.BaseRequest):
 		ws = web.WebSocketResponse(max_msg_size=self.WebSocketMaxReadingMessageSize, heartbeat=None if self.HttpUpgradeHearbeatDuration == 0 else self.HttpUpgradeHearbeatDuration, autoping=True)
 
-		self.status = self.STATUS_PREPARING
-		log.debug(f"{self.name}] Preparing...")
-		await ws.prepare(request)
-
-		self.status = self.STATUS_INITIALIZING
-		log.debug(f"{self.name}] Initializing...")
 		try:
-			prepareRet = await self.initialize(ws)
-		except Exception as e:
-			log.error(f"{self.name}] Error in initialize. {e}", exc_info=True, stack_info=True)
-			prepareRet = ws
-		if prepareRet is not None:
-			self.status = self.STATUS_INIT
-			log.error(f"{self.name}] Failed to initialize. Return to init status.")
-			return prepareRet
+			self.status = self.STATUS_PREPARING
+			log.debug(f"{self.name}] Preparing...")
+			await ws.prepare(request)
 
-		self.ws = ws
-		self.status = self.STATUS_CONNECTED
-		await self.OnConnected()
-		shouldGoing = True
-		if self.config.allowOFOResend:
-			asyncio.ensure_future(self.resendScheduledPackages())
-		else:
-			shouldGoing = await self.resendScheduledPackages()
-		if shouldGoing:
-			try:
+			self.status = self.STATUS_INITIALIZING
+			log.debug(f"{self.name}] Initializing...")
+
+			if await self.initialize(ws) == False:
+				log.error(f"{self.name}] Failed to initialize. Return to init status.")
+				return ws
+
+			self.ws = ws
+			self.status = self.STATUS_CONNECTED
+			await self.OnConnected()
+			shouldGoing = True
+			if self.config.allowOFOResend:
+				asyncio.ensure_future(self.resendScheduledPackages())
+			else:
+				shouldGoing = await self.resendScheduledPackages()
+			if shouldGoing:
 				async for msg in ws:
 					if msg.type == aiohttp.WSMsgType.ERROR:
 						log.error(f"{self.name}] {ws.exception()}", exc_info=True, stack_info=True)
@@ -396,13 +399,13 @@ class Server:
 							transport.sender = self.name
 
 						await self.OnPackage(transport)
-			except Exception as e:
-				log.error(f"{self.name}] Mainloop error: {e}", exc_info=True, stack_info=True)
-			
-		self.status = self.STATUS_INIT
-		await self.OnDisconnected()
-		log.debug(f"{self.name}] Disconnected. Return to init status.")
-		self.ws = None
+		except Exception as e:
+			log.error(f"{self.name}] Error in mainloop. {e}", exc_info=True, stack_info=True)
+		finally:
+			self.status = self.STATUS_INIT
+			await self.OnDisconnected()
+			log.debug(f"{self.name}] Disconnected. Return to init status.")
+			self.ws = None
 		return ws
 
 class Router(IRouter):

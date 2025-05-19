@@ -94,13 +94,16 @@ class Client:
 		self.sseCloseSignal: typing.Dict[str, bool] = {}
 
 	async def waitForOnePackage(self, ws: web.WebSocketResponse):
-		async for msg in ws:
-			if msg.type == aiohttp.WSMsgType.ERROR:
-				log.error(f"1Pkg] Error: {ws.exception()}", exc_info=True, stack_info=True)
-			elif msg.type == aiohttp.WSMsgType.TEXT or msg.type == aiohttp.WSMsgType.BINARY:
-				transport = protocol.Transport.Parse(msg.data)
-				log.debug(f"1Pkg] {protocol.Transport.Mappings.ValueToString(transport.transportType)} {transport.seq_id}:{transport.cur_idx}/{transport.total_cnt} <- {transport.sender}")
-				return transport
+		try:
+			async for msg in ws:
+				if msg.type == aiohttp.WSMsgType.ERROR:
+					log.error(f"1Pkg] Error: {ws.exception()}", exc_info=True, stack_info=True)
+				elif msg.type == aiohttp.WSMsgType.TEXT or msg.type == aiohttp.WSMsgType.BINARY:
+					transport = protocol.Transport.Parse(msg.data)
+					log.debug(f"1Pkg] {protocol.Transport.Mappings.ValueToString(transport.transportType)} {transport.seq_id}:{transport.cur_idx}/{transport.total_cnt} <- {transport.sender}")
+					return transport
+		except Exception as e:
+			log.error(f"1Pkg] Exception: {e}", exc_info=True, stack_info=True)
 		log.error(f"1Pkg] WS broken.")
 		return None
 
