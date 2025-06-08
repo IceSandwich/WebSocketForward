@@ -15,7 +15,7 @@ import math
 import shutil
 
 log = logging.getLogger(__name__)
-utils.SetupLogging(log, "remote", terminalLevel=logging.INFO, saveInFile=True)
+utils.SetupLogging(log, "remote", terminalLevel=logging.DEBUG, saveInFile=True)
 protocol.log = log
 utils.log = log
 
@@ -620,7 +620,13 @@ class StableDiffusionCachingClient(Client):
 		self.assets_dir = ['/assets', '/webui-assets']
 		self.sdDirPattern = 'D:/GITHUB/stable-diffusion-webui-forge/'
 		self.tmpDirPattern = r'^C:/Users/[a-zA-Z0-9._-]+/AppData/Local/Temp/'
-		self.keep_list = ["outputs", "index.html"]
+		self.keep_list = ["outputs", "index.html", "always_local", "models"]
+		self.alwayslocal_dir = os.path.join(self.root_dir, "always_local")
+		self.use_localfiles = {
+			"extensions/a1111-sd-webui-tagcomplete/tags/e621.csv": os.path.join(self.alwayslocal_dir, "e621.csv"),
+			"extensions/a1111-sd-webui-tagcomplete/tags/extra-quality-tags.csv": os.path.join(self.alwayslocal_dir, "extra-quality-tags.csv"),
+			"html/card-no-preview.png": os.path.join(self.alwayslocal_dir, "card-no-preview.png")
+		}
 		
 		os.makedirs(self.root_dir,exist_ok=True)
 		for assets_fd in self.assets_dir:
@@ -633,6 +639,7 @@ class StableDiffusionCachingClient(Client):
 		#http://127.0.0.1:7860/file=D:/GITHUB/stable-diffusion-webui-forge/outputs/txt2img-images/2025-04-04/00146-3244803616.png
 		#http://127.0.0.1:7860/file=extensions/a1111-sd-webui-tagcomplete/javascript/ext_umi.js?1729071885.9683821=
 		#http://127.0.0.1:7860/file=C:/Users/xxx/AppData/Local/Temp/gradio/tmpey_xm_6q.png
+		#http://127.0.0.1:7860/sd_extra_networks/thumb?filename=D:/GITHUB/stable-diffusion-webui-forge/models/Lora/Illustrious/xxx.png&mtime=1749270957.098788
 
 		self.nocipher = encryptor.NewCipher('plain', '')
 
@@ -788,30 +795,58 @@ class StableDiffusionCachingClient(Client):
 			if session_hash in self.requireSession:
 				self.listenEventIdInStreamSeqId[request.seq_id] = self.requireSession[session_hash]
 				del self.requireSession[session_hash]
-				print("== got /queue/data for session_hash: ", session_hash, "seq:", request.seq_id)
+				# print("== got /queue/data for session_hash: ", session_hash, "seq:", request.seq_id)
 			return await super().Session(request)
 		
 		if parsed_url.path.startswith("/file="):
 			filepath = parsed_url.path[len("/file="):]
 
-			if filepath.startswith(self.sdDirPattern):
-				relativefn = filepath[len(self.sdDirPattern):]
-				cachefn = os.path.join(self.root_dir, relativefn)
-				if relativefn.startswith("outputs"):
+			if re.match(self.tmpDirPattern, filepath):
+				# 使用re.sub()去掉匹配的前缀部分
+				cachefn = os.path.join(self.root_dir, re.sub(self.tmpDirPattern, '', parsed_url.path[len("/file="):]))
+				if cachefn.endswith(".png"):
 					return await self.cacheImageOrRequest(request, cachefn)
 				else:
 					return await self.cacheOrRequest(request, cachefn)
 
-			if re.match(self.tmpDirPattern, filepath):
-				# 使用re.sub()去掉匹配的前缀部分
-				cachefn = os.path.join(self.root_dir, re.sub(self.tmpDirPattern, '', parsed_url.path[len("/file="):]))
+			if filepath.startswith(self.sdDirPattern):
+				relativefn = filepath[len(self.sdDirPattern):]
+			else:
+				relativefn = filepath
+
+			cachefn = os.path.join(self.root_dir, relativefn)
+			if relativefn.startswith("outputs"):
+				return await self.cacheImageOrRequest(request, cachefn)
+			elif relativefn in self.use_localfiles:
+				return await self.cacheOrRequest(request, self.use_localfiles[relativefn])
+			else:
 				return await self.cacheOrRequest(request, cachefn)
+		
+		if parsed_url.path == "/sd_extra_networks/thumb":
+			querys = parse_qs(parsed_url.query)
+			filepath = querys["filename"][0]
+
+			if filepath.startswith(self.sdDirPattern):
+				relativefn = filepath[len(self.sdDirPattern):]
+				cachefn = os.path.join(self.root_dir, relativefn)
+				if relativefn.startswith("models/Lora") and relativefn.endswith('.png'):
+					return await self.cacheImageOrRequest(request, cachefn)
+				else:
+					return await self.cacheOrRequest(request, cachefn)
 			
 			cachefn = os.path.join(self.root_dir, filepath)
 			return await self.cacheOrRequest(request, cachefn)
 				
 		if parsed_url.path == "/":
 			cachefn = os.path.join(self.root_dir, "index.html")
+			return await self.cacheOrRequest(request, cachefn)
+
+		if parsed_url.path == "/internal/progress":
+			utils.SetWSFCompress(request, utils.MIMETYPE_WEBP, self.config.img_quality)
+			return await super().Session(request)
+
+		if parsed_url.path in ["/favicon.ico", "/theme.css"] or parsed_url.path.startswith("/custom_component"):
+			cachefn = os.path.join(self.root_dir, parsed_url.path[1:])
 			return await self.cacheOrRequest(request, cachefn)
 		
 		return await super().Session(request)
