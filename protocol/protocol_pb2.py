@@ -24,19 +24,19 @@ _sym_db = _symbol_database.Default()
 
 
 
-DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x0eprotocol.proto\x12\tWSForward\"?\n\tPackageId\x12\x0e\n\x06seq_id\x18\x03 \x01(\t\x12\x0f\n\x07\x63ur_idx\x18\x01 \x01(\x05\x12\x11\n\ttotal_cnt\x18\x02 \x01(\x05\"\x85\x01\n\tTransport\x12&\n\x04type\x18\x03 \x01(\x0e\x32\x18.WSForward.TransportType\x12\x10\n\x08receiver\x18\x05 \x01(\t\x12\x0e\n\x06sender\x18\x04 \x01(\t\x12\x0c\n\x04\x64\x61ta\x18\x01 \x01(\x0c\x12 \n\x02id\x18\x02 \x01(\x0b\x32\x14.WSForward.PackageId\"=\n\x07\x43ontrol\x12$\n\x04type\x18\x01 \x01(\x0e\x32\x16.WSForward.ControlType\x12\x0c\n\x04\x64\x61ta\x18\x02 \x01(\x0c\"=\n\nClientInfo\x12\n\n\x02id\x18\x01 \x01(\t\x12#\n\x04type\x18\x02 \x01(\x0e\x32\x15.WSForward.ClientType\"\x8f\x01\n\x12HelloClientControl\x12#\n\x04info\x18\x03 \x01(\x0b\x32\x15.WSForward.ClientInfo\x12\'\n\tsent_pkgs\x18\x01 \x03(\x0b\x32\x14.WSForward.PackageId\x12+\n\rreceived_pkgs\x18\x02 \x03(\x0b\x32\x14.WSForward.PackageId\"\x8b\x01\n\x12HelloServerControl\x12&\n\x07\x63lients\x18\x03 \x03(\x0b\x32\x15.WSForward.ClientInfo\x12%\n\x07reports\x18\x01 \x03(\x0b\x32\x14.WSForward.PackageId\x12&\n\x08requires\x18\x02 \x03(\x0b\x32\x14.WSForward.PackageId\"?\n\x13QueryClientsControl\x12(\n\tconnected\x18\x01 \x03(\x0b\x32\x15.WSForward.ClientInfo\"S\n\x07Request\x12\x0b\n\x03url\x18\x01 \x01(\t\x12\x0e\n\x06method\x18\x02 \x01(\t\x12\x0f\n\x07headers\x18\x03 \x01(\t\x12\x11\n\x04\x62ody\x18\x04 \x01(\x0cH\x00\x88\x01\x01\x42\x07\n\x05_body\"F\n\x08Response\x12\x0b\n\x03url\x18\x01 \x01(\t\x12\x0e\n\x06status\x18\x02 \x01(\x05\x12\x0f\n\x07headers\x18\x03 \x01(\t\x12\x0c\n\x04\x62ody\x18\x04 \x01(\x0c*X\n\rTransportType\x12\x0b\n\x07\x43ONTROL\x10\x00\x12\x0b\n\x07REQUEST\x10\x01\x12\x0c\n\x08RESPONSE\x10\x02\x12\x0e\n\nSUBPACKAGE\x10\x03\x12\x0f\n\x0bSTREAM_DATA\x10\x04*Y\n\x0b\x43ontrolType\x12\t\n\x05HELLO\x10\x00\x12\x11\n\rQUERY_CLIENTS\x10\x01\x12\x0f\n\x0bQUIT_SIGNAL\x10\x02\x12\t\n\x05PRINT\x10\x03\x12\x10\n\x0cRETRIEVE_PKG\x10\x04*$\n\nClientType\x12\n\n\x06\x43LIENT\x10\x00\x12\n\n\x06REMOTE\x10\x01\x62\x06proto3')
+DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x0eprotocol.proto\x12\tWSForward\"?\n\tPackageId\x12\x0e\n\x06seq_id\x18\x03 \x01(\t\x12\x0f\n\x07\x63ur_idx\x18\x01 \x01(\x05\x12\x11\n\ttotal_cnt\x18\x02 \x01(\x05\"\x85\x01\n\tTransport\x12&\n\x04type\x18\x03 \x01(\x0e\x32\x18.WSForward.TransportType\x12\x10\n\x08receiver\x18\x05 \x01(\t\x12\x0e\n\x06sender\x18\x04 \x01(\t\x12\x0c\n\x04\x64\x61ta\x18\x01 \x01(\x0c\x12 \n\x02id\x18\x02 \x01(\x0b\x32\x14.WSForward.PackageId\"=\n\x07\x43ontrol\x12$\n\x04type\x18\x01 \x01(\x0e\x32\x16.WSForward.ControlType\x12\x0c\n\x04\x64\x61ta\x18\x02 \x01(\x0c\"=\n\nClientInfo\x12\n\n\x02id\x18\x01 \x01(\t\x12#\n\x04type\x18\x02 \x01(\x0e\x32\x15.WSForward.ClientType\"\x8f\x01\n\x12HelloClientControl\x12#\n\x04info\x18\x03 \x01(\x0b\x32\x15.WSForward.ClientInfo\x12\'\n\tsent_pkgs\x18\x01 \x03(\x0b\x32\x14.WSForward.PackageId\x12+\n\rreceived_pkgs\x18\x02 \x03(\x0b\x32\x14.WSForward.PackageId\"\x8b\x01\n\x12HelloServerControl\x12&\n\x07\x63lients\x18\x03 \x03(\x0b\x32\x15.WSForward.ClientInfo\x12%\n\x07reports\x18\x01 \x03(\x0b\x32\x14.WSForward.PackageId\x12&\n\x08requires\x18\x02 \x03(\x0b\x32\x14.WSForward.PackageId\"?\n\x13QueryClientsControl\x12(\n\tconnected\x18\x01 \x03(\x0b\x32\x15.WSForward.ClientInfo\"\x1d\n\nRPCControl\x12\x0f\n\x07message\x18\x01 \x01(\t\"S\n\x07Request\x12\x0b\n\x03url\x18\x01 \x01(\t\x12\x0e\n\x06method\x18\x02 \x01(\t\x12\x0f\n\x07headers\x18\x03 \x01(\t\x12\x11\n\x04\x62ody\x18\x04 \x01(\x0cH\x00\x88\x01\x01\x42\x07\n\x05_body\"F\n\x08Response\x12\x0b\n\x03url\x18\x01 \x01(\t\x12\x0e\n\x06status\x18\x02 \x01(\x05\x12\x0f\n\x07headers\x18\x03 \x01(\t\x12\x0c\n\x04\x62ody\x18\x04 \x01(\x0c*X\n\rTransportType\x12\x0b\n\x07\x43ONTROL\x10\x00\x12\x0b\n\x07REQUEST\x10\x01\x12\x0c\n\x08RESPONSE\x10\x02\x12\x0e\n\nSUBPACKAGE\x10\x03\x12\x0f\n\x0bSTREAM_DATA\x10\x04*\x96\x01\n\x0b\x43ontrolType\x12\t\n\x05HELLO\x10\x00\x12\x11\n\rQUERY_CLIENTS\x10\x01\x12\x0f\n\x0bQUIT_SIGNAL\x10\x02\x12\t\n\x05PRINT\x10\x03\x12\x10\n\x0cRETRIEVE_PKG\x10\x04\x12\r\n\tRPC_QUERY\x10\x05\x12\x0c\n\x08RPC_CALL\x10\x06\x12\x0c\n\x08RPC_RESP\x10\x07\x12\x10\n\x0cRPC_PROGRESS\x10\x08*$\n\nClientType\x12\n\n\x06\x43LIENT\x10\x00\x12\n\n\x06REMOTE\x10\x01\x62\x06proto3')
 
 _globals = globals()
 _builder.BuildMessageAndEnumDescriptors(DESCRIPTOR, _globals)
 _builder.BuildTopDescriptorsAndMessages(DESCRIPTOR, 'protocol_pb2', _globals)
 if not _descriptor._USE_C_DESCRIPTORS:
   DESCRIPTOR._loaded_options = None
-  _globals['_TRANSPORTTYPE']._serialized_start=866
-  _globals['_TRANSPORTTYPE']._serialized_end=954
-  _globals['_CONTROLTYPE']._serialized_start=956
-  _globals['_CONTROLTYPE']._serialized_end=1045
-  _globals['_CLIENTTYPE']._serialized_start=1047
-  _globals['_CLIENTTYPE']._serialized_end=1083
+  _globals['_TRANSPORTTYPE']._serialized_start=897
+  _globals['_TRANSPORTTYPE']._serialized_end=985
+  _globals['_CONTROLTYPE']._serialized_start=988
+  _globals['_CONTROLTYPE']._serialized_end=1138
+  _globals['_CLIENTTYPE']._serialized_start=1140
+  _globals['_CLIENTTYPE']._serialized_end=1176
   _globals['_PACKAGEID']._serialized_start=29
   _globals['_PACKAGEID']._serialized_end=92
   _globals['_TRANSPORT']._serialized_start=95
@@ -51,8 +51,10 @@ if not _descriptor._USE_C_DESCRIPTORS:
   _globals['_HELLOSERVERCONTROL']._serialized_end=642
   _globals['_QUERYCLIENTSCONTROL']._serialized_start=644
   _globals['_QUERYCLIENTSCONTROL']._serialized_end=707
-  _globals['_REQUEST']._serialized_start=709
-  _globals['_REQUEST']._serialized_end=792
-  _globals['_RESPONSE']._serialized_start=794
-  _globals['_RESPONSE']._serialized_end=864
+  _globals['_RPCCONTROL']._serialized_start=709
+  _globals['_RPCCONTROL']._serialized_end=738
+  _globals['_REQUEST']._serialized_start=740
+  _globals['_REQUEST']._serialized_end=823
+  _globals['_RESPONSE']._serialized_start=825
+  _globals['_RESPONSE']._serialized_end=895
 # @@protoc_insertion_point(module_scope)

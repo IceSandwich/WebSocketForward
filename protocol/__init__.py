@@ -403,12 +403,85 @@ class QueryClientsControl:
 		ret.connected = [ ClientInfo.Unpack(x) for x in pbt.connected   ]
 		return ret
 	
+class RPCQueryControl:
+	def __init__(self):
+		self.items: typing.Dict[str, typing.Dict[str, typing.Union[typing.List, str]]] = {}
+
+	def Add(self, name: str, params: typing.List[typing.Dict[str, str]]):
+		self.items[name] = { 'params': params }
+
+	def ToDict(self):
+		return self.items
+
+	def Pack(self) -> bytes:
+		return json.dumps(self.items).encode('utf-8')
+	
+	@classmethod
+	def Unpack(cls, data: bytes):
+		ret = RPCQueryControl()
+		ret.items = json.loads(data.decode('utf-8'))
+		return ret
+	
+class RPCCallControl:
+	def __init__(self, name:str, params: typing.Dict[str, typing.Any]):
+		self.name = name
+		self.params = params
+
+	def Pack(self) -> bytes:
+		return json.dumps({
+			"name": self.name,
+			"params": self.params
+		}).encode('utf-8')
+	
+	@classmethod
+	def Unpack(cls, data: bytes):
+		pbt = json.loads(data.decode('utf-8'))
+		return RPCCallControl(pbt['name'], pbt['params'])
+	
+class RPCResponseControl:
+	JSON = 0
+	STREAM = 1
+	PROGRESS = 2
+	ERROR = 3
+
+	UNKNOWN = -1
+
+	def __init__(self):
+		self.type = self.UNKNOWN
+		self.params = {}
+
+	def Init(self, bodyType: int, jsonData: typing.Dict[str, typing.Any]):
+		self.type = bodyType
+		self.params = jsonData
+
+	def ToDict(self):
+		return {
+			"type": self.type,
+			"params": self.params
+		}
+	
+	def Pack(self) -> bytes:
+		return json.dumps(self.ToDict()).encode('utf-8')
+	
+	@classmethod
+	def Unpack(cls, data: bytes):
+		pbt = json.loads(data.decode('utf-8'))
+		ret = RPCResponseControl()
+		ret.type = pbt['type']
+		ret.params = pbt['params']
+		return ret
+
 class Control(Transport):
 	HELLO = 0
 	QUERY_CLIENTS = 1
 	QUIT_SIGNAL = 2
 	PRINT = 3
 	RETRIEVE_PKG = 4
+	QUERY_RPC = 5
+	RPC_CALL = 6
+	RPC_RESP = 7
+	RPC_PROGRESS = 8
+
 	UNKNOWN = -1
 
 	Mappings = TypeMapping([
@@ -417,6 +490,10 @@ class Control(Transport):
 		[QUIT_SIGNAL, 'QUIT_SIGNAL', pb.ControlType.QUIT_SIGNAL],
 		[PRINT, 'PRINT', pb.ControlType.PRINT],
 		[RETRIEVE_PKG, 'RETRIEVE_PKG', pb.ControlType.RETRIEVE_PKG],
+		[QUERY_RPC, 'QUERY_RPC', pb.ControlType.RPC_QUERY],
+		[RPC_CALL, 'RPC_CALL', pb.ControlType.RPC_CALL],
+		[RPC_RESP, 'RPC_RESP', pb.ControlType.RPC_RESP],
+		[RPC_PROGRESS, 'RPC_PROGRESS', pb.ControlType.RPC_PROGRESS]
 	])
 
 	def __init__(self):
@@ -450,6 +527,39 @@ class Control(Transport):
 	def ToQueryClientsControl(self):
 		assert self.controlType == Control.QUERY_CLIENTS, f'ToQueryClientsControl() require controlType == {Control.QUERY_CLIENTS} but got {self.controlType}'
 		return QueryClientsControl.Unpack(self.body)
+	
+	def InitRPCQueryControl(self, data: RPCQueryControl = RPCQueryControl()):
+		self.controlType = Control.QUERY_RPC
+		self.body = data.Pack()
+
+	def ToRPCQueryControl(self) -> RPCQueryControl:
+		assert self.controlType == Control.QUERY_RPC, f'ToRPCQueryClientControl() require controlType == {Control.QUERY_RPC} but got {self.controlType}'
+		return RPCQueryControl.Unpack(self.body)
+	
+	def InitRPCCallControl(self, data: RPCCallControl):
+		self.controlType = Control.RPC_CALL
+		self.body = data.Pack()
+
+	def ToRPCCallControl(self) -> RPCCallControl:
+		assert self.controlType == Control.RPC_CALL, f'ToRPCCallControl() require controlType == {Control.RPC_CALL} but got {self.controlType}'
+		return RPCCallControl.Unpack(self.body)
+	
+	def InitRPCResponseControl(self, data: RPCResponseControl):
+		self.controlType = Control.RPC_RESP
+		self.body = data.Pack()
+
+	def ToRPCResponseControl(self) -> RPCResponseControl:
+		assert self.controlType == Control.RPC_RESP, f'ToRPCResponseControl() require controlType == {Control.RPC_RESP} but got {self.controlType}'
+		return RPCResponseControl.Unpack(self.body)
+	
+	# response is a rpc response control
+	def InitRPCProgressControl(self, task: str):
+		self.controlType = Control.RPC_PROGRESS
+		self.body = task.encode('utf-8')
+
+	def GetRPCProgressTaskId(self):
+		assert self.controlType == Control.RPC_PROGRESS, f'GetRPCProgressTaskId() require controlType == {Control.RPC_PROGRESS} but got {self.controlType}'
+		return self.body.decode('utf-8')
 	
 	def InitPrintControl(self, msg: str):
 		self.controlType = Control.PRINT

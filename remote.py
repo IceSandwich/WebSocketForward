@@ -416,14 +416,16 @@ class Client:
 		del self.chunks[raw.seq_id]
 		return ret
 	
+	async def putInControlSession(self, pkg: protocol.Control):
+		async with self.controlSessionCondition:
+			self.controlSessionMap[pkg.seq_id] = pkg
+			self.controlSessionCondition.notify_all()
+
 	async def processControlPackage(self, pkg: protocol.Control):
-		log.debug(f"Control {protocol.Control.Mappings.ValueToString(pkg.controlType)} {pkg.seq_id}:{pkg.cur_idx}/{pkg.total_cnt} <- {pkg.sender}")
 		if pkg.controlType == protocol.Control.PRINT:
 			log.info(f"% {pkg.DecodePrintMsg()}")
 		elif pkg.controlType in [protocol.Control.QUERY_CLIENTS]:
-			async with self.controlSessionCondition:
-				self.controlSessionMap[pkg.seq_id] = pkg
-				self.controlSessionCondition.notify_all()
+			await self.putInControlSession(pkg)
 		else:
 			log.error(f"OnPackage] Unsupported control type({protocol.Control.Mappings.ValueToString(pkg.controlType)})")
 
@@ -442,6 +444,7 @@ class Client:
 
 	async def OnPackage(self, pkg: typing.Union[protocol.Request, protocol.Response, protocol.Subpackage, protocol.StreamData, protocol.Control]) -> bool:
 		if type(pkg) == protocol.Control:
+			log.debug(f"Control {protocol.Control.Mappings.ValueToString(pkg.controlType)} {pkg.seq_id}:{pkg.cur_idx}/{pkg.total_cnt} <- {pkg.sender}")
 			await self.processControlPackage(pkg)
 		else:
 			async with self.historyRecvQueueLock:
@@ -531,6 +534,33 @@ class Client:
 		raw.SetSenderReceiver(self.config.uid, self.config.target_uid)
 		raw.InitQuitSignal()
 		await self.DirectSend(raw)
+
+	async def ControlRPCQuery(self):
+		raw = protocol.Control()
+		raw.SetSenderReceiver(self.config.uid, self.config.target_uid)
+		raw.InitRPCQueryControl()
+		resp = await self.SessionControl(raw)
+		assert resp.controlType == protocol.Control.QUERY_RPC, f"ControlRPCQuery {raw.seq_id} require to receive a QueryRPC package but got {protocol.Control.Mappings.ValueToString(resp.controlType)}"
+		rpcq = resp.ToRPCQueryControl()
+		return rpcq.ToDict()
+
+	async def ControlRPCCall(self, data: protocol.RPCCallControl):
+		raw = protocol.Control()
+		raw.SetSenderReceiver(self.config.uid, self.config.target_uid)
+		raw.InitRPCCallControl(data)
+		resp = await self.SessionControl(raw)
+		assert resp.controlType == protocol.Control.RPC_RESP, f"ControlRPCCall {raw.seq_id} require to receive a RPCResponse package but got {protocol.Control.Mappings.ValueToString(resp.controlType)}"
+		rpcc = resp.ToRPCResponseControl()
+		return rpcc.ToDict()
+	
+	async def ControlRPCProgress(self, task: str):
+		raw = protocol.Control()
+		raw.SetSenderReceiver(self.config.uid, self.config.target_uid)
+		raw.InitRPCProgressControl(task)
+		resp = await self.SessionControl(raw)
+		assert resp.controlType == protocol.Control.RPC_RESP, f"ControlRPCProgress {raw.seq_id} require to receive a RPCResponse package but got {protocol.Control.Mappings.ValueToString(resp.controlType)}"
+		rpcc = resp.ToRPCResponseControl()
+		return rpcc.ToDict()
 
 class ImageInstance:
 	def __init__(self, img: PIL.ImageFile.ImageFile, prompt: str):
@@ -851,6 +881,13 @@ class StableDiffusionCachingClient(Client):
 		
 		return await super().Session(request)
 
+	async def processControlPackage(self, pkg: protocol.Control):
+		if pkg.controlType in [protocol.Control.QUERY_RPC, protocol.Control.RPC_RESP]:
+			await self.putInControlSession(pkg)
+			return
+		
+		return await super().processControlPackage(pkg)
+
 class HttpServer:
 	def __init__(self, conf: Configuration, client: Client) -> None:
 		self.config = conf
@@ -907,12 +944,34 @@ class HttpServer:
 	async def handlerControlExit(self, request: web.BaseRequest):
 		await self.client.ControlExit()
 		return web.Response(status=200)
+	
+	async def handlerRPCPage(self, request: web.BaseRequest):
+		return web.FileResponse(os.path.join(os.getcwd(), 'assets', 'rpc.html'))
+	
+	async def handlerControlQuery(self, request: web.BaseRequest):
+		jsonObj = await self.client.ControlRPCQuery()
+		return web.json_response(jsonObj)
+	
+	async def handlerRPCCall(self, request: web.BaseRequest):
+		params = await request.json()
+		rpcc = protocol.RPCCallControl(params['name'], params['params'])		
+		jsonObj = await self.client.ControlRPCCall(rpcc)
+		return web.json_response(jsonObj)
+	
+	async def handlerRPCProgress(self, request: web.BaseRequest):
+		task: str = request.query["task"]
+		jsonObj = await self.client.ControlRPCProgress(task)
+		return web.json_response(jsonObj)
 		
 	async def MainLoop(self):
 		app = web.Application(client_max_size=1024 * 1024 * 1024)
 		app.router.add_get("/wsf-control", self.handlerControlPage)
 		app.router.add_get("/wsf-control/query", self.handlerControlQuery)
 		app.router.add_post("/wsf-control/exit", self.handlerControlExit)
+		app.router.add_get("/wsf-rpc", self.handlerRPCPage)
+		app.router.add_get("/wsf-rpc/query", self.handlerControlQuery)
+		app.router.add_post("/wsf-rpc/call", self.handlerRPCCall)
+		app.router.add_get("/wsf-rpc/progress", self.handlerRPCProgress)
 		app.router.add_route('*', '/{tail:.*}', self.MainLoopOnRequest)  # HTTP服务
 		
 		self.runner = web.AppRunner(app)

@@ -327,7 +327,6 @@ class Server:
 		else:
 			await self.router.Route(pkg)
 
-
 	async def OnPackage(self, raw: protocol.Transport):
 		if self.config.dropRandom and random.random() < DROP_RANDOM_RATE:
 			log.warning(f"{self.name}] Drop received package {raw.seq_id}:{protocol.Transport.Mappings.ValueToString(raw.transportType)} <- {raw.sender}")

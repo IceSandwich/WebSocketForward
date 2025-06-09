@@ -1,4 +1,7 @@
+import os
 import typing
+from urllib.parse import urlparse
+import uuid
 
 import aiohttp.client_exceptions
 import utils
@@ -9,6 +12,10 @@ import logging
 import asyncio, aiohttp
 import aiohttp.web as web
 import argparse as argp
+import abc
+import json
+import base64
+import requests
 
 log = logging.getLogger(__name__)
 utils.SetupLogging(log, "client", terminalLevel=logging.DEBUG, saveInFile=True)
@@ -257,7 +264,19 @@ class Client:
 			else:
 				log.debug(f"Stream {raw.seq_id} end because {self.config.target_uid} requires to end.")
 			await resp.release()
-		
+	
+	async def optimizeResponsePackage(self, req: protocol.Request, resp: aiohttp.ClientResponse, respData: bytes):
+		headers = dict(resp.headers)
+		require_mimetype, require_quality = utils.GetWSFCompress(req)
+		mimetype, rawData = utils.CompressImage(respData, require_mimetype, require_quality)
+		compress_ratio = utils.ComputeCompressRatio(len(respData), len(rawData))
+		utils.SetWSFCompress(headers, mimetype, quality=-1)
+
+		raw = protocol.Response(self.config.cipher)
+		raw.SetForResponseTransport(req)
+		raw.Init(req.url, resp.status, headers, rawData)
+		return raw, compress_ratio
+
 	async def processRequestPackage(self, req: protocol.Request):
 		log.debug(f"Request {req.seq_id} - {req.method} {req.url} {len(req.body)} bytes")
 
@@ -285,16 +304,11 @@ class Client:
 		
 		respData = await resp.content.read()
 		if utils.HasWSFCompress(req): # optimize for image requests
-			headers = dict(resp.headers)
-			require_mimetype, require_quality = utils.GetWSFCompress(req)
-			mimetype, rawData = utils.CompressImage(respData, require_mimetype, require_quality)
-			compress_ratio = utils.ComputeCompressRatio(len(respData), len(rawData))
-			utils.SetWSFCompress(headers, mimetype, quality=-1)
-
-			raw = protocol.Response(self.config.cipher)
-			raw.SetForResponseTransport(req)
-			raw.Init(req.url, resp.status, headers, rawData)
-			log.debug(f"Response(Compress {int(compress_ratio*10000)/100}%) {raw.seq_id} - {req.method} {resp.url} {resp.status} {len(raw.body)} bytes")
+			raw, compress_ratio = await self.optimizeResponsePackage(req, resp, respData)
+			if compress_ratio == 0.0:
+				log.debug(f"Response {req.seq_id} - {req.method} {resp.url} {resp.status} {len(respData)} bytes")
+			else:
+				log.debug(f"Response(Compress {int(compress_ratio*10000)/100}%) {raw.seq_id} - {req.method} {resp.url} {resp.status} {len(raw.body)} bytes")
 			await self.QueueSendSmartSegments(raw)
 		else:
 			log.debug(f"Response {req.seq_id} - {req.method} {resp.url} {resp.status} {len(respData)} bytes")
@@ -453,8 +467,263 @@ class Client:
 		log.info(f"Program exit normally.")
 		return bakHandler
 	
+
+class RPCInfo(abc.ABC):
+	def __init__(self, name: str, params: typing.List[typing.Dict[str, str]]) -> None:
+		self.name = name
+		self.params = params
+
+	def GetName(self) -> str:
+		return self.name
+	
+	def GetParamsDef(self) -> typing.List[typing.Dict[str, str]]:
+		return self.params
+	
+	@abc.abstractmethod
+	async def Invoke(self, arg: protocol.RPCCallControl) -> protocol.RPCResponseControl:
+		raise NotImplementedError()
+	
+class SayHello(RPCInfo):
+	def __init__(self, client: Client):
+		super().__init__("SayHello", [{
+			"name": "message",
+			"type": "string",
+		}])
+		self.client = client
+
+	async def Invoke(self, arg: protocol.RPCCallControl) -> protocol.RPCResponseControl:
+		await self.client.SendMsg(f"SayHello rpc called with message: {arg.params['message']}")
+		rpcrc = protocol.RPCResponseControl()
+		rpcrc.Init(protocol.RPCResponseControl.JSON, {
+			"message": arg.params["message"],
+		})
+		return rpcrc
+	
+class RPCAdd(RPCInfo):
+	def __init__(self):
+		super().__init__("Add", [{
+			"name": "a",
+			"type": "int",
+		}, {
+			"name": "b",
+			"type": "int",
+		}])
+
+	async def Invoke(self, arg: protocol.RPCCallControl) -> protocol.RPCResponseControl:
+		a: int = arg.params["a"]
+		b: int = arg.params["b"]
+		rpcrc = protocol.RPCResponseControl()
+		rpcrc.Init(protocol.RPCResponseControl.JSON, {
+			"result": a + b,
+		})
+		return rpcrc
+	
+class TaskManager:
+	def __init__(self):
+		self.tasks: typing.Dict[str, typing.Any] = {}
+
+	def AddTask(self, taskData: typing.Any) -> str:
+		name = uuid.uuid4().hex[:8]
+		self.tasks[name] = taskData
+		return name
+
+	def UpdateTask(self, taskid: str, taskData: typing.Any):
+		self.tasks[taskid] = taskData
+	
+	def HasTask(self, taskid: str) -> bool:
+		return taskid in self.tasks
+	
+	def GetData(self, taskid: str):
+		return self.tasks[taskid]
+
+class RPCDownloadFile(RPCInfo):
+	def __init__(self, tm: TaskManager):
+		super().__init__("DownloadFile", [{
+			"name": "url",
+			"type": "string",
+			"default": "https://speed.cloudflare.com/__down?bytes=10485760",
+		}, {
+			"name": "path",
+			"type": "string",
+			"default": "D:/GITHUB/stable-diffusion-webui-forge/models/Lora/Illustrious/Characters",
+		}])
+		self.tm = tm
+	
+	async def startDownload(self, resp: requests.Response, filename: str, taskid: str):
+		data = self.tm.GetData(taskid)
+		total = data["total"]
+		
+		with open(filename, 'wb') as f:
+			for chunk in resp.iter_content(chunk_size=1024):
+				if chunk:
+					f.write(chunk)
+					data["current"] = data["current"] + len(chunk)
+		# for i in range(0, total, 128):
+		# 	data["current"] = i
+		# 	await asyncio.sleep(time_utils.Seconds(2))
+		# 	print("downloading: ", data["current"])
+
+		data["current"] = data["total"]
+		resp.close()
+		log.info(f"finish download {filename}")
+
+	def resp(self, t: int, data: typing.Any):
+		rpcrc = protocol.RPCResponseControl()
+		rpcrc.Init(t, data)
+		return rpcrc
+
+	async def Invoke(self, arg: protocol.RPCCallControl) -> protocol.RPCResponseControl:
+		url: str = arg.params["url"]
+		path: str = arg.params["path"]
+
+		if os.path.isfile(path):
+			return self.resp(protocol.RPCResponseControl.ERROR, {
+				"error": f"{path} file already exists",
+			})
+
+		try:
+			response = requests.get(url, stream=True)
+		except Exception as e:
+			return self.resp(protocol.RPCResponseControl.ERROR, {
+				"error": f"request failed: {e}",
+			})
+		
+		if response.status_code != 200:
+			return self.resp(protocol.RPCResponseControl.ERROR, {
+				"error": f"download failed: {response.text}",
+				"code": response.status_code,
+			})
+
+		if os.path.isdir(path):
+			# 尝试从 Content-Disposition 获取文件名
+			filename = None
+			if "Content-Disposition" in response.headers:
+				content_disposition = response.headers["Content-Disposition"]
+				parts = content_disposition.split(";")
+				for part in parts:
+					if part.strip().startswith("filename="):
+						filename = part.split("=")[1].strip().strip('"')
+						break
+
+			# 如果 Content-Disposition 没有提供，就从 URL 获取
+			if not filename:
+				parsed_url = urlparse(url)
+				filename = os.path.basename(parsed_url.path)
+
+			path = os.path.join(path, filename)
+		else:
+			pardir = os.path.dirname(path)
+			if pardir:
+				log.debug(f"Create folder {pardir} for path {path}")
+				os.makedirs(pardir, exist_ok=True)
+		
+		total_size = int(response.headers.get('content-length', 0))
+		# response = None
+		# total_size = 5000
+
+		taskid = self.tm.AddTask({
+			"current": 0,
+			"total": total_size,
+		})
+
+		log.info(f"start download {url} to {path}")
+		asyncio.ensure_future(self.startDownload(response, path, taskid))
+
+		rpcrc = protocol.RPCResponseControl()
+		rpcrc.Init(protocol.RPCResponseControl.PROGRESS, {
+			"task": taskid,
+			"filename": path,
+		})
+		return rpcrc
+
+class StableDiffusionClient(Client):
+	def __init__(self, config: Configuration):
+		super().__init__(config)
+		self.rpcs: typing.Dict[str, RPCInfo] = {}
+
+		self.tm = TaskManager()
+		self.AddRPC(SayHello(self))
+		self.AddRPC(RPCAdd())
+		self.AddRPC(RPCDownloadFile(self.tm))
+
+	def AddRPC(self, rpc: RPCInfo):
+		self.rpcs[rpc.GetName()] = rpc
+
+	async def processControlPackage(self, pkg: protocol.Control) -> bool:
+		ctrlType = pkg.GetControlType()
+
+		if ctrlType == protocol.Control.QUERY_RPC:
+			rpcqc = protocol.RPCQueryControl()
+			for name, rpc in self.rpcs.items():
+				rpcqc.Add(name, rpc.GetParamsDef())
+			rpcraw = protocol.Control()
+			rpcraw.SetForResponseTransport(pkg)
+			rpcraw.InitRPCQueryControl(rpcqc)
+			await self.DirectSend(rpcraw)
+			return True
+		
+		if ctrlType == protocol.Control.RPC_CALL:
+			rpcc = pkg.ToRPCCallControl()
+			if rpcc.name in self.rpcs:
+				rpcresp = await self.rpcs[rpcc.name].Invoke(rpcc)
+				rpcrespraw = protocol.Control()
+				rpcrespraw.SetForResponseTransport(pkg)
+				rpcrespraw.InitRPCResponseControl(rpcresp)
+				await self.DirectSend(rpcrespraw)
+			else:
+				await self.SendMsg(f"{self.name}] No rpc function for name: {rpcc.name}")
+			return True
+		
+		if ctrlType == protocol.Control.RPC_PROGRESS:
+			taskid = pkg.GetRPCProgressTaskId()
+			if self.tm.HasTask(taskid):
+				respc = protocol.RPCResponseControl()
+				respc.Init(protocol.RPCResponseControl.PROGRESS, self.tm.GetData(taskid))
+				raw = protocol.Control()
+				raw.SetForResponseTransport(pkg)
+				raw.InitRPCResponseControl(respc)
+				await self.DirectSend(raw)
+			else:
+				await self.SendMsg(f"{self.name}] No task for id {taskid}")
+			return True
+
+		return await super().processControlPackage(pkg)
+	
+	async def optimizeResponsePackage(self, req: protocol.Request, resp: aiohttp.client_exceptions.ClientResponse, respData: bytes):
+		urlpath = urlparse(req.url)
+		headers = dict(resp.headers)
+		if urlpath.path == "/internal/progress":
+			respjson = json.loads(respData)
+			compress_ratio = 0.0
+			if respjson["live_preview"] != None and respjson["live_preview"].startswith("data:image/png;base64"):
+				# 假设 base64_png_str 是你的 base64 PNG 字符串（不带前缀）
+				base64_png_str: str =  respjson["live_preview"][len("data:image/png;base64,"):] # 示例截断
+
+				# 解码 base64 为图像字节流
+				png_data = base64.b64decode(base64_png_str)
+
+				require_mimetype, require_quality = utils.GetWSFCompress(req)
+				mimetype, rawData = utils.CompressImage(png_data, require_mimetype, require_quality)
+				compress_ratio = utils.ComputeCompressRatio(len(respData), len(rawData))
+				base64_avif_str = base64.b64encode(rawData).decode('utf-8')
+
+				if mimetype != utils.MIMETYPE_WEBP:
+					raise Exception(f"Unsupported mimetype: {mimetype}")
+				
+				respjson["live_preview"] = "data:image/avif;base64," + base64_avif_str
+
+				respData = json.dumps(respjson).encode('utf-8')
+				headers["Content-Length"] = str(len(respData))
+
+			raw = protocol.Response(self.config.cipher)
+			raw.SetForResponseTransport(req)
+			raw.Init(req.url, resp.status, headers, respData)
+			return raw, compress_ratio
+				
+		return await super().optimizeResponsePackage(req, resp, respData)
+	
 async def main(config: Configuration):
-	client = Client(config)
+	client = StableDiffusionClient(config)
 	try:
 		await client.MainLoop()
 	except Exception as e:

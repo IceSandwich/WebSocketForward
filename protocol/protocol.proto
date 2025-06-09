@@ -38,6 +38,10 @@ enum ControlType {
 	QUIT_SIGNAL = 2;
 	PRINT = 3;
 	RETRIEVE_PKG = 4;
+	RPC_QUERY = 5;
+	RPC_CALL = 6;
+	RPC_RESP = 7;
+	RPC_PROGRESS = 8;
 }
 
 enum ClientType {
@@ -71,8 +75,9 @@ message QueryClientsControl {
 	repeated ClientInfo connected = 1;
 }
 
-
-
+message RPCControl {
+	string message = 1;
+}
 
 
 
