@@ -463,6 +463,7 @@ class Client:
 				break
 		bakHandler = self.ws
 		await self.forward_session.close()
+		await self.ws.close()
 		self.ws = None
 		log.info(f"Program exit normally.")
 		return bakHandler

@@ -27,6 +27,7 @@ class Configuration:
 		self.allowOFOResend: bool  = args.allow_ofo_resend
 		self.dropRandom: bool = args.drop_random
 		self.resendScheduledTime: int  = args.resend_schedule_time
+		self.first_pkg_timeout: int = time_utils.Seconds(args.first_pkg_timeout)
 
 		if self.dropRandom:
 			log.warning("Server is running on drop random mode. Pay attention that this option is only for debug use.")
@@ -36,6 +37,7 @@ class Configuration:
 		parser.add_argument("--server", type=str, default="127.0.0.1:8030", help="The address to listen on.")
 		parser.add_argument("--cache_size", type=int, default=140, help="The maximum number of packages to cache. Set 0 to disable cache.")
 		parser.add_argument("--timeout", type=int, default=60, help="The maximum seconds to resend packages.")
+		parser.add_argument("--first_pkg_timeout", type=int, default=20, help="The timeout of the first package.")
 		parser.add_argument("--listen_route", type=str, default='/wsf/ws')
 		parser.add_argument("--allow_ofo_resend", action="store_true", help="Allow out of order message to be resend. Disable this feature may results in buffer overflow issue. By default, this feature is disable.")
 		parser.add_argument("--resend_schedule_time", type=int, default=time_utils.Seconds(1), help="Interval to resend scheduled packages")
@@ -113,13 +115,15 @@ class Server:
 
 	async def waitForOnePackage(self, ws: web.WebSocketResponse):
 		try:
-			async for msg in ws:
-				if msg.type == aiohttp.WSMsgType.ERROR:
-					log.error(f"{self.name}]1Pkg] Error on waiting 1 package: {ws.exception()}", exc_info=True, stack_info=True)
-				elif msg.type == aiohttp.WSMsgType.TEXT or msg.type == aiohttp.WSMsgType.BINARY:
-					transport = protocol.Transport.Parse(msg.data)
-					log.debug(f"{self.name}]1Pkg] Got one package: {transport.seq_id}:{protocol.Transport.Mappings.ValueToString(transport.transportType)} from {transport.sender}")
-					return transport
+			msg = await ws.receive(self.config.first_pkg_timeout)
+			if msg.type == aiohttp.WSMsgType.ERROR:
+				log.error(f"{self.name}]1Pkg] Error on waiting 1 package: {ws.exception()}", exc_info=True, stack_info=True)
+			elif msg.type == aiohttp.WSMsgType.TEXT or msg.type == aiohttp.WSMsgType.BINARY:
+				transport = protocol.Transport.Parse(msg.data)
+				log.debug(f"{self.name}]1Pkg] Got one package: {transport.seq_id}:{protocol.Transport.Mappings.ValueToString(transport.transportType)} from {transport.sender}")
+				return transport
+		except asyncio.TimeoutError:
+			log.error(f"{self.name}1Pkg] Timeout for reading the first package. Rollback.")
 		except Exception as e:
 			log.error(f"{self.name}]1Pkg] Error on waiting 1 package: {e}", exc_info=True, stack_info=True)
 		log.error(f"{self.name}]1Pkg] WS Broken.")
@@ -407,6 +411,7 @@ class Server:
 			await self.OnDisconnected()
 			log.debug(f"{self.name}] Disconnected. Return to init status.")
 			self.ws = None
+			await ws.close()
 		return ws
 
 class Router(IRouter):
