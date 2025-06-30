@@ -97,6 +97,9 @@ message Response {
 }
 
 
-
+message WSStreamData {
+	int32 type = 1;
+	bytes body = 2;
+}
 
 

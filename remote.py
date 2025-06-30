@@ -50,9 +50,9 @@ class Configuration:
 	def SetupParser(cls, parser: argp.ArgumentParser):
 		parser.add_argument("--server", type=str, default="http://127.0.0.1:8030/wsf/ws", help="The websocket server to connect to.")
 		parser.add_argument("--cipher", type=str, default="xor", help=f"The cipher to use. Available: [{', '.join(encryptor.GetAvailableCipherMethods())}]")
-		parser.add_argument("--key", type=str, default="通讯密钥，必须跟另一端保持一致；否则传输出错。", help="The key to use for the cipher. Must be the same with client.")
+		parser.add_argument("--key", type=str, default="必须使用同一个通讯密钥，否则WebSocketForward报错无法正常运行。", help="The key to use for the cipher. Must be the same with client.")
 
-		parser.add_argument("--prefix", type=str, default="http://127.0.0.1:7860", help="The prefix of your requests.")
+		parser.add_argument("--prefix", type=str, default="http://127.0.0.1:8188", help="The prefix of your requests.")
 		parser.add_argument("--port", type=int, default=8130, help="The port to listen on.")
 
 		parser.add_argument("--uid", type=str, default="Remote")
@@ -612,6 +612,15 @@ class StableDiffusionGridCacheInfo():
 			self.img = img
 		self.trigger.set()
 
+class StreamListenInfo:
+	TYPE_UNKNOWN = 0
+	TYPE_WEBUI111_SSE_EVENT = 1
+	TYPE_COMFY_WS = 2
+	def __init__(self):
+		self.dtype = self.TYPE_UNKNOWN
+		self.event_id = ""
+		self.url = ""
+
 class MessageStreamProcessor:
 	def __init__(self):
 		self.buffer = ""  # 用于存储流中的字符数据
@@ -643,14 +652,18 @@ class MessageStreamProcessor:
 				break
 		return ret
 class StableDiffusionCachingClient(Client):
+	CLIENT_BACKEND_UNKNOWN = 0
+	CLIENT_BACKEND_SDFORGE = 1
+	CLIENT_BACKEND_COMFY = 2
+
 	def __init__(self, config: Configuration):
 		super().__init__(config)
 		
 		self.root_dir = 'cache_sdwebui'
-		self.assets_dir = ['/assets', '/webui-assets']
+		self.assets_dir = ['/assets', '/webui-assets', "/templates"]
 		self.sdDirPattern = 'D:/GITHUB/stable-diffusion-webui-forge/'
 		self.tmpDirPattern = r'^C:/Users/[a-zA-Z0-9._-]+/AppData/Local/Temp/'
-		self.keep_list = ["outputs", "index.html", "always_local", "models"]
+		self.keep_list = ["outputs", "always_local", "models", "comfy_output"]
 		self.alwayslocal_dir = os.path.join(self.root_dir, "always_local")
 		self.use_localfiles = {
 			"extensions/a1111-sd-webui-tagcomplete/tags/e621.csv": os.path.join(self.alwayslocal_dir, "e621.csv"),
@@ -675,13 +688,15 @@ class StableDiffusionCachingClient(Client):
 
 		# session_hash to event_id
 		self.requireSession: typing.Dict[str, str] = {}
-		# key is stream seq id, value is event id
-		self.listenEventIdInStreamSeqId: typing.Dict[str, str] = {}
+		# key is stream seq id, value is StreamListenInfo, 监听Stream流
+		self.listenInStream: typing.Dict[str, StreamListenInfo] = {}
 
 		# grid url to StableDiffusionGridCacheInfo
 		self.imageGridWaitList: typing.Dict[str, StableDiffusionGridCacheInfo] = {}
 		# image url to grid url
 		self.imageWaitList: typing.Dict[str, str] = {}
+
+		self.backendType = self.CLIENT_BACKEND_UNKNOWN
 
 		self.clean()
 
@@ -699,17 +714,21 @@ class StableDiffusionCachingClient(Client):
 				os.remove(fn)
 	
 	async def Stream(self, seq_id: str):
-		isQueueDataSSE = False
-		event_id = ""
-		msgproc = MessageStreamProcessor()
-		if seq_id in self.listenEventIdInStreamSeqId:
-			isQueueDataSSE = True
-			event_id = self.listenEventIdInStreamSeqId[seq_id]
-			print("===Capture: ", seq_id, "event:", event_id)
-			del self.listenEventIdInStreamSeqId[seq_id]
+		if seq_id not in self.listenInStream or self.listenInStream[seq_id].dtype not in [StreamListenInfo.TYPE_WEBUI111_SSE_EVENT]:
+			if seq_id in self.listenInStream:
+				log.error(f"Unknown stream type to listen: {self.listenInStream[seq_id].dtype}, fallback to normal call.")
+			
+			async for package in super().Stream(seq_id):
+				yield package
+			return
+		
+		if self.listenInStream[seq_id].dtype == StreamListenInfo.TYPE_WEBUI111_SSE_EVENT:
+			msgproc = MessageStreamProcessor()
+			print("===Capture: ", seq_id, "event:", self.listenInStream[seq_id].event_id)
+			del self.listenInStream[seq_id]
 
-		async for package in super().Stream(seq_id):
-			if isQueueDataSSE:
+			# 寻找可能的最终图的url，包括grid和每个image的url，这样就知道grid的url对应哪些图片
+			async for package in super().Stream(seq_id):
 				body = package.body.decode('utf-8')
 				msgs = msgproc.Process(body)
 				for msg in msgs:
@@ -730,7 +749,10 @@ class StableDiffusionCachingClient(Client):
 								self.imageWaitList[imgUrl] = gridUrl
 							self.imageGridWaitList[gridUrl] = StableDiffusionGridCacheInfo(task["width"], task["height"], gridUrl, imgUrls, all_prompts)
 							log.info(f"{self.name}] detected grid image: {gridUrl}")
-			yield package
+				yield package
+		# elif self.listenInStream[seq_id].dtype == StreamListenInfo.TYPE_COMFY_WS:
+		# 	async for package in super().Stream(seq_id):
+		# 		package
 	
 	def useCache(self, request: protocol.Request, filename: str):
 		with open(filename, 'rb') as f:
@@ -800,10 +822,15 @@ class StableDiffusionCachingClient(Client):
 	async def Session(self, request: protocol.Request):
 		parsed_url = urlparse(request.url)
 
+		# 缓存assets的路径
 		if parsed_url.path.startswith(tuple(self.assets_dir)):
-			cachefn = os.path.join(self.root_dir, parsed_url.path[1:])
+			if self.backendType == self.CLIENT_BACKEND_COMFY:
+				cachefn = os.path.join(self.alwayslocal_dir, parsed_url.path[1:])
+			else:
+				cachefn = os.path.join(self.root_dir, parsed_url.path[1:])
 			return await self.cacheOrRequest(request, cachefn)
 		
+		# 在sse流中找可能的最终图的url
 		if parsed_url.path == '/queue/join':
 			querys = json.loads(request.body)
 			if querys["trigger_id"] != 16:
@@ -818,16 +845,18 @@ class StableDiffusionCachingClient(Client):
 			self.requireSession[session_hash] = eventId
 			return resp
 		
+		# 哪个sse流中最有可能包括最终图的url
 		if parsed_url.path == "/queue/data":
 			querys = parse_qs(parsed_url.query)
 			session_hash = querys["session_hash"][0]
 			# print("Query session hash: ", session_hash)
 			if session_hash in self.requireSession:
-				self.listenEventIdInStreamSeqId[request.seq_id] = self.requireSession[session_hash]
+				self.listenInStream[request.seq_id] = self.requireSession[session_hash]
 				del self.requireSession[session_hash]
 				# print("== got /queue/data for session_hash: ", session_hash, "seq:", request.seq_id)
 			return await super().Session(request)
 		
+		# 最终图
 		if parsed_url.path.startswith("/file="):
 			filepath = parsed_url.path[len("/file="):]
 
@@ -852,6 +881,7 @@ class StableDiffusionCachingClient(Client):
 			else:
 				return await self.cacheOrRequest(request, cachefn)
 		
+		# lora预览图
 		if parsed_url.path == "/sd_extra_networks/thumb":
 			querys = parse_qs(parsed_url.query)
 			filepath = querys["filename"][0]
@@ -869,13 +899,54 @@ class StableDiffusionCachingClient(Client):
 				
 		if parsed_url.path == "/":
 			cachefn = os.path.join(self.root_dir, "index.html")
-			return await self.cacheOrRequest(request, cachefn)
+			resp = await self.cacheOrRequest(request, cachefn)
+			try:
+				html_str = resp.body[:120].decode('utf-8')
+				# 使用正则表达式匹配<title>标签内容
+				match = re.search(r'<title>(.*?)</title>', html_str, re.IGNORECASE)
+				if match:
+					title = match.group(1).lower()
+					if 'comfy' in title:
+						self.backendType = self.CLIENT_BACKEND_COMFY
+						log.info(f"Detected ComfyUI backend.")
+					else: # TODO: check forge title and make a condition
+						self.backendType = self.CLIENT_BACKEND_SDFORGE
+						log.info(f"Detected SDForge backend.")
+			except Exception as e:
+				log.error(f"cannot extract title from index.html, got {e}")
+			return resp
 
+		# 进度
 		if parsed_url.path == "/internal/progress":
 			utils.SetWSFCompress(request, utils.MIMETYPE_WEBP, self.config.img_quality)
 			return await super().Session(request)
 
 		if parsed_url.path in ["/favicon.ico", "/theme.css"] or parsed_url.path.startswith("/custom_component"):
+			cachefn = os.path.join(self.root_dir, parsed_url.path[1:])
+			return await self.cacheOrRequest(request, cachefn)
+		
+		# comfy ui 最终图
+		if parsed_url.path == "/api/view":
+			querys = parse_qs(parsed_url.query)
+			goodpath = True
+			for requireQuery in ["filename", "subfolder", "type"]:
+				if requireQuery not in querys:
+					goodpath = False
+					break
+
+			if goodpath == False:
+				log.error(f"Cannot decide the saved location of output file: {request.url} , disable cache function and image optimize")
+				return await super().Session(request)
+			else:
+				if querys["type"][0] != "output":
+					log.error(f"Unknown /api/view type: {querys['type'][0]} , disable cache function and image optimize")
+					return await super().Session(request)
+				else:
+					cachefn = os.path.join(self.root_dir, f"comfy_{querys['type'][0]}", querys["subfolder"][0], querys["filename"][0])
+					return await self.cacheImageOrRequest(request, cachefn)
+				
+		# comfy ui 缓存
+		if os.path.splitext(parsed_url.path)[1].lower() in [".css", ".js", ".woff2", ".svg", ".json", ".webp"]:
 			cachefn = os.path.join(self.root_dir, parsed_url.path[1:])
 			return await self.cacheOrRequest(request, cachefn)
 		
@@ -897,6 +968,8 @@ class HttpServer:
 		self.site: web.TCPSite = None
 		self.runner: web.AppRunner = None
 
+		self.plainCipher = encryptor.NewCipher('plain', '')
+
 	async def exitFunc(self):
 		await self.site.stop()
 		await self.runner.shutdown()
@@ -911,25 +984,69 @@ class HttpServer:
 		except Exception as e:
 			log.error(f"Unknown exception: {e}", exc_info=True, stack_info=True)
 
+	async def processWS(self, resp: protocol.Response, ws: web.WebSocketResponse):
+		try:
+			wsd = protocol.WSStreamData(self.plainCipher)
+			wsd.data = resp.body
+			wsd.Unpack(wsd)
+			if wsd.GetType() == protocol.WSStreamData.TYPE_TEXT:
+				await ws.send_str(wsd.GetTextData())
+			elif wsd.GetType() == protocol.WSStreamData.TYPE_BIN:
+				await ws.send_bytes(wsd.GetBinData())
+			else:
+				log.fatal(f"Unsupported ws stream data type: {wsd.GetType()}")
+
+			async for package in self.client.Stream(resp.seq_id):
+				wsd = protocol.WSStreamData(self.config.cipher)
+				wsd.Unpack(package)
+
+				if wsd.GetType() == protocol.WSStreamData.TYPE_TEXT:
+					await ws.send_str(wsd.GetTextData())
+				elif wsd.GetType() == protocol.WSStreamData.TYPE_BIN:
+					await ws.send_bytes(wsd.GetBinData())
+				elif wsd.GetType() == protocol.WSStreamData.TYPE_END:
+					break
+				else:
+					log.error(f"Unsupported ws stream data type: {wsd.GetType()}")
+		except aiohttp.client_exceptions.ClientConnectionResetError:
+			pass # invoke GeneratorExit in client.Stream()
+		except Exception as e:
+			log.error(f"Unknown exception: {e}", exc_info=True, stack_info=True)
+		finally:
+			# TODO: tell client the websocket has been closed
+			log.info("WebSocket closed")
+
 	async def MainLoopOnRequest(self, request: web.BaseRequest):
 		# 提取请求的相关信息
+		headers = dict(request.headers)
+
+		# comfy ui, prefer compress images
+		if request.url.path == '/ws':
+			utils.SetWSFCompress(headers, quality=self.config.img_quality)
+		
 		req = protocol.Request(self.config.cipher)
-		req.Init(self.config.prefix + str(request.url.path_qs), request.method, dict(request.headers))
+		req.Init(self.config.prefix + str(request.url.path_qs), request.method, headers)
 		req.SetBody(await request.read() if request.can_read_body else None)
 		
 		resp = await self.client.Session(req)
+
+		if utils.HasWSUpgarde(resp):
+			ws = web.WebSocketResponse(autoping=True)
+			await ws.prepare(request)
+			await self.processWS(resp, ws)
+			return ws
 
 		if 'Content-Type' in resp.headers and 'text/event-stream' in resp.headers['Content-Type']:
 			ss = web.StreamResponse(status=resp.status, headers=resp.headers)
 			await ss.prepare(request)
 			await self.processSSE(resp, ss)
 			return ss
-		else:
-			return web.Response(
-				status=resp.status,
-				headers=resp.headers,
-				body=resp.body
-			)
+		
+		return web.Response(
+			status=resp.status,
+			headers=resp.headers,
+			body=resp.body
+		)
 		
 	async def handlerControlPage(self, request: web.BaseRequest):
 		return web.FileResponse(os.path.join(os.getcwd(), 'assets', 'control.html'))

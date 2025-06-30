@@ -1,6 +1,7 @@
 import logging, os, collections, asyncio, sys, io, uuid, datetime, heapq, abc
 from PIL import Image
 import aiohttp.web as web
+import aiohttp
 import protocol, time_utils
 
 import typing
@@ -162,6 +163,9 @@ def GetWSFCompress(req: protocol.Request):
 	sp = compress.split(',')
 	assert(len(sp) == 2)
 	return (sp[0], int(sp[1]))
+
+def HasWSUpgarde(resp: typing.Union[aiohttp.ClientResponse, protocol.Response]):
+	return 'Connection' in resp.headers and resp.headers['Connection'] == 'upgrade' and 'Upgrade' in resp.headers and resp.headers['Upgrade'] == 'websocket'
 
 class TimerTask(abc.ABC):
 	def __init__(self, time: int):

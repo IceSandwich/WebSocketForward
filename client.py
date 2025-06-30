@@ -1,4 +1,6 @@
+import io
 import os
+import struct
 import typing
 from urllib.parse import urlparse
 import uuid
@@ -16,6 +18,8 @@ import abc
 import json
 import base64
 import requests
+from PIL import Image
+import math
 
 log = logging.getLogger(__name__)
 utils.SetupLogging(log, "client", terminalLevel=logging.DEBUG, saveInFile=True)
@@ -40,6 +44,8 @@ class Configuration:
 
 		self.waitToReconnect: int = args.wait_to_reconnect_time
 
+		self.comfyPreviewSpeed: float = args.comfy_preview_speed
+
 		# debug only
 		self.force_id: str = args.force_id
 
@@ -47,7 +53,7 @@ class Configuration:
 	def SetupParser(cls, parser: argp.ArgumentParser):
 		parser.add_argument("--server", type=str, default="http://127.0.0.1:8030/wsf/ws", help="Server address")
 		parser.add_argument("--cipher", type=str, default="xor", help="Cipher to use for encryption")
-		parser.add_argument("--key", type=str, default="通讯密钥，必须跟另一端保持一致；否则传输出错。", help="The key to use for the cipher. Must be the same with remote.")
+		parser.add_argument("--key", type=str, default="必须使用同一个通讯密钥，否则WebSocketForward报错无法正常运行。", help="The key to use for the cipher. Must be the same with remote.")
 		parser.add_argument("--uid", type=str, default="Client")
 		parser.add_argument("--target_uid", type=str, default="Remote")
 		parser.add_argument("--compress", type=str, default="none")
@@ -62,6 +68,7 @@ class Configuration:
 		parser.add_argument("--wait_to_reconnect_time", type=int, default=time_utils.Seconds(2), help="Time to wait before reconnecting")
 
 		parser.add_argument("--force_id", type=str, default="")
+		parser.add_argument("--comfy_preview_speed", type=float, default=1.3, help="Speed to preview")
 		return parser
 	
 class Client:
@@ -76,6 +83,7 @@ class Client:
 		self.config = config
 		self.name = self.config.uid
 		self.url = f'{config.server}?uid={config.uid}'
+		self.plainCipher = encryptor.NewCipher("plain", "")
 
 		self.instance_id = utils.NewId()
 		self.status: int = self.STATUS_INIT
@@ -238,7 +246,7 @@ class Client:
 					raw.SetForResponseTransport(req)
 					raw.Init(req.url, resp.status, dict(resp.headers), chunk)
 
-					log.debug(f"Stream {raw.seq_id}:{raw.cur_idx}/{raw.total_cnt} - {resp.url} {len(raw.body)} bytes <<< {repr(raw.body[:utils.LOG_BYTES_LEN])} ...>>> -> {raw.receiver}")
+					log.debug(f"SSE {raw.seq_id}:{raw.cur_idx}/{raw.total_cnt} - {resp.url} {len(raw.body)} bytes <<< {repr(raw.body[:utils.LOG_BYTES_LEN])} ...>>> -> {raw.receiver}")
 					await self.QueueSend(raw)
 				else:
 					raw = protocol.StreamData(self.config.cipher)
@@ -246,25 +254,82 @@ class Client:
 					raw.SetBody(chunk)
 					raw.SetIndex(cur_idx, 0)
 					
-					log.debug(f"Stream {raw.seq_id}:{raw.cur_idx}/{raw.total_cnt} - {len(raw.body)} bytes <<< {repr(raw.body[:utils.LOG_BYTES_LEN])} ...>>> -> {raw.receiver}")
+					log.debug(f"SSE {raw.seq_id}:{raw.cur_idx}/{raw.total_cnt} - {len(raw.body)} bytes <<< {repr(raw.body[:utils.LOG_BYTES_LEN])} ...>>> -> {raw.receiver}")
 					await self.QueueSend(raw)
 				# 第一个response的idx为0，第一个sse_subpackage的idx为1
 				cur_idx = cur_idx + 1
 		except asyncio.exceptions.TimeoutError:
-			log.error(f"Stream {req.seq_id} timeout. by default, aiohttp use 300 seconds as timeout.")
+			log.error(f"SSE {req.seq_id} timeout. by default, aiohttp use 300 seconds as timeout.")
 		except Exception as e:
-			log.error(f'Stream {req.seq_id} end iter unexpectally. err: {e}', exc_info=True, stack_info=True)
+			log.error(f'SSE {req.seq_id} end iter unexpectally. err: {e}', exc_info=True, stack_info=True)
 		finally:
 			if shouldSendEndStreamData:
 				raw = protocol.StreamData(self.config.cipher)
 				raw.SetForResponseTransport(req)
 				raw.SetIndex(cur_idx, -1)
-				log.debug(f"Stream {raw.seq_id}:{raw.cur_idx}/{raw.total_cnt} - {resp.url} {len(raw.body)} bytes -x> {raw.receiver}")
+				log.debug(f"SSE {raw.seq_id}:{raw.cur_idx}/{raw.total_cnt} - {resp.url} {len(raw.body)} bytes -x> {raw.receiver}")
 				await self.QueueSend(raw)
 			else:
-				log.debug(f"Stream {raw.seq_id} end because {self.config.target_uid} requires to end.")
+				log.debug(f"SSE {raw.seq_id} end because {self.config.target_uid} requires to end.")
 			await resp.release()
+
+	async def postprocessWSPackage(self, req: protocol.Request, raw: protocol.WSStreamData) -> bool:
+		"""
+		返回False表示取消发送
+		"""
+		return True
 	
+	async def processWSSession(self, req: protocol.Request, resp: aiohttp.ClientResponse, ws: aiohttp.ClientWebSocketResponse):
+		# 第一个response的idx为0，第一个sse_subpackage的idx为1
+		cur_idx = 0
+		self.sseCloseSignal[req.seq_id] = False
+		shouldSendEndStreamData = True
+		try:
+			async for msg in ws:
+				if self.sseCloseSignal[req.seq_id] == True: # remote requires to close sse
+					shouldSendEndStreamData = False # remote has already close the stream, we don't need to send end package
+					del self.sseCloseSignal[req.seq_id]
+					break
+
+				if msg.type == aiohttp.WSMsgType.ERROR:
+					self.SendErrMsg(f"WebSocket Forward {req.url} got error: {self.ws.exception()}")
+				elif msg.type == aiohttp.WSMsgType.TEXT or msg.type == aiohttp.WSMsgType.BINARY:
+					if cur_idx == 0:
+						# 在Response里装载WSStreamData的pb类型，我们只使用WSStreamData类的body变量
+						wsd = protocol.WSStreamData(self.plainCipher)
+						wsd.SetBody(msg.data)
+						await self.postprocessWSPackage(req, wsd)
+
+						raw = protocol.Response(self.config.cipher)
+						raw.SetForResponseTransport(req)
+						raw.Init(req.url, resp.status, dict(resp.headers), wsd.PackToPB())
+						log.debug(f"WS {raw.seq_id}:{raw.cur_idx}/{raw.total_cnt} - {req.url} {len(raw.body)} bytes <<< {repr(raw.body[:utils.LOG_BYTES_LEN])} ...>>> -> {raw.receiver}")
+						await self.QueueSend(raw)
+						cur_idx = cur_idx + 1
+					else:
+						raw = protocol.WSStreamData(self.config.cipher)
+						raw.SetForResponseTransport(req)
+						raw.SetIndex(cur_idx, 0)
+						raw.SetBody(msg.data)
+						shouldSend = await self.postprocessWSPackage(req, raw)
+						if shouldSend == False:
+							log.debug(f"WS {raw.seq_id}:{raw.cur_idx}/{raw.total_cnt} - {len(raw.body)} bytes <<< {repr(raw.body[:utils.LOG_BYTES_LEN])} ...>>> -Skip-x> {raw.receiver}")
+						else:
+							log.debug(f"WS {raw.seq_id}:{raw.cur_idx}/{raw.total_cnt} - {len(raw.body)} bytes <<< {repr(raw.body[:utils.LOG_BYTES_LEN])} ...>>> -> {raw.receiver}")
+							await self.QueueSend(raw)
+							cur_idx = cur_idx + 1
+		finally:
+			if shouldSendEndStreamData:
+				raw = protocol.WSStreamData(self.config.cipher)
+				raw.SetForResponseTransport(req)
+				raw.SetIndex(cur_idx, -1)
+				raw.MarkEnd()
+				log.debug(f"WS {raw.seq_id}:{raw.cur_idx}/{raw.total_cnt} - {req.url} {len(raw.body)} bytes -x> {raw.receiver}")
+				await self.QueueSend(raw)
+			else:
+				log.debug(f"WS {raw.seq_id} end because {self.config.target_uid} requires to end.")
+			await ws.close()
+
 	async def optimizeResponsePackage(self, req: protocol.Request, resp: aiohttp.ClientResponse, respData: bytes):
 		headers = dict(resp.headers)
 		require_mimetype, require_quality = utils.GetWSFCompress(req)
@@ -294,10 +359,18 @@ class Client:
 				log.error(f"Failed to forward request {req.url}, current times: {retry}, got ClientOSError: {e}")
 				retry += 1
 				if retry >= self.config.maxRetries:
-					await self.SendMsg(f"Tried {self.config.maxRetries} times but still cannot forward request {req.seq_id} for url: {req.url}. Got ClientOSError: {e}. Client abort.")
+					await self.SendErrMsg(f"Tried {self.config.maxRetries} times but still cannot forward request {req.seq_id} for url: {req.url}. Got ClientOSError: {e}. Client abort.")
 					raise e
-
-		if 'text/event-stream' in resp.headers['Content-Type']:
+				
+		if utils.HasWSUpgarde(resp):
+			try:
+				ws = await self.forward_session.ws_connect(req.url, method=req.method, headers=req.headers)
+				asyncio.ensure_future(self.processWSSession(req, resp, ws))
+			except Exception as e:
+				self.SendErrMsg(f"Failed to forward ws request {req.url}, got: {e}")
+			return
+		
+		if 'Content-Type' in resp.headers and 'text/event-stream' in resp.headers['Content-Type']:
 			# log.debug(f"SSE Response {req.seq_id} - {req.method} {resp.url} {resp.status}")
 			asyncio.ensure_future(self.processSSESession(req, resp))
 			return
@@ -351,6 +424,16 @@ class Client:
 		ctrl.SetSenderReceiver(self.config.uid, self.config.target_uid)
 		ctrl.InitPrintControl(f"{self.name}] {msg}")
 		log.info(f"Send Msg] {msg} -> {self.config.target_uid}")
+		await self.DirectSend(ctrl)
+
+	async def SendErrMsg(self, msg: str):
+		"""
+		send and log to error
+		"""
+		ctrl = protocol.Control()
+		ctrl.SetSenderReceiver(self.config.uid, self.config.target_uid)
+		ctrl.InitPrintControl(f"{self.name}] {msg}")
+		log.error(f"Send Msg] {msg} -> {self.config.target_uid}")
 		await self.DirectSend(ctrl)
 
 	async def OnPackage(self, pkg: typing.Union[protocol.Request, protocol.Response, protocol.Subpackage, protocol.StreamData, protocol.Control]) -> bool:
@@ -647,6 +730,9 @@ class StableDiffusionClient(Client):
 		self.AddRPC(RPCAdd())
 		self.AddRPC(RPCDownloadFile(self.tm))
 
+		self.shouldProcessNextWSMsg = True
+		self.cachedSteps: typing.Dict[int, typing.List[int]] = {}
+
 	def AddRPC(self, rpc: RPCInfo):
 		self.rpcs[rpc.GetName()] = rpc
 
@@ -723,6 +809,80 @@ class StableDiffusionClient(Client):
 				
 		return await super().optimizeResponsePackage(req, resp, respData)
 	
+	# 来自 comfyUI/server.py BinaryEventTypes类
+	COMFY_BinaryEventTypes_PREVIEW_IMAGE = 1
+	COMFY_BinaryEventTypes_UNENCODED_PREVIEW_IMAGE = 2
+	COMFY_BinaryEventTypes_TEXT = 3
+
+	# 来自 comfyUI/server.py send_image()函数
+	COMFY_ImageType_JPEG = 1
+	COMFY_ImageType_PNG = 2
+
+	async def postprocessWSPackage(self, req: protocol.Request, raw: protocol.WSStreamData) -> bool:
+		parsed_url = urlparse(req.url)
+		if parsed_url.path == '/ws':
+			if raw.GetType() == protocol.WSStreamData.TYPE_TEXT:
+				jsonText = json.loads(raw.GetTextData())
+				if jsonText["type"] == 'progress':
+					self.maxSteps = jsonText["data"]["max"]
+					if self.maxSteps not in self.cachedSteps:
+						estimateNum = int(pow(math.e, math.log(self.maxSteps)/self.config.comfyPreviewSpeed)) # solve x**rate = steps
+						self.cachedSteps[self.maxSteps] = [int(x**self.config.comfyPreviewSpeed)+1 for x in range(estimateNum+1)]
+						self.cachedSteps[self.maxSteps].append(self.maxSteps)
+					self.shouldProcessNextWSMsg = jsonText["data"]["value"] in self.cachedSteps[self.maxSteps]
+					if self.shouldProcessNextWSMsg == False:
+						return False
+				else:
+					self.shouldProcessNextWSMsg = True
+				return True
+			
+			if raw.GetType() == protocol.WSStreamData.TYPE_BIN:
+				# comfy 的数据为 flatten([packed, data])，而packed是使用struct.pack(">I", event)得到的
+				message = raw.GetBinData()
+				# 1. 确定 packed 的字节大小
+				packed_size = struct.calcsize(">I")
+				# 2. 从 message 中提取 packed 的字节部分
+				packed = message[:packed_size]
+				# 3. 解包 packed
+				event: int = struct.unpack(">I", packed)[0]
+				# 4. 剩余的部分就是 data
+				data = message[packed_size:]
+
+				# 这个是推理过程中预览的图像
+				if event == self.COMFY_BinaryEventTypes_PREVIEW_IMAGE and utils.HasWSFCompress(req):
+					if self.shouldProcessNextWSMsg == False: # skip this preview image
+						self.shouldProcessNextWSMsg = True
+						return False
+					
+					# 预览的数据为 bytesIO([header, Image])，而header是使用struct.pack(">I", type_num)得到的
+					# 读取头部，获取 type_num
+					header_size = struct.calcsize(">I")
+					type_num: int = struct.unpack(">I", data[:header_size])[0]
+
+					mimetype, quality = utils.GetWSFCompress(req)
+					mimetype, finalImageData = utils.CompressImage(data[header_size:], mimetype, quality)
+
+					compress_ratio = utils.ComputeCompressRatio(len(data) - header_size, len(finalImageData))
+
+					# 重新打包
+					bytesIO = io.BytesIO()
+					header = struct.pack(">I", type_num)
+					bytesIO.write(header)
+					bytesIO.write(finalImageData)
+					preview_bytes = bytesIO.getvalue()
+
+					packed = struct.pack(">I", event)
+					message = bytearray(packed)
+					message.extend(preview_bytes)
+
+					raw.SetBody(message)
+					log.debug(f"WS(Compress {int(compress_ratio*10000)/100}%) {raw.seq_id} - {req.method} {req.url} {len(raw.body)} bytes")
+
+				self.shouldProcessNextWSMsg = True
+				return True
+			
+		return True
+
 async def main(config: Configuration):
 	client = StableDiffusionClient(config)
 	try:

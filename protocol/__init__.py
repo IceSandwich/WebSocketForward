@@ -248,7 +248,6 @@ class Response(Transport):
 		self.body = pbt.body
 
 class Subpackage(Transport):
-	PRINT_ONCE_MSG = True
 	def __init__(self, encrypt: encryptor.Cipher):
 		super().__init__(Transport.SUBPACKAGE)
 		self.encrypt = encrypt
@@ -279,6 +278,60 @@ class StreamData(Subpackage):
 
 	def __lt__(self, other):
 		return self.cur_idx < other.cur_idx
+	
+class WSStreamData(StreamData):
+	TYPE_END = -1
+	TYPE_UNKNOWN = 0
+	TYPE_TEXT = 1
+	TYPE_BIN = 2
+
+	def __init__(self, encrypt: encryptor.Cipher):
+		super().__init__(encrypt)
+		self.dtype = self.TYPE_UNKNOWN
+
+	def SetBody(self, data: typing.Union[str, bytes, bytearray]):
+		if type(data) == str:
+			self.dtype = self.TYPE_TEXT
+			self.body = data.encode('utf-8')
+		elif type(data) == bytes or type(data) == bytearray:
+			self.dtype = self.TYPE_BIN
+			self.body = bytes(data)
+		else:
+			raise Exception(f"Unkown ws data type: {type(data)}, only support text or bytes.")
+		
+	def MarkEnd(self):
+		self.dtype = self.TYPE_END
+		
+	def GetType(self):
+		return self.dtype
+	
+	def GetTextData(self) -> str:
+		return self.body.decode('utf-8')
+
+	def GetBinData(self) -> bytes:
+		return self.body
+	
+	def PackToPB(self) -> bytes:
+		res = pb.WSStreamData()
+		res.type = self.dtype
+		res.body = self.body
+		return res.SerializeToString()
+
+	def Pack(self) -> bytes:
+		tmpbody = self.body
+		self.body = self.PackToPB()
+		ret = super().Pack()
+		self.body = tmpbody
+		return ret
+	
+	def Unpack(self, transport: Transport):
+		super().Unpack(transport)
+
+		pbt = pb.WSStreamData()
+		pbt.ParseFromString(self.body)
+
+		self.dtype = pbt.type
+		self.body = pbt.body
 
 class ClientInfo:
 	CLIENT = 0
