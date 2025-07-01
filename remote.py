@@ -1065,6 +1065,9 @@ class HttpServer:
 	async def handlerRPCPage(self, request: web.BaseRequest):
 		return web.FileResponse(os.path.join(os.getcwd(), 'assets', 'rpc.html'))
 	
+	async def handlerFSPage(self, request: web.BaseRequest):
+		return web.FileResponse(os.path.join(os.getcwd(), 'assets', 'filesystem.html'))
+
 	async def handlerRPCQuery(self, request: web.BaseRequest):
 		jsonObj = await self.client.ControlRPCQuery()
 		return web.json_response(jsonObj)
@@ -1089,6 +1092,7 @@ class HttpServer:
 		app.router.add_get("/wsf-rpc/query", self.handlerRPCQuery)
 		app.router.add_post("/wsf-rpc/call", self.handlerRPCCall)
 		app.router.add_get("/wsf-rpc/progress", self.handlerRPCProgress)
+		app.router.add_get("/wsf-fs", self.handlerFSPage)
 		app.router.add_route('*', '/{tail:.*}', self.MainLoopOnRequest)  # HTTP服务
 		
 		self.runner = web.AppRunner(app)

@@ -1,0 +1,271 @@
+<!DOCTYPE html>
+<html lang="zh">
+
+<head>
+	<meta charset="UTF-8">
+	<title>文件复制工具</title>
+	<style>
+		body {
+			font-family: Arial;
+			padding: 20px;
+		}
+
+		.container {
+			display: flex;
+			gap: 40px;
+		}
+
+		.panel {
+			flex: 1;
+		}
+
+		ul {
+			list-style: none;
+			padding: 0;
+			border: 1px solid #ccc;
+			height: 300px;
+			overflow-y: auto;
+		}
+
+		li {
+			padding: 5px;
+			cursor: pointer;
+		}
+
+		li.selected {
+			background-color: #b3d4fc;
+		}
+
+		.dir::before {
+			content: "📁 ";
+		}
+
+		.file::before {
+			content: "📄 ";
+		}
+
+		.pathinput_container {
+			display: flex;
+			gap: 20px;
+		}
+
+		.pathinput {
+			flex-grow: 1;
+		}
+
+		.control_container {
+			display: flex;
+			flex-direction: column;
+			justify-content: center;
+			gap: 30px;
+		}
+	</style>
+</head>
+
+<body>
+
+	<h1>文件复制工具</h1>
+
+	<div class="container">
+		<div class="panel">
+			<div class="pathinput_container">
+				<input type="text" id="path1" class="pathinput">
+				<button onclick="loadList('path1', 'list1')" value="D:\">加载</button>
+			</div>
+			<h3>文件列表</h3>
+			<ul id="list1" onclick="selectItem(event, 'list1')" ondblclick="enterFolder(event, 'path1', 'list1')"></ul>
+			<button onclick="deleteFile('path1', 'list1')">删除选中项</button>
+		</div>
+		<div class="control_container">
+			<button onclick="copyFile()">复制 &gt;&gt;</button>
+		</div>
+		<div class="panel">
+			<div class="pathinput_container">
+				<input type="text" id="path2" class="pathinput">
+				<button onclick="loadList('path2', 'list2')" value="D:\">加载</button>
+			</div>
+			<h3>文件列表</h3>
+			<ul id="list2" onclick="selectItem(event, 'list2')" ondblclick="enterFolder(event, 'path2', 'list2')"></ul>
+			<button onclick="deleteFile('path2', 'list2')">删除选中项</button>
+		</div>
+	</div>
+
+	<script>
+		const selected = { list1: null, list2: null };
+		const pathState = {
+			list1: [],
+			list2: []
+		};
+
+		async function fetchFiles(fullPath) {
+			try {
+				const response = await fetch('/wsf-rpc/call', {
+					method: 'POST',
+					headers: { 'Content-Type': 'application/json' },
+					body: JSON.stringify({
+						name: "ListFile", params: {
+							path: fullPath
+						}
+					})
+				});
+
+				const data = await response.json();
+				return data["params"]["result"];
+			} catch (err) {
+				alert('加载失败: ' + err.message);
+			}
+		}
+
+		async function applyToList(filelist, listId) {
+			const listEl = document.getElementById(listId);
+			listEl.innerHTML = '';
+			selected[listId] = null;
+
+			// 添加“返回上一级”按钮（如果当前路径不是根路径）
+			const li = document.createElement('li');
+			li.textContent = '..';
+			li.dataset.type = 'up';
+			listEl.appendChild(li);
+
+			filelist.forEach(file => {
+				const li = document.createElement('li');
+				li.textContent = file.name;
+				li.dataset.name = file.name;
+				li.dataset.type = file.type;
+				li.classList.add(file.type);
+				listEl.appendChild(li);
+			});
+		}
+
+		async function loadList(pathId, listId) {
+			const path = document.getElementById(pathId).value;
+			if (!path || path === '') {
+				alert('请输入路径');
+				return;
+			}
+
+			const filelist = await fetchFiles(path);
+			await applyToList(filelist, listId);
+		}
+
+		function selectItem(event, listId) {
+			if (event.target.tagName !== 'LI') return;
+
+			const items = document.getElementById(listId).children;
+			for (let item of items) {
+				item.classList.remove('selected');
+			}
+			event.target.classList.add('selected');
+			selected[listId] = event.target.dataset.name;
+		}
+
+		function enterFolder(event, pathId, listId) {
+			const li = event.target;
+			const basePath = document.getElementById(pathId).value;
+			if (li.dataset.type === 'dir') {
+				const newFullPath = [basePath, li.dataset.name].join('/');
+				document.getElementById(pathId).value = newFullPath;
+				loadList(pathId, listId);
+			} else if (li.dataset.type === 'up') {
+				// 返回上一级
+				const newFullPath = basePath.replace(/\/[^/]*$/, '');
+				document.getElementById(pathId).value = newFullPath;
+				loadList(pathId, listId);
+			}
+		}
+
+		async function copyFile() {
+			const sourceBase = document.getElementById('path1').value;
+			const targetBase = document.getElementById('path2').value;
+			const fileName = selected['list1'];
+
+			if (!fileName) {
+				alert('请从路径1中选择要复制的文件');
+				return;
+			}
+
+			const sourcePath = [sourceBase, fileName].join('/').replace(/\/+/g, '/');
+			const targetPath = targetBase;
+
+			try {
+				const res = await fetch('/wsf-rpc/call', {
+					method: 'POST',
+					headers: { 'Content-Type': 'application/json' },
+					body: JSON.stringify({
+						name: "CopyFile",
+						params: {
+							srcFilename: sourcePath,
+							dstDir: targetPath
+						}
+					})
+				});
+
+				const result = await res.json();
+				if (result.params.error) {
+					alert('复制失败：' + result.params.error);
+				} else {
+					alert('复制成功');
+					await applyToList(result["params"]["result"], "list2");
+				}
+			} catch (err) {
+				alert('复制出错: ' + err.message);
+			}
+		}
+
+		async function deleteFile(pathId, listId) {
+			// 判断哪个列表被选中了（这里只支持从 list1 删除）
+			const fileName = selected[listId];
+			if (!fileName) {
+				alert('请选择要删除的文件');
+				return;
+			}
+
+			const basePath = document.getElementById(pathId).value;
+			const fullPath = [basePath, selected[listId]].join('/');
+
+			// 查找所选项的类型，确认是否是文件（不允许删除目录）
+			const listItems = document.getElementById(listId).children;
+			let fileType = null;
+			for (let item of listItems) {
+				if (item.classList.contains('selected')) {
+					fileType = item.dataset.type;
+					break;
+				}
+			}
+
+			if (fileType !== 'file') {
+				alert('只能删除文件，不能删除目录');
+				return;
+			}
+
+			const confirmDelete = confirm(`确定要删除文件 "${fullPath}" 吗？`);
+			if (!confirmDelete) return;
+
+			try {
+				const res = await fetch('/wsf-rpc/call', {
+					method: 'POST',
+					headers: { 'Content-Type': 'application/json' },
+					body: JSON.stringify({
+						name: "DeleteFile",
+						params: {
+							filename: fullPath,
+						}
+					})
+				});
+
+				const result = await res.json();
+				if (result.params.error) {
+					alert('删除失败：' + result.params.error);
+				} else {
+					alert('删除成功');
+					await applyToList(result["params"]["result"], listId);
+				}
+			} catch (err) {
+				alert('删除时出错：' + err.message);
+			}
+		}
+	</script>
+
+</body>
+
+</html>

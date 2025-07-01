@@ -1,5 +1,6 @@
 import io
 import os
+import shutil
 import struct
 import typing
 from urllib.parse import urlparse
@@ -601,7 +602,94 @@ class RPCAdd(RPCInfo):
 			"result": a + b,
 		})
 		return rpcrc
+
+class RPCListFile(RPCInfo):
+	def __init__(self):
+		super().__init__("ListFile", [{
+			"name": "path",
+			"type": "string",
+		}])
+
+	async def Invoke(self, arg: protocol.RPCCallControl) -> protocol.RPCResponseControl:
+		path: str = arg.params["path"]
+		rpcrc = protocol.RPCResponseControl()
+		rpcrc.Init(protocol.RPCResponseControl.JSON, {
+			"result": [{
+				"name": x,
+				"type": os.path.isdir(os.path.join(path, x)) and "dir" or "file",
+			} for x in os.listdir(path)]
+		})
+		return rpcrc
 	
+class RPCCopyFile(RPCInfo):
+	def __init__(self):
+		super().__init__("CopyFile", [{
+			"name": "srcFilename",
+			"type": "string",
+		}, {
+			"name": "dstDir",
+			"type": "string",
+		}])
+
+	async def Invoke(self, arg: protocol.RPCCallControl) -> protocol.RPCResponseControl:
+		srcFilename = arg.params["srcFilename"]
+		dstDir = arg.params["dstDir"]
+		if os.path.isdir(os.path.join(dstDir, srcFilename)):
+			rpcrc = protocol.RPCResponseControl()
+			rpcrc.Init(protocol.RPCResponseControl.JSON, {
+				"error": f"{srcFilename} is not a file, but a dir",
+			})
+			return rpcrc
+		try:
+			shutil.copyfile(srcFilename, os.path.join(dstDir, os.path.basename(srcFilename)))
+		except Exception as e:
+			rpcrc = protocol.RPCResponseControl()
+			rpcrc.Init(protocol.RPCResponseControl.JSON, {
+				"error": f"Can't copy dir {srcFilename} to {dstDir}: {e}",
+			})
+			return rpcrc
+		rpcrc = protocol.RPCResponseControl()
+		rpcrc.Init(protocol.RPCResponseControl.JSON, {
+			"result": [{
+				"name": x,
+				"type": os.path.isdir(os.path.join(dstDir, x)) and "dir" or "file",
+			} for x in os.listdir(dstDir)]
+		})
+		return rpcrc
+	
+class RPCDeleteFile(RPCInfo):
+	def __init__(self):
+		super().__init__("DeleteFile", [{
+			"name": "filename",
+			"type": "string",
+		}])
+
+	async def Invoke(self, arg: protocol.RPCCallControl) -> protocol.RPCResponseControl:
+		filename = arg.params["filename"]
+		if os.path.isdir(filename):
+			rpcrc = protocol.RPCResponseControl()
+			rpcrc.Init(protocol.RPCResponseControl.JSON, {
+				"error": f"{filename} is not a file, but a dir",
+			})
+			return rpcrc
+		try:
+			os.remove(filename)
+		except Exception as e:
+			rpcrc = protocol.RPCResponseControl()
+			rpcrc.Init(protocol.RPCResponseControl.JSON, {
+				"error": f"Can't delete file {filename}: {e}",
+			})
+			return rpcrc
+		basedir = os.path.dirname(filename)
+		rpcrc = protocol.RPCResponseControl()
+		rpcrc.Init(protocol.RPCResponseControl.JSON, {
+			"result": [{
+				"name": x,
+				"type": os.path.isdir(os.path.join(basedir, x)) and "dir" or "file",
+			} for x in os.listdir(basedir)]
+		})
+		return rpcrc
+
 class TaskManager:
 	def __init__(self):
 		self.tasks: typing.Dict[str, typing.Any] = {}
@@ -729,6 +817,9 @@ class StableDiffusionClient(Client):
 		self.AddRPC(SayHello(self))
 		self.AddRPC(RPCAdd())
 		self.AddRPC(RPCDownloadFile(self.tm))
+		self.AddRPC(RPCListFile())
+		self.AddRPC(RPCCopyFile())
+		self.AddRPC(RPCDeleteFile())
 
 		self.shouldProcessNextWSMsg = True
 		self.cachedSteps: typing.Dict[int, typing.List[int]] = {}
