@@ -916,6 +916,9 @@ class StableDiffusionClient(Client):
 				jsonText = json.loads(raw.GetTextData())
 				if jsonText["type"] == 'progress':
 					self.maxSteps = jsonText["data"]["max"]
+					if self.maxSteps <= 10:
+						self.shouldProcessNextWSMsg = True
+						return True
 					if self.maxSteps not in self.cachedSteps:
 						estimateNum = int(pow(math.e, math.log(self.maxSteps)/self.config.comfyPreviewSpeed)) # solve x**rate = steps
 						self.cachedSteps[self.maxSteps] = [int(x**self.config.comfyPreviewSpeed)+1 for x in range(estimateNum+1)]
