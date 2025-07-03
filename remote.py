@@ -13,6 +13,7 @@ import heapq
 import PIL.ImageFile
 import math
 import shutil
+from collections import OrderedDict
 
 log = logging.getLogger(__name__)
 utils.SetupLogging(log, "remote", terminalLevel=logging.DEBUG, saveInFile=True)
@@ -670,6 +671,8 @@ class StableDiffusionCachingClient(Client):
 			"extensions/a1111-sd-webui-tagcomplete/tags/extra-quality-tags.csv": os.path.join(self.alwayslocal_dir, "extra-quality-tags.csv"),
 			"html/card-no-preview.png": os.path.join(self.alwayslocal_dir, "card-no-preview.png")
 		}
+		self.comfyHistoryTrackId = ""
+		self.comfyHistory = OrderedDict()
 		
 		os.makedirs(self.root_dir,exist_ok=True)
 		for assets_fd in self.assets_dir:
@@ -944,6 +947,30 @@ class StableDiffusionCachingClient(Client):
 				else:
 					cachefn = os.path.join(self.root_dir, f"comfy_{querys['type'][0]}", querys["subfolder"][0], querys["filename"][0])
 					return await self.cacheImageOrRequest(request, cachefn)
+		
+		# comfy ui 历史节点存储
+		if parsed_url.path == "/api/history":
+			request.headers["WSF-INCREMENTAL"] = self.comfyHistoryTrackId
+			ret = await super().Session(request)
+			state = ret.headers["WSF-STATE"]
+			if state == 'INIT':
+				self.comfyHistory = json.loads(ret.body, object_pairs_hook=OrderedDict)
+			elif state == 'APPEND':
+				incData = json.loads(ret.body, object_pairs_hook=OrderedDict)
+				for key, value in incData.items():
+					self.comfyHistory[key] = value
+			else:
+				raise Exception(f"Unknown WSF-STATE: {state}")
+			self.comfyHistoryTrackId = ret.headers["WSF-INCREMENTAL"]
+
+			newJSON = json.dumps(self.comfyHistory, ensure_ascii=False)
+
+			ret.body = newJSON.encode('utf8')
+			if 'Content-Length' in ret.headers:
+				ret.headers['Content-Length'] = str(len(ret.body))
+			del ret.headers["WSF-STATE"]
+			del ret.headers["WSF-INCREMENTAL"]
+			return ret
 				
 		# comfy ui 缓存
 		if os.path.splitext(parsed_url.path)[1].lower() in [".css", ".js", ".woff2", ".svg", ".json", ".webp"]:

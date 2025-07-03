@@ -21,6 +21,7 @@ import base64
 import requests
 from PIL import Image
 import math
+from collections import OrderedDict
 
 log = logging.getLogger(__name__)
 utils.SetupLogging(log, "client", terminalLevel=logging.DEBUG, saveInFile=True)
@@ -109,6 +110,8 @@ class Client:
 		self.scheduleSendQueue: asyncio.Queue[protocol.Transport] = asyncio.Queue()
 
 		self.sseCloseSignal: typing.Dict[str, bool] = {}
+
+		self.incrementalJson: typing.Dict[str, typing.List[typing.Tuple[str, typing.Any]]] = {}
 
 	async def waitForOnePackage(self, ws: web.WebSocketResponse):
 		try:
@@ -343,6 +346,15 @@ class Client:
 		raw.Init(req.url, resp.status, headers, rawData)
 		return raw, compress_ratio
 
+	def checkMatchIncrementalJson(self, url: str, compare: typing.List[typing.Tuple[str, typing.Any]]):
+		curlen = len(self.incrementalJson[url])
+		if curlen > len(compare):
+			return False
+		for i in range(0, curlen):
+			if compare[i][0]!= self.incrementalJson[url][i][0]:
+				return False
+		return True
+
 	async def processRequestPackage(self, req: protocol.Request):
 		log.debug(f"Request {req.seq_id} - {req.method} {req.url} {len(req.body)} bytes")
 
@@ -377,6 +389,33 @@ class Client:
 			return
 		
 		respData = await resp.content.read()
+
+		if utils.HasIncremental(req):
+			startIdx = int(req.headers["WSF-INCREMENTAL"]) if req.headers["WSF-INCREMENTAL"] != "" else -1
+			dt = utils.OrderedDictToList(json.loads(respData, object_pairs_hook=OrderedDict))
+			if req.url not in self.incrementalJson or startIdx == -1 or startIdx > len(self.incrementalJson[req.url]) or self.checkMatchIncrementalJson(req.url, dt) == False:
+				self.incrementalJson[req.url] = dt
+
+				raw = protocol.Response(self.config.cipher)
+				raw.SetForResponseTransport(req)
+				raw.Init(req.url, resp.status, dict(resp.headers), respData)
+				raw.headers["WSF-INCREMENTAL"] = str(len(self.incrementalJson[req.url]))
+				raw.headers["WSF-STATE"] = "INIT"
+				await self.QueueSendSmartSegments(raw)
+			else:
+				self.incrementalJson[req.url] = dt
+				ret = utils.OrderedDictListToJson(self.incrementalJson[req.url][startIdx:])
+
+				raw = protocol.Response(self.config.cipher)
+				raw.SetForResponseTransport(req)
+				raw.Init(req.url, resp.status, dict(resp.headers), ret.encode('utf-8'))
+				raw.headers["WSF-INCREMENTAL"] = str(len(self.incrementalJson[req.url]))
+				raw.headers["WSF-STATE"] = "APPEND"
+				await self.QueueSendSmartSegments(raw)
+
+			await resp.release()
+			return
+
 		if utils.HasWSFCompress(req): # optimize for image requests
 			raw, compress_ratio = await self.optimizeResponsePackage(req, resp, respData)
 			if compress_ratio == 0.0:

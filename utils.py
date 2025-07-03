@@ -1,3 +1,4 @@
+import json
 import logging, os, collections, asyncio, sys, io, uuid, datetime, heapq, abc
 from PIL import Image
 import aiohttp.web as web
@@ -166,6 +167,21 @@ def GetWSFCompress(req: protocol.Request):
 
 def HasWSUpgarde(resp: typing.Union[aiohttp.ClientResponse, protocol.Response]):
 	return 'Connection' in resp.headers and resp.headers['Connection'] == 'upgrade' and 'Upgrade' in resp.headers and resp.headers['Upgrade'] == 'websocket'
+
+def HasIncremental(req: protocol.Request):
+	return 'WSF-INCREMENTAL' in req.headers
+
+def OrderedDictToList(od: collections.OrderedDict):
+	ret: typing.List[typing.Tuple[str, typing.Any]] = []
+	for k, v in od.items():
+		ret.append((k, v))
+	return ret
+
+def OrderedDictListToJson(ls: typing.List[typing.Tuple[str, typing.Any]]):
+	od = collections.OrderedDict()
+	for (k, v) in ls:
+		od[k] = v
+	return json.dumps(od, ensure_ascii=False)
 
 class TimerTask(abc.ABC):
 	def __init__(self, time: int):
