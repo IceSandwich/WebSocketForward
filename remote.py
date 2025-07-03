@@ -949,7 +949,7 @@ class StableDiffusionCachingClient(Client):
 					return await self.cacheImageOrRequest(request, cachefn)
 		
 		# comfy ui 历史节点存储
-		if parsed_url.path == "/api/history":
+		if parsed_url.path == "/api/history" and request.method == 'GET':
 			request.headers["WSF-INCREMENTAL"] = self.comfyHistoryTrackId
 			ret = await super().Session(request)
 			state = ret.headers["WSF-STATE"]
