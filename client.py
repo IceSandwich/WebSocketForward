@@ -3,7 +3,7 @@ import os
 import shutil
 import struct
 import typing
-from urllib.parse import urlparse
+from urllib.parse import urlparse, parse_qs
 import uuid
 
 import aiohttp.client_exceptions
@@ -347,12 +347,20 @@ class Client:
 		return raw, compress_ratio
 
 	def checkMatchIncrementalJson(self, url: str, compare: typing.List[typing.Tuple[str, typing.Any]]):
-		curlen = len(self.incrementalJson[url])
-		if curlen > len(compare):
-			return False
-		for i in range(0, curlen):
-			if compare[i][0]!= self.incrementalJson[url][i][0]:
+		if len(self.incrementalJson[url]) <= len(compare):
+			clen = len(self.incrementalJson[url])
+			if clen == 0:
 				return False
+			for i in range(0, clen):
+				if self.incrementalJson[url][i][0] != compare[i][0]:
+					return False
+		else:
+			clen = len(compare)
+			if clen == 0:
+				return False
+			for i in range(0, clen):
+				if self.incrementalJson[url][-clen+i][0] != compare[i][0]:
+					return False
 		return True
 
 	async def processRequestPackage(self, req: protocol.Request):

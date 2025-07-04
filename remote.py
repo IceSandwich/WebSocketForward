@@ -955,10 +955,12 @@ class StableDiffusionCachingClient(Client):
 			state = ret.headers["WSF-STATE"]
 			if state == 'INIT':
 				self.comfyHistory = json.loads(ret.body, object_pairs_hook=OrderedDict)
+				print(f"================>>>>>> INIT, got {len(self.comfyHistory)}, pointer {ret.headers['WSF-INCREMENTAL']}")
 			elif state == 'APPEND':
 				incData = json.loads(ret.body, object_pairs_hook=OrderedDict)
 				for key, value in incData.items():
 					self.comfyHistory[key] = value
+				print(f"================>>>>>> APPEND, got {len(incData)}, pointer {ret.headers['WSF-INCREMENTAL']}")
 			else:
 				raise Exception(f"Unknown WSF-STATE: {state}")
 			self.comfyHistoryTrackId = ret.headers["WSF-INCREMENTAL"]
