@@ -979,6 +979,11 @@ class StableDiffusionCachingClient(Client):
 			cachefn = os.path.join(self.root_dir, parsed_url.path[1:])
 			return await self.cacheOrRequest(request, cachefn)
 		
+		# temp fix, comfy ui auto complete plugin
+		if parsed_url.path.startswith("/autocomplete-plus/csv/danbooru/tags/extra/0"):
+			cachefn = os.path.join(self.alwayslocal_dir, "autocomplete-plus", "danbooru_tags.csv")
+			return await self.cacheOrRequest(request, cachefn)
+		
 		return await super().Session(request)
 
 	async def processControlPackage(self, pkg: protocol.Control):

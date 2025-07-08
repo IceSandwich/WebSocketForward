@@ -407,11 +407,13 @@ class Server:
 		except Exception as e:
 			log.error(f"{self.name}] Error in mainloop. {e}", exc_info=True, stack_info=True)
 		finally:
+			needClose = (self.status >= self.STATUS_INITIALIZING)
 			self.status = self.STATUS_INIT
 			await self.OnDisconnected()
 			log.debug(f"{self.name}] Disconnected. Return to init status.")
 			self.ws = None
-			await ws.close()
+			if needClose:
+				await ws.close()
 		return ws
 
 class Router(IRouter):
