@@ -403,7 +403,7 @@ class Client:
 			dt: typing.List[typing.Tuple[str, typing.Any]] = []
 			if len(respData) != 0:
 				dt = utils.OrderedDictToList(json.loads(respData, object_pairs_hook=OrderedDict))
-			if req.url not in self.incrementalJson or startIdx == -1 or startIdx > len(self.incrementalJson[req.url]) or self.checkMatchIncrementalJson(req.url, dt) == False:
+			if req.url not in self.incrementalJson or startIdx == -1 or self.checkMatchIncrementalJson(req.url, dt) == False:
 				self.incrementalJson[req.url] = dt
 
 				raw = protocol.Response(self.config.cipher)

@@ -932,7 +932,7 @@ class StableDiffusionCachingClient(Client):
 		if parsed_url.path == "/api/view":
 			querys = parse_qs(parsed_url.query)
 			goodpath = True
-			for requireQuery in ["filename", "subfolder", "type"]:
+			for requireQuery in ["filename", "type"]:
 				if requireQuery not in querys:
 					goodpath = False
 					break
@@ -941,12 +941,19 @@ class StableDiffusionCachingClient(Client):
 				log.error(f"Cannot decide the saved location of output file: {request.url} , disable cache function and image optimize")
 				return await super().Session(request)
 			else:
-				if querys["type"][0] != "output":
+				if querys["type"][0] == "output":
+					subfolder = querys["subfolder"][0] if "subfolder" in querys else ""
+					if subfolder: # maybe can merge into one line?
+						cachefn = os.path.join(self.root_dir, f"comfy_{querys['type'][0]}", querys["subfolder"][0], querys["filename"][0])
+					else:
+						cachefn = os.path.join(self.root_dir, f"comfy_{querys['type'][0]}", querys["filename"][0])
+					return await self.cacheImageOrRequest(request, cachefn)
+				elif querys["type"][0] in ["temp", "input"]:
+					cachefn = os.path.join(self.root_dir, f"comfy_{querys['type'][0]}", querys["filename"][0])
+					return await self.cacheImageOrRequest(request, cachefn)
+				else:
 					log.error(f"Unknown /api/view type: {querys['type'][0]} , disable cache function and image optimize")
 					return await super().Session(request)
-				else:
-					cachefn = os.path.join(self.root_dir, f"comfy_{querys['type'][0]}", querys["subfolder"][0], querys["filename"][0])
-					return await self.cacheImageOrRequest(request, cachefn)
 		
 		# comfy ui 历史节点存储
 		if parsed_url.path == "/api/history" and request.method == 'GET':

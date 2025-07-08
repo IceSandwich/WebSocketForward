@@ -7,16 +7,15 @@
 ```conf
 frontend fe_main
   bind :80
-  use_backend websocket_servers if { path_beg /ws }
+  use_backend websocket_servers if { path_beg /wsf }
   default_backend http_servers
 
 backend websocket_servers
-  option http-server-close
+  #option http-server-close
   #timeout client  1h  # 设置客户端连接的超时时间为 1 小时
   #timeout server  1h  # 设置服务器连接的超时时间为 1 小时
   timeout tunnel 1h
-  server s1 192.168.0.10:3000 check
-  server s2 192.168.0.11:3000 check
+  server wsf 127.0.0.1:12228
 ```
 
 ## Nginx
