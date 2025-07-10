@@ -672,7 +672,7 @@ class StableDiffusionCachingClient(Client):
 			"html/card-no-preview.png": os.path.join(self.alwayslocal_dir, "card-no-preview.png")
 		}
 		self.comfyHistoryTrackId = ""
-		self.comfyHistory = OrderedDict()
+		self.comfyHistory: typing.List[typing.Tuple[str, typing.Any]] = []
 		
 		os.makedirs(self.root_dir,exist_ok=True)
 		for assets_fd in self.assets_dir:
@@ -961,18 +961,22 @@ class StableDiffusionCachingClient(Client):
 			ret = await super().Session(request)
 			state = ret.headers["WSF-STATE"]
 			if state == 'INIT':
-				self.comfyHistory = json.loads(ret.body, object_pairs_hook=OrderedDict)
+				self.comfyHistory = utils.OrderedDictToList(json.loads(ret.body, object_pairs_hook=OrderedDict))
 				print(f"================>>>>>> INIT, got {len(self.comfyHistory)}, pointer {ret.headers['WSF-INCREMENTAL']}")
 			elif state == 'APPEND':
-				incData = json.loads(ret.body, object_pairs_hook=OrderedDict)
-				for key, value in incData.items():
-					self.comfyHistory[key] = value
+				incData = utils.OrderedDictToList(json.loads(ret.body, object_pairs_hook=OrderedDict))
+				self.comfyHistory.extend(incData)
 				print(f"================>>>>>> APPEND, got {len(incData)}, pointer {ret.headers['WSF-INCREMENTAL']}")
 			else:
 				raise Exception(f"Unknown WSF-STATE: {state}")
 			self.comfyHistoryTrackId = ret.headers["WSF-INCREMENTAL"]
 
-			newJSON = json.dumps(self.comfyHistory, ensure_ascii=False)
+			queries = parse_qs(parsed_url.query)
+			if 'max_items' in queries:
+				maxItems = int(queries['max_items'][0])
+				newJSON = utils.OrderedDictListToJson(self.comfyHistory[-maxItems:])
+			else:
+				newJSON = utils.OrderedDictListToJson(self.comfyHistory)
 
 			ret.body = newJSON.encode('utf8')
 			if 'Content-Length' in ret.headers:
@@ -1066,7 +1070,7 @@ class HttpServer:
 			utils.SetWSFCompress(headers, quality=self.config.img_quality)
 		
 		req = protocol.Request(self.config.cipher)
-		req.Init(self.config.prefix + str(request.url.path_qs), request.method, headers)
+		req.Init(self.config.prefix + str(request.url.raw_path_qs), request.method, headers)
 		req.SetBody(await request.read() if request.can_read_body else None)
 		
 		resp = await self.client.Session(req)

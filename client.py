@@ -346,22 +346,60 @@ class Client:
 		raw.Init(req.url, resp.status, headers, rawData)
 		return raw, compress_ratio
 
-	def checkMatchIncrementalJson(self, url: str, compare: typing.List[typing.Tuple[str, typing.Any]]):
-		if len(self.incrementalJson[url]) <= len(compare):
+	def checkMatchAndGetIncrementalJson(self, url: str, startIdx: int, compare: typing.List[typing.Tuple[str, typing.Any]]):
+		"""
+		返回None表示列表清空或者匹配不上，需要重新传输（INIT）。
+		返回字典表示需要增量传输（INCREMENTAL），返回的是增量的内容。
+		"""
+		if url not in self.incrementalJson:
+			self.incrementalJson[url] = compare
+			return None
+		
+		if startIdx == -1:
+			self.incrementalJson[url] = compare
+			return None
+
+		if len(self.incrementalJson[url]) < len(compare):
 			clen = len(self.incrementalJson[url])
 			if clen == 0:
-				return False
+				self.incrementalJson[url] = compare
+				return None
 			for i in range(0, clen):
 				if self.incrementalJson[url][i][0] != compare[i][0]:
-					return False
-		else:
-			clen = len(compare)
-			if clen == 0:
-				return False
-			for i in range(0, clen):
-				if self.incrementalJson[url][-clen+i][0] != compare[i][0]:
-					return False
-		return True
+					self.incrementalJson[url] = compare
+					return None
+			self.incrementalJson[url] = compare
+			return compare[clen:]
+		
+		# 在新列表中寻找跟历史列表对应的key位置
+		keyindex = -1
+		for i in range(0, len(compare)):
+			if compare[i][0] == self.incrementalJson[url][startIdx-1][0]:
+				keyindex = i
+				break
+		# 没对应说明列表需要重新传输了
+		if keyindex == -1:
+			self.incrementalJson[url] = compare
+			return None
+		
+		# double check, 前面keyindex个元素是否都匹配
+		for i in range(0, keyindex):
+			if compare[i][0] != self.incrementalJson[url][startIdx-keyindex-1+i][0]:
+				self.incrementalJson[url] = compare
+				return None
+			
+		# double check, 后面的元素是否匹配
+		cntAfter = min(len(compare)-keyindex-1, len(self.incrementalJson[url])-startIdx)
+		for i in range(0, cntAfter):
+			if compare[keyindex+1+i][0]!= self.incrementalJson[url][startIdx+i][0]:
+				self.incrementalJson[url] = compare
+				return None
+			
+		# 扩展到同长度并拷贝
+		self.incrementalJson[url].extend([None] * (startIdx + cntAfter - len(self.incrementalJson[url])))
+		self.incrementalJson[url][startIdx:] = compare[keyindex+1:]
+		
+		return compare[keyindex+1:]
 
 	async def processRequestPackage(self, req: protocol.Request):
 		log.debug(f"Request {req.seq_id} - {req.method} {req.url} {len(req.body)} bytes")
@@ -403,9 +441,8 @@ class Client:
 			dt: typing.List[typing.Tuple[str, typing.Any]] = []
 			if len(respData) != 0:
 				dt = utils.OrderedDictToList(json.loads(respData, object_pairs_hook=OrderedDict))
-			if req.url not in self.incrementalJson or startIdx == -1 or self.checkMatchIncrementalJson(req.url, dt) == False:
-				self.incrementalJson[req.url] = dt
-
+			checkResult = self.checkMatchAndGetIncrementalJson(req.url, startIdx, dt)
+			if checkResult is None:
 				raw = protocol.Response(self.config.cipher)
 				raw.SetForResponseTransport(req)
 				raw.Init(req.url, resp.status, dict(resp.headers), respData)
@@ -413,12 +450,9 @@ class Client:
 				raw.headers["WSF-STATE"] = "INIT"
 				await self.QueueSendSmartSegments(raw)
 			else:
-				self.incrementalJson[req.url] = dt
-				ret = utils.OrderedDictListToJson(self.incrementalJson[req.url][startIdx:])
-
 				raw = protocol.Response(self.config.cipher)
 				raw.SetForResponseTransport(req)
-				raw.Init(req.url, resp.status, dict(resp.headers), ret.encode('utf-8'))
+				raw.Init(req.url, resp.status, dict(resp.headers), utils.OrderedDictListToJson(checkResult).encode('utf-8'))
 				raw.headers["WSF-INCREMENTAL"] = str(len(self.incrementalJson[req.url]))
 				raw.headers["WSF-STATE"] = "APPEND"
 				await self.QueueSendSmartSegments(raw)
