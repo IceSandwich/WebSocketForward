@@ -664,7 +664,7 @@ class StableDiffusionCachingClient(Client):
 		self.assets_dir = ['/assets', '/webui-assets', "/templates"]
 		self.sdDirPattern = 'D:/GITHUB/stable-diffusion-webui-forge/'
 		self.tmpDirPattern = r'^C:/Users/[a-zA-Z0-9._-]+/AppData/Local/Temp/'
-		self.keep_list = ["outputs", "always_local", "models", "comfy_output"]
+		self.keep_list = ["outputs", "always_local", "models", "comfy_output", "extensions", "comfy_input"]
 		self.alwayslocal_dir = os.path.join(self.root_dir, "always_local")
 		self.use_localfiles = {
 			"extensions/a1111-sd-webui-tagcomplete/tags/e621.csv": os.path.join(self.alwayslocal_dir, "e621.csv"),
@@ -854,7 +854,11 @@ class StableDiffusionCachingClient(Client):
 			session_hash = querys["session_hash"][0]
 			# print("Query session hash: ", session_hash)
 			if session_hash in self.requireSession:
-				self.listenInStream[request.seq_id] = self.requireSession[session_hash]
+				sli = StreamListenInfo()
+				sli.dtype = StreamListenInfo.TYPE_WEBUI111_SSE_EVENT
+				sli.url = parsed_url.path
+				sli.event_id = self.requireSession[session_hash]
+				self.listenInStream[request.seq_id] = sli
 				del self.requireSession[session_hash]
 				# print("== got /queue/data for session_hash: ", session_hash, "seq:", request.seq_id)
 			return await super().Session(request)
