@@ -1,8 +1,7 @@
-/__pycache__
-/__pycache__/*.pyc
-/logs
 /cache_sdwebui
+/venv
+/__pycache__
+/logs
+*.pyc
 /.vscode
 /notes
-/venv
-run_*.bat

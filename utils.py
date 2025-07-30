@@ -1,7 +1,9 @@
+import json
 import logging, os, collections, asyncio, sys, io, uuid, datetime, heapq, abc
 from PIL import Image
 import aiohttp.web as web
-import data, time_utils
+import aiohttp
+import protocol, time_utils
 
 import typing
 T = typing.TypeVar('T')
@@ -12,11 +14,16 @@ mimetypes.add_type("text/plain; charset=utf-8", ".woff2")
 MIMETYPE_WEBP = 'image/webp'
 CONTENTTYPE_UTF8HTML = 'text/html; charset=utf-8'
 
+# 在日志中打印数据内容，这里设置打印前n个字节
+LOG_BYTES_LEN = 20
+
+log: logging.Logger = None
+
 # 配置 logging
 # logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 def SetupLogging(log: logging.Logger, id: str, terminalLevel: int = logging.INFO, saveInFile: bool = True):
-	formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+	formatter = logging.Formatter('%(asctime)s - %(filename)s:%(lineno)d - %(levelname)s - %(message)s')
 	log.setLevel(logging.DEBUG)
 
 	chandler = logging.StreamHandler(sys.stdout)
@@ -74,26 +81,27 @@ class Chunk:
 		self.total_cnt = total_cnt
 		self.data: typing.List[bytes] = [None] * self.count
 		self.cur_idx = 0
-		self.template: data.Transport = None
+		self.template: typing.Union[protocol.Request, protocol.Response] = None
 		self.lock = asyncio.Lock()
 
 	def IsFinish(self):
 		return self.cur_idx >= self.count
 
-	async def Put(self, raw: data.Transport):
+	async def Put(self, raw: typing.Union[protocol.Request, protocol.Response, protocol.Subpackage]):
 		if self.IsFinish():
 			raise Exception(f"Chunk] {raw.seq_id} already full(total_cnt={self.total_cnt}, cur_idx={self.cur_idx}).")
 		
 		async with self.lock:
-			self.data[raw.cur_idx - self.start_idx] = raw.data
-			if raw.data_type != data.TransportDataType.SUBPACKAGE:
+			assert raw.body is not None, f"{protocol.Transport.Mappings.ValueToString(raw.transportType)} Package {raw.seq_id}:{raw.cur_idx}/{raw.total_cnt} the body is None which should not happend."
+			self.data[raw.cur_idx - self.start_idx] = raw.body
+			if raw.transportType != protocol.Transport.SUBPACKAGE:
 				self.template = raw
 			
 			self.cur_idx = self.cur_idx + 1
 	
 	def Combine(self):
 		raw = b''.join(self.data)
-		self.template.data = raw
+		self.template.body = raw
 		self.template.cur_idx = 0
 		self.template.total_cnt = 1
 		return self.template
@@ -119,7 +127,8 @@ def CompressImage(raw: bytes, target_mimetype: str, quality: int = 75):
 		MIMETYPE_WEBP: 'WebP'
 	}
 	if target_mimetype not in mimetypeToFormat:
-		print(f"Cannot compress image, unknown target mimetype: {target_mimetype}. Use WebP as default.")
+		if log is not None:
+			log.error(f"Cannot compress image, unknown target mimetype: {target_mimetype}. Use WebP as default.")
 		target_mimetype = MIMETYPE_WEBP
 
 	image = DecodeImageFromBytes(raw)
@@ -130,23 +139,23 @@ def CompressImage(raw: bytes, target_mimetype: str, quality: int = 75):
 def ComputeCompressRatio(source: int, target: int):
 	return 1.0 - (target / source)
 
-def NewSeqId():
+def NewId():
 	return str(uuid.uuid4())
 
-def SetWSFCompress(req: typing.Union[data.Request, typing.Dict[str, str]],image_type: str = "image/webp", quality: int = 75):
+def SetWSFCompress(req: typing.Union[protocol.Request, typing.Dict[str, str]],image_type: str = "image/webp", quality: int = 75):
 	"""
 	quality设置-1表示这是一个通知信息
 	"""
 	value = f'{image_type}' if quality == -1 else f'{image_type},{quality}'
-	if type(req) == data.Request:
+	if type(req) == protocol.Request:
 		req.headers['WSF-Compress'] = value
 	else:
 		req['WSF-Compress'] = value
 
-def HasWSFCompress(req: data.Request):
+def HasWSFCompress(req: protocol.Request):
 	return 'WSF-Compress' in req.headers
 
-def GetWSFCompress(req: data.Request):
+def GetWSFCompress(req: protocol.Request):
 	"""
 	解析Compress头，返回MIMETYPE和图片质量。
 	注意，调用前请使用HasWSFCompress()确保包含Compress头。
@@ -156,12 +165,30 @@ def GetWSFCompress(req: data.Request):
 	assert(len(sp) == 2)
 	return (sp[0], int(sp[1]))
 
+def HasWSUpgarde(resp: typing.Union[aiohttp.ClientResponse, protocol.Response]):
+	return 'Connection' in resp.headers and resp.headers['Connection'] == 'upgrade' and 'Upgrade' in resp.headers and resp.headers['Upgrade'] == 'websocket'
+
+def HasIncremental(req: protocol.Request):
+	return 'WSF-INCREMENTAL' in req.headers
+
+def OrderedDictToList(od: collections.OrderedDict):
+	ret: typing.List[typing.Tuple[str, typing.Any]] = []
+	for k, v in od.items():
+		ret.append((k, v))
+	return ret
+
+def OrderedDictListToJson(ls: typing.List[typing.Tuple[str, typing.Any]]):
+	od = collections.OrderedDict()
+	for (k, v) in ls:
+		od[k] = v
+	return json.dumps(od, ensure_ascii=False)
+
 class TimerTask(abc.ABC):
-	def __init__(self, time: float):
+	def __init__(self, time: int):
 		self.timestamp = time_utils.GetTimestamp()
 		self.time = time
 
-	def __le__(self, other):
+	def __lt__(self, other):
 		return self.time < other.time
 	
 	def GetTimestamp(self):
@@ -169,16 +196,20 @@ class TimerTask(abc.ABC):
 	
 	@abc.abstractmethod
 	async def Run(self):
+		"""
+		到时执行该函数
+		"""
 		raise NotImplementedError()
 	
 class Timer:
 	"""
-	Not a accurate timer.
+	Not an accurate timer.
 	"""
 	def __init__(self):
 		self.tasks: typing.List[TimerTask] = []
 		self.condition = asyncio.Condition()
 		self.runningSignal = False
+		self.nextTimestamp = 0
 
 	def Start(self):
 		"""
@@ -190,29 +221,42 @@ class Timer:
 	
 	async def Stop(self):
 		self.runningSignal = False
-		self.condition.notify_all()
+		async with self.condition:
+			self.condition.notify_all()
 		await self.instance
 
 	async def AddTask(self, task: TimerTask):
 		if self.runningSignal == False:
-			print(f"Warning: Timer doesn't start at this moment but AddTask() has been called.")
+			if log is not None:
+				log.error(f"Warning: Timer doesn't start at this moment but AddTask() has been called.")
 
 		async with self.condition:
+			if self.nextTimestamp != 0:
+				task.time = task.time - ( self.nextTimestamp - task.GetTimestamp() )
+
 			heapq.heappush(self.tasks, task)
 			self.condition.notify_all()
 
 	async def mainloop(self):
+		log.debug(f"Timer] Start mainloop")
 		while True:
 			async with self.condition:
 				await self.condition.wait_for(lambda: len(self.tasks) > 0 or self.runningSignal == False)
 				if self.runningSignal == False:
 					return
 				item = heapq.heappop(self.tasks)
-			if item.time <= 0:
-				continue
-			await asyncio.sleep(item.time)
-			await item.Run()
-			async with self.condition: # this will change the new packages added during sleep time. So utils.Timer is not a accurate timer.
-				for task in self.tasks:
-					task.time -= item.time
-		 
+				self.nextTimestamp = time_utils.GetTimestamp()
+				if item.time > 0:
+					self.nextTimestamp = self.nextTimestamp + item.time
+			
+			try:
+				if item.time > 0:
+					await asyncio.sleep(item.time)
+					await item.Run()
+					async with self.condition: # this will change the new packages added during sleep time. So utils.Timer is not a accurate timer.
+						for task in self.tasks:
+							task.time -= item.time
+				else:
+					await item.Run()
+			except Exception as e:
+				log.error(f"Timer] Exception: {e}", exc_info=True, stack_info=True)

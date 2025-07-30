@@ -22,9 +22,10 @@ source venv/bin/activate
 echo "安装依赖..."
 python -m pip install -r requirements.txt
 
+USAGE="用法: $0 {install|uninstall|run|stop|update}"
 # 检查参数
 if [ $# -ne 1 ]; then
-    echo "用法: $0 {install|uninstall|run|stop}"
+    echo "${USAGE}"
     exit 1
 fi
 
@@ -67,9 +68,15 @@ case "$COMMAND" in
 	stop)
 		kill $(cat server.pid)
 		;;
+    update)
+        sudo systemctl stop ${PROJECT_NAME}.service
+        git pull
+        sudo systemctl start ${PROJECT_NAME}.service
+        sudo systemctl status ${PROJECT_NAME}.service
+        ;;
     *)
         echo "无效指令: $COMMAND"
-        echo "用法: $0 {install|uninstall|run|stop}"
+        echo "${USAGE}"
         exit 1
         ;;
 esac

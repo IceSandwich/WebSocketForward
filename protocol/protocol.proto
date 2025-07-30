@@ -1,0 +1,105 @@
+syntax = "proto3";
+package WSForward;
+
+enum TransportType {
+	CONTROL = 0; // control package will not encrypted
+	REQUEST = 1;
+	RESPONSE = 2;
+	SUBPACKAGE = 3;
+	STREAM_DATA = 4;
+}
+
+message PackageId {
+	string seq_id = 3;
+
+	int32 cur_idx = 1;
+	int32 total_cnt = 2;
+}
+
+message Transport {
+	TransportType type = 3;
+	string receiver = 5;
+	string sender = 4;
+
+	bytes data = 1; // encrypted when type is not Control
+
+	PackageId id = 2;
+}
+
+
+
+
+
+
+
+enum ControlType {
+	HELLO = 0; // HelloClient or HelloServer data
+	QUERY_CLIENTS = 1; // QueryClientsControl data
+	QUIT_SIGNAL = 2;
+	PRINT = 3;
+	RETRIEVE_PKG = 4;
+	RPC_QUERY = 5;
+	RPC_CALL = 6;
+	RPC_RESP = 7;
+	RPC_PROGRESS = 8;
+}
+
+enum ClientType {
+	CLIENT = 0;
+	REMOTE = 1;
+}
+
+message Control {
+	ControlType type = 1;
+	bytes data = 2;
+}
+
+message ClientInfo {
+	string id = 1;
+	ClientType type = 2;
+}
+
+message HelloClientControl {
+	ClientInfo info = 3;
+	repeated PackageId sent_pkgs = 1; // client reports sent packages
+	repeated PackageId received_pkgs = 2; // remote reports received packages and sent packages
+}
+
+message HelloServerControl {
+	repeated ClientInfo clients = 3;
+	repeated PackageId reports = 1; // report received packages to client, report sent packages to remote
+	repeated PackageId requires = 2; // require client/remote to resend packages
+}
+
+message QueryClientsControl {
+	repeated ClientInfo connected = 1;
+}
+
+message RPCControl {
+	string message = 1;
+}
+
+
+
+
+message Request {
+	string url = 1;
+	string method = 2;
+	string headers = 3;
+	optional bytes body = 4;
+}
+
+message Response {
+	string url = 1;
+	int32 status = 2;
+	string headers = 3;
+	bytes body = 4;
+}
+
+
+message WSStreamData {
+	int32 type = 1;
+	bytes body = 2;
+}
+
+

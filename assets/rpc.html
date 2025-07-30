@@ -1,0 +1,233 @@
+<!DOCTYPE html>
+<html lang="zh">
+
+<head>
+	<meta charset="UTF-8">
+	<title>RPC 调用器</title>
+	<style>
+		body {
+			font-family: Arial, sans-serif;
+			padding: 20px;
+		}
+
+		label {
+			display: block;
+			margin-top: 10px;
+		}
+
+		input,
+		select,
+		button {
+			margin-top: 5px;
+		}
+
+		.param-inputs {
+			margin-top: 10px;
+		}
+
+		.param-group {
+			margin-bottom: 10px;
+		}
+
+		#result {
+			background: #f9f9f9;
+			padding: 10px;
+			border: 1px solid #ccc;
+			white-space: pre-wrap;
+		}
+
+		.error {
+			color: red;
+			font-weight: bold;
+		}
+
+		#progress-bar {
+			height: 30px;
+			background-color: #81c983;
+			/* padding-left: 10px; */
+			text-align: center;
+			align-content: center;
+		}
+
+		input {
+			width: 100%;
+		}
+	</style>
+</head>
+
+<body>
+
+	<h1>RPC 调用器</h1>
+
+	<label for="rpc-function">选择 RPC 函数:</label>
+	<select id="rpc-function">
+		<option value="">-- 请选择函数 --</option>
+	</select>
+
+	<div class="param-inputs" id="param-inputs"></div>
+
+	<button id="call-button">调用函数</button>
+
+	<p>
+		<div style="width: 100%; border: 1px solid #ccc;">
+			<div id="progress-bar" style="width: 0%;"></div>
+		</div>
+	</p>
+
+	<h2>返回结果:</h2>
+	<pre id="result"></pre>
+
+	<script>
+		const queryURL = "/wsf-rpc/query";
+		const callUrl = "/wsf-rpc/call";
+		const progressUrl = "/wsf-rpc/progress";
+		let rpcDefinitions = {};
+
+		// 显示结果
+		function showResult(content, isError = false) {
+			const resultEl = document.getElementById('result');
+			resultEl.textContent = typeof content === 'string' ? content : JSON.stringify(content, null, 2);
+			resultEl.className = isError ? 'error' : '';
+		}
+
+		// 封装错误处理 fetch
+		async function fetchJsonWithErrors(url, options = {}) {
+			const res = await fetch(url, options);
+			const contentType = res.headers.get('Content-Type') || '';
+			const isJson = contentType.includes('application/json');
+
+			if (!res.ok) {
+				if (isJson) {
+					const errData = await res.json();
+					const message = errData.message || '请求失败';
+					throw new Error(`错误 ${res.status} (${errData.errno}): ${message}`);
+				} else {
+					throw new Error(`HTTP 错误 ${res.status}: ${res.statusText}`);
+				}
+			}
+
+			return isJson ? res.json() : {};
+		}
+
+		// 初始化加载 /rpc
+		fetchJsonWithErrors(queryURL)
+			.then(data => {
+				rpcDefinitions = data;
+				const select = document.getElementById('rpc-function');
+				for (const funcName in data) {
+					const option = document.createElement('option');
+					option.value = funcName;
+					option.textContent = funcName;
+					select.appendChild(option);
+				}
+			})
+			.catch(err => {
+				showResult(`加载 ${queryURL} 失败: ` + err.message, true);
+			});
+
+		// 切换函数，更新参数输入框
+		document.getElementById('rpc-function').addEventListener('change', function () {
+			const funcName = this.value;
+			const paramContainer = document.getElementById('param-inputs');
+			paramContainer.innerHTML = '';
+			showResult(''); // 清空结果
+
+			if (!funcName || !rpcDefinitions[funcName]) return;
+
+			const params = rpcDefinitions[funcName].params;
+			params.forEach(param => {
+				const wrapper = document.createElement('div');
+				wrapper.className = 'param-group';
+
+				const label = document.createElement('label');
+				label.textContent = `${param.name} (${param.type})${param.range ? ` [${param.range[0]} - ${param.range[1]}]` : ''}`;
+
+				const input = document.createElement('input');
+				input.name = param.name;
+				input.id = 'param-' + param.name;
+				input.type = param.type === 'int' ? 'number' : 'text';
+				if (param.default) {
+					input.value = param.default;
+				}
+
+				if (param.range) {
+					input.min = param.range[0];
+					input.max = param.range[1];
+				}
+
+				wrapper.appendChild(label);
+				wrapper.appendChild(input);
+				paramContainer.appendChild(wrapper);
+			});
+		});
+
+		// 调用函数
+		document.getElementById('call-button').addEventListener('click', async function () {
+			const funcName = document.getElementById('rpc-function').value;
+			if (!funcName || !rpcDefinitions[funcName]) {
+				showResult('请选择有效的 RPC 函数。', true);
+				return;
+			}
+
+			const paramsDef = rpcDefinitions[funcName].params;
+			const payload = {
+				"name": funcName,
+				"params": {}
+			};
+
+			for (const param of paramsDef) {
+				const value = document.getElementById('param-' + param.name).value;
+				let parsedValue = value;
+
+				if (param.type === 'int') {
+					parsedValue = parseInt(value, 10);
+					if (isNaN(parsedValue)) {
+						showResult(`参数 "${param.name}" 必须是整数。`, true);
+						return;
+					}
+				}
+
+				payload["params"][param.name] = parsedValue;
+			}
+
+			try {
+				const result = await fetchJsonWithErrors(callUrl, {
+					method: 'POST',
+					headers: { 'Content-Type': 'application/json' },
+					body: JSON.stringify(payload)
+				});
+				showResult(result);
+
+				if (result["type"] === 2) { // progress
+					const taskid = result["params"]["task"];
+					console.log(`detected progress task ${taskid}, start interval...`);
+
+					const intervalFunc = function () {
+						fetchJsonWithErrors(`${progressUrl}?task=${taskid}`).then((res) => {
+							const current = res["params"]["current"];
+							const total = res["params"]["total"];
+							const progress = current / total * 100;
+							const progressBar = document.getElementById('progress-bar');
+
+							progressBar.style.width = progress + '%';
+							progressBar.textContent = progress.toFixed(2) + '%';
+
+							if (current === total || current > total) {
+								progressBar.textContent = '完成';
+							} else {
+								setTimeout(intervalFunc, 1000);
+							}
+						});
+					}
+
+					intervalFunc();
+				}
+			} catch (err) {
+				showResult('调用失败: ' + err.message, true);
+			}
+		});
+	</script>
+
+</body>
+
+</html>
